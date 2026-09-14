@@ -1,0 +1,3 @@
+<Window xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:wv="clr-namespace:AvaloniaWebView;assembly=Avalonia.WebView" x:Class="LocalNotesMvp.StickyWindow" Width="360" Height="420" Title="便签" Background="#FFF7C7">
+  <wv:WebView x:Name="EditorView" />
+</Window>

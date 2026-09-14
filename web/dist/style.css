@@ -1,0 +1,16 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #172b4d; background: #fff; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: #fff; }
+.app { max-width: 820px; margin: 0 auto; padding: 34px 42px 90px; }
+.toolbar { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #eef0f3; padding-bottom: 14px; }
+.toolbar button { border: 0; background: #f2f4f7; color: #475467; border-radius: 7px; padding: 8px 12px; cursor: pointer; }
+.toolbar button:hover { background: #e4e7ec; }
+#status { margin-left: auto; font-size: 12px; color: #98a2b3; }
+#title { display: block; width: 100%; border: 0; outline: 0; font-size: 36px; font-weight: 700; color: #172b4d; margin: 30px 0 24px; }
+#title::placeholder { color: #d0d5dd; }
+.block { display: flex; align-items: flex-start; gap: 10px; min-height: 38px; margin: 4px 0; font-size: 17px; line-height: 1.65; }
+.block-text { flex: 1; min-height: 32px; outline: 0; border-radius: 5px; padding: 1px 5px; }
+.block-text:focus { background: #fafbfc; box-shadow: 0 0 0 2px #dbeafe; }
+.block-text.heading { font-size: 24px; font-weight: 700; }
+.grip { color: #c4cad4; user-select: none; padding-top: 4px; }
+.block input { margin-top: 9px; accent-color: #4f46e5; }

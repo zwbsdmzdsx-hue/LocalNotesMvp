@@ -1,0 +1,28 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv="clr-namespace:AvaloniaWebView;assembly=Avalonia.WebView"
+        x:Class="LocalNotesMvp.MainWindow" Width="1180" Height="760" MinWidth="900" MinHeight="560" Title="Local Notes">
+  <Grid RowDefinitions="Auto,*" Background="#F6F7F9">
+    <Border Grid.Row="0" Background="#FFFFFF" BorderBrush="#E4E7EC" BorderThickness="0,0,0,1" Padding="22,14">
+      <DockPanel LastChildFill="False">
+        <StackPanel DockPanel.Dock="Left" Spacing="3">
+          <TextBlock Text="LOCAL NOTES" FontSize="12" FontWeight="Bold" Foreground="#667085" />
+          <TextBlock Text="本地笔记工作台" FontSize="22" FontWeight="SemiBold" Foreground="#172B4D" />
+        </StackPanel>
+        <Button DockPanel.Dock="Right" Click="OpenStickyClick" Padding="18,10" Margin="16,0,0,0" Background="#172B4D" Foreground="White" Content="打开便签" />
+        <Button DockPanel.Dock="Right" Click="NewNoteClick" Padding="18,10" Content="新建笔记" />
+      </DockPanel>
+    </Border>
+    <Grid Grid.Row="1" ColumnDefinitions="260,*">
+      <Border Grid.Column="0" Background="#FFFFFF" BorderBrush="#E4E7EC" BorderThickness="0,0,1,0" Padding="18">
+        <DockPanel>
+          <TextBlock DockPanel.Dock="Top" Text="我的笔记" FontSize="14" FontWeight="SemiBold" Foreground="#344054" Margin="0,0,0,12" />
+          <ListBox x:Name="NotesList" SelectionChanged="NoteSelectionChanged" />
+        </DockPanel>
+      </Border>
+      <Border Grid.Column="1" Margin="22" Background="White" CornerRadius="10" BorderBrush="#E4E7EC" BorderThickness="1">
+        <wv:WebView x:Name="EditorView" />
+      </Border>
+    </Grid>
+  </Grid>
+</Window>

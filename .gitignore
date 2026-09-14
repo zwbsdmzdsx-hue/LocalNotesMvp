@@ -1,0 +1,12 @@
+# Build artifacts
+**/bin/
+**/obj/
+
+# Node dependencies
+web/node_modules/
+
+# Local editor files
+.vs/
+.idea/
+*.user
+*.suo
