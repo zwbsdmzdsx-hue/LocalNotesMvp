@@ -1,6 +1,15 @@
 {
   "name": "local-notes-editor",
   "private": true,
-  "scripts": { "build": "tsc" },
-  "devDependencies": { "typescript": "^5.6.3" }
+  "scripts": {
+    "build": "tsc && node build-assets.mjs",
+    "dev:editor": "vite --config vite.editor.config.mjs",
+    "build:editor": "tsc -p ../editor/tsconfig.json && vite build --config vite.editor.config.mjs",
+    "test:editor": "playwright test -c playwright.editor.config.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "typescript": "^5.6.3",
+    "vite": "^8.3.0"
+  }
 }

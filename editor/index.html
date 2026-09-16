@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Local Notes Editor</title>
-  <link rel="stylesheet" href="style.css">
+  
 </head>
 <body>
   <main class="app">
@@ -34,11 +34,12 @@
         <section id="blocks"></section>
       </article>
       <aside class="relations">
+        <section id="reference-sidebar-section" hidden><h2>右侧实时引用</h2><div id="reference-sidebar"></div></section>
         <section><h2>反向链接</h2><div id="backlinks"></div></section>
         <section><h2>外部覆写</h2><div id="override-notices"></div></section>
       </aside>
     </div>
   </main>
-  <script type="module" src="main.js"></script>
+  <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

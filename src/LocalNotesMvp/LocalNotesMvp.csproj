@@ -13,8 +13,26 @@
     <PackageReference Include="WebView.Avalonia" Version="11.0.0.1" />
     <PackageReference Include="WebView.Avalonia.Desktop" Version="11.0.0.1" />
     <PackageReference Include="WebView.Avalonia.Windows" Version="11.0.0.1" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="..\..\web\dist\**" CopyToOutputDirectory="PreserveNewest" Link="web\%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="..\..\protocol\ProtocolModels.cs" Link="protocol\ProtocolModels.cs" />
+    <Compile Include="..\..\storage\INoteRepository.cs" Link="storage\INoteRepository.cs" />
+    <Compile Include="..\..\storage\DomainModels.cs" Link="storage\DomainModels.cs" />
+    <Compile Include="..\..\host\WebViewMessageChannel.cs" Link="host\WebViewMessageChannel.cs" />
+    <Compile Include="..\..\host\EditorHostController.cs" Link="host\EditorHostController.cs" />
+    <Compile Include="..\..\host\MainWindowHostAdapter.cs" Link="host\MainWindowHostAdapter.cs" />
+    <Compile Include="..\..\host\StickyWindowHostAdapter.cs" Link="host\StickyWindowHostAdapter.cs" />
+  </ItemGroup>
+  <Target Name="BuildEditorAssets" BeforeTargets="PrepareForBuild">
+    <Exec Command="npm run build" WorkingDirectory="$(MSBuildProjectDirectory)\..\..\web" />
+  </Target>
+  <!-- Ignore an accidental nested project copy in delivery folders. -->
+  <ItemGroup>
+    <Compile Remove="**/LocalNotesMvp/**/*.cs" />
+    <EmbeddedResource Remove="**/LocalNotesMvp/**/*" />
+    <None Remove="**/LocalNotesMvp/**/*" />
+    <AvaloniaResource Remove="**/LocalNotesMvp/**/*.axaml" />
   </ItemGroup>
 </Project>

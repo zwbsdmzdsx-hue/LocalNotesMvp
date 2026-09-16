@@ -10,3 +10,19 @@ web/node_modules/
 .idea/
 *.user
 *.suo
+
+# Generated previews, packages, test output and local data
+**/.vite/
+editor/dist/
+web/test-results/
+web/compat-test-results/
+web/playwright-report/
+tests/*.png
+tests/*.zip
+web/tests/*.png
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example

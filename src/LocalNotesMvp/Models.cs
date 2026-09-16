@@ -6,40 +6,93 @@ public sealed class Note
 {
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string Title { get; set; } = "未命名笔记";
-    public string ContentJson { get; set; } = "[]";
     public bool IsSticky { get; set; }
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    public long ClientVersion { get; set; }
+    public string? WorkspaceId { get; set; }
     public override string ToString() => Title;
 }
 
-public sealed class NoteStore
+public sealed class Workspace
 {
-    private readonly string _path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LocalNotesMvp", "notes.json");
-    private readonly JsonSerializerOptions _options = new(JsonSerializerDefaults.Web) { WriteIndented = true };
-    private List<Note> _notes = [];
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Name { get; set; } = "未命名工作区";
+    public string? RootPath { get; set; }
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    public override string ToString() => Name;
+}
 
-    public IReadOnlyList<Note> Notes => _notes;
+public sealed class Bookmark
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string WorkspaceId { get; set; } = "";
+    public string Name { get; set; } = "未分类";
+    public string Color { get; set; } = "#3B82F6";
+    public string Position { get; set; } = "00001000";
+    public string ShortName => string.IsNullOrWhiteSpace(Name) ? "?" : Name.Trim()[..1];
+    public override string ToString() => Name;
+}
 
-    public void Load()
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-        if (File.Exists(_path))
-            _notes = JsonSerializer.Deserialize<List<Note>>(File.ReadAllText(_path), _options) ?? [];
-        if (_notes.Count == 0)
-        {
-            _notes.Add(new Note { Title = "欢迎使用本地笔记", ContentJson = "[{\"type\":\"paragraph\",\"text\":\"这是一个本地优先的块编辑器。点击这里开始记录。\"}]" });
-            Save();
-        }
-    }
+public sealed class WorkspacePreview
+{
+    public Workspace Workspace { get; set; } = new();
+    public int BookmarkCount { get; set; }
+    public int DocumentCount { get; set; }
+    public string Summary => $"{BookmarkCount} 个书签 · {DocumentCount} 篇文档";
+    public override string ToString() => Workspace.Name;
+}
 
-    public Note Create(bool sticky = false)
-    {
-        var note = new Note { Title = sticky ? "新便签" : "新笔记", IsSticky = sticky };
-        _notes.Insert(0, note);
-        Save();
-        return note;
-    }
+public sealed class BlockRecord
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string? ParentId { get; set; }
+    public string Position { get; set; } = "00001000";
+    public string Type { get; set; } = "paragraph";
+    public JsonElement Content { get; set; }
+    public JsonElement Properties { get; set; }
+    public int Revision { get; set; } = 1;
+}
 
-    public void Save() => File.WriteAllText(_path, JsonSerializer.Serialize(_notes, _options));
-    public Note? Find(string id) => _notes.FirstOrDefault(x => x.Id == id);
+public sealed class SaveDocumentRequest
+{
+    public string DocumentId { get; set; } = "";
+    public string Title { get; set; } = "未命名笔记";
+    public List<BlockRecord> Blocks { get; set; } = [];
+}
+
+public sealed class SaveTransactionRequest
+{
+    public string DocumentId { get; set; } = "";
+    public string MutationId { get; set; } = "";
+    public long ClientVersion { get; set; }
+    public string Title { get; set; } = "未命名笔记";
+    public List<BlockRecord> Blocks { get; set; } = [];
+}
+
+public sealed class SaveOverrideRequest
+{
+    public string ReferenceInstanceId { get; set; } = "";
+    public string TargetBlockId { get; set; } = "";
+    public JsonElement Content { get; set; }
+    public JsonElement Properties { get; set; }
+}
+
+public sealed class SetReferenceModeRequest
+{
+    public string ReferenceInstanceId { get; set; } = "";
+    public string Mode { get; set; } = "inline";
+}
+
+public sealed class SaveInstanceBlockRequest
+{
+    public string ReferenceInstanceId { get; set; } = "";
+    public BlockRecord Block { get; set; } = new();
+}
+
+public sealed class MoveReferencedBlockRequest
+{
+    public string ReferenceInstanceId { get; set; } = "";
+    public string TargetBlockId { get; set; } = "";
+    public string? ParentBlockId { get; set; }
+    public string Position { get; set; } = "00001000";
 }

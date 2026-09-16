@@ -5,6 +5,18 @@
   <Grid RowDefinitions="Auto,*" Background="#F6F7F9">
     <Border Grid.Row="0" Background="#FFFFFF" BorderBrush="#E4E7EC" BorderThickness="0,0,0,1" Padding="22,14">
       <DockPanel LastChildFill="False">
+        <Menu DockPanel.Dock="Left" Margin="0,0,22,0">
+          <MenuItem Header="文件">
+            <MenuItem Header="打开工作区" Click="OpenWorkspaceClick" />
+            <MenuItem Header="创建工作区" Click="CreateWorkspaceClick" />
+            <Separator />
+            <MenuItem Header="关闭工作区" Click="CloseWorkspaceClick" />
+          </MenuItem>
+        </Menu>
+        <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" Spacing="4" Margin="0,0,16,0">
+          <Button x:Name="BackButton" Content="←" Click="BackClick" ToolTip.Tip="后退（Alt+左方向键）" Padding="10,5" IsEnabled="False" />
+          <Button x:Name="ForwardButton" Content="→" Click="ForwardClick" ToolTip.Tip="前进（Alt+右方向键）" Padding="10,5" IsEnabled="False" />
+        </StackPanel>
         <StackPanel DockPanel.Dock="Left" Spacing="3">
           <TextBlock Text="LOCAL NOTES" FontSize="12" FontWeight="Bold" Foreground="#667085" />
           <TextBlock Text="本地笔记工作台" FontSize="22" FontWeight="SemiBold" Foreground="#172B4D" />
@@ -13,15 +25,27 @@
         <Button DockPanel.Dock="Right" Click="NewNoteClick" Padding="18,10" Content="新建笔记" />
       </DockPanel>
     </Border>
-    <Grid Grid.Row="1" ColumnDefinitions="260,*">
-      <Border Grid.Column="0" Background="#FFFFFF" BorderBrush="#E4E7EC" BorderThickness="0,0,1,0" Padding="18">
+    <Grid Grid.Row="1" ColumnDefinitions="74,250,*">
+      <Border Grid.Column="0" Background="#F8FAFC" BorderBrush="#E4E7EC" BorderThickness="0,0,1,0" Padding="8,18">
+        <StackPanel x:Name="BookmarksBar" Spacing="8">
+          <TextBlock Text="书签" FontSize="11" Foreground="#98A2B3" HorizontalAlignment="Center" />
+          <Button Content="+" Click="NewBookmarkClick" FontSize="22" Padding="0" Height="42" Background="#FFFFFF" />
+        </StackPanel>
+      </Border>
+      <Border Grid.Column="1" Background="#FFFFFF" BorderBrush="#E4E7EC" BorderThickness="0,0,1,0" Padding="18">
         <DockPanel>
-          <TextBlock DockPanel.Dock="Top" Text="我的笔记" FontSize="14" FontWeight="SemiBold" Foreground="#344054" Margin="0,0,0,12" />
+          <StackPanel DockPanel.Dock="Top" Spacing="8" Margin="0,0,0,12">
+            <ScrollViewer HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled">
+              <StackPanel x:Name="WorkspaceTabs" Orientation="Horizontal" Spacing="5" />
+            </ScrollViewer>
+            <TextBlock x:Name="WorkspaceLabel" Text="工作区" FontSize="11" Foreground="#98A2B3" />
+            <TextBlock x:Name="BookmarkLabel" Text="选择书签" FontSize="14" FontWeight="SemiBold" Foreground="#344054" />
+          </StackPanel>
           <ListBox x:Name="NotesList" SelectionChanged="NoteSelectionChanged" />
         </DockPanel>
       </Border>
-      <Border Grid.Column="1" Margin="22" Background="White" CornerRadius="10" BorderBrush="#E4E7EC" BorderThickness="1">
-        <wv:WebView x:Name="EditorView" />
+      <Border Grid.Column="2" Margin="22" Background="White" CornerRadius="10" BorderBrush="#E4E7EC" BorderThickness="1">
+        <wv:WebView x:Name="EditorView" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
       </Border>
     </Grid>
   </Grid>

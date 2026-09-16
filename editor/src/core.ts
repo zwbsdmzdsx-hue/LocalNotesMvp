@@ -1,29 +1,22 @@
-type BlockType = "paragraph" | "heading" | "todo" | "reference";
-type LinkToken = { targetDocumentId?: string; targetBlockId?: string; targetText: string; alias?: string; start: number; end: number };
-type BlockContent = { text: string; html: string; checked?: boolean; targetDocumentId?: string; links?: LinkToken[] };
-type BlockProperties = { background?: string; textColor?: string };
-type Block = { id: string; parentId: string | null; position: string; type: BlockType; content: BlockContent; properties: BlockProperties; revision: number; scopeType?: "canonical" | "reference_instance" };
-type Note = { id: string; title: string; isSticky: boolean; clientVersion: number };
-type Backlink = { sourceDocumentId: string; sourceTitle: string; sourceBlockId: string; excerpt: string };
-type OverrideNotice = { referenceInstanceId: string; targetBlockId: string; sourceUpdated: boolean; hostTitle: string; hostDocumentId: string; excerpt: string; kind: "content_style" | "hide" | "move" | "insert" };
-type ReferenceOverride = { targetBlockId: string; patch: { content: BlockContent; properties: BlockProperties }; baseRevision: number };
-type ReferenceMode = "inline" | "collapsed" | "sidebar";
-type ReferenceInstance = { id: string; hostBlockId: string; targetDocumentId: string; targetTitle: string; mode: ReferenceMode; broken?: boolean; blocks: Block[]; overrides: ReferenceOverride[]; hiddenBlockIds: string[] };
-type EditorState = { note: Note; blocks: Block[]; documents: Array<{ id: string; title: string }>; backlinks: Backlink[]; overrideNotices: OverrideNotice[]; references: ReferenceInstance[] };
-type SaveDocumentPayload = { title: string; blocks: Block[] };
-type SaveMutation = SaveDocumentPayload & { documentId: string; mutationId: string; clientVersion: number };
+import type { BlockType, LinkToken, BlockContent, BlockProperties, Block, Note, Backlink, OverrideNotice, ReferenceOverride, ReferenceMode, ReferenceInstance, EditorState, SaveMutation, RequestMap } from "../../protocol/types";
+import type { EditorHostApi } from "./editor-host-api";
 
+// The existing renderer and editing operations are shared by browser and desktop.
+export function mountEditor(host: EditorHostApi) {
 const titleInput = document.querySelector<HTMLInputElement>("#title")!;
 const blockSurface = document.querySelector<HTMLDivElement>("#blocks")!;
 const saveStatus = document.querySelector<HTMLSpanElement>("#status")!;
 const linkSuggestions = document.querySelector<HTMLDivElement>("#link-suggestions")!;
 const backlinksPanel = document.querySelector<HTMLDivElement>("#backlinks")!;
 const noticesPanel = document.querySelector<HTMLDivElement>("#override-notices")!;
+const referenceSidebarSection = document.querySelector<HTMLElement>("#reference-sidebar-section")!;
+const referenceSidebarPanel = document.querySelector<HTMLDivElement>("#reference-sidebar")!;
 let state: EditorState | null = null;
 let mutationVersion = 0;
 let inFlightMutation: SaveMutation | null = null;
 let queuedMutation: SaveMutation | null = null;
-let flushRequestId: string | undefined;
+let commandTail: Promise<void> = Promise.resolve();
+let commandFailure: Error | null = null;
 let saveFailure: string | null = null;
 const saveDrainWaiters: Array<() => void> = [];
 let activeEditable: HTMLElement | null = null;
@@ -31,14 +24,51 @@ let activeBlock: HTMLElement | null = null;
 let linkMenuItems: Array<{ id: string; blockId?: string; title: string; meta: string; label: string }> = [];
 let linkMenuIndex = 0;
 
-function post(message: object, sourceDocumentId = state?.note.id) {
-  const serialized = JSON.stringify({ sourceDocumentId, ...message });
-  const bridge = window.chrome?.webview;
-  const legacy = window.external as unknown as { postMessage?(value: string): void; sendMessage?(value: string): void } | undefined;
-  if (bridge) bridge.postMessage(serialized);
-  else if (legacy?.postMessage) legacy.postMessage(serialized);
-  else if (legacy?.sendMessage) legacy.sendMessage(serialized);
-  else saveStatus.textContent = "桌面桥接不可用";
+const referenceModeLabels: Record<ReferenceMode, string> = {
+  inline: "正文直显",
+  collapsed: "折叠卡片",
+  sidebar: "右侧分栏"
+};
+
+type Message = { [K in keyof RequestMap]: { type: K } & RequestMap[K] }[keyof RequestMap];
+function post(message: Message, sourceDocumentId = state?.note.id): Promise<void> {
+  const { type, ...payload } = message;
+  if (type === "saveDocument") {
+    return host.saveDocument(payload as SaveMutation).then(handleSaveAck, error =>
+      handleSaveNack({ mutationId: (payload as SaveMutation).mutationId, error: error.message }));
+  }
+  if (type === "openDocument" || type === "navigateBack" || type === "navigateForward") {
+    return flush().then(() => host.request(type, payload as RequestMap[typeof type], sourceDocumentId))
+      .then(() => undefined).catch(showError);
+  }
+  const owner = sourceDocumentId;
+  if (!owner) return Promise.resolve();
+  const commandKinds = new Set(["createReference", "setReferenceMode", "saveOverride", "saveInstanceBlock", "moveReferenceBlock", "deleteInstanceBlock", "hideReferenceBlock", "resetOverride", "resetReference", "removeReference"]);
+  const operationName = (value: string) => value.replace(/[A-Z]/g, letter => "-" + letter.toLowerCase());
+  commandTail = commandTail.catch(() => undefined).then(async () => {
+    const result = commandKinds.has(type)
+      ? await host.executeCommand({ operation: operationName(type), ...(payload as Record<string, unknown>) }, owner)
+      : await host.request(type, payload as RequestMap[typeof type], owner);
+    commandFailure = null;
+    if (result && "state" in result && state?.note.id === owner) {
+      // Text edits keep the caret; structural commands redraw after their ACK.
+      if (type === "saveOverride" || type === "saveInstanceBlock" || type === "moveReferenceBlock") {
+        state.references = result.state.references;
+      } else render(result.state);
+    }
+    saveStatus.textContent = "已保存";
+  }).catch(error => { commandFailure = error; showError(error); });
+  return commandTail;
+}
+function showError(error: unknown) {
+  saveStatus.textContent = "保存失败：" + (error instanceof Error ? error.message : String(error));
+}
+async function flush() {
+  if (saveFailure) throw new Error(saveFailure);
+  await new Promise<void>(resolve => runAfterSaveDrain(resolve));
+  await commandTail;
+  if (saveFailure) throw new Error(saveFailure);
+  if (commandFailure) throw commandFailure;
 }
 
 function pumpSaveQueue() {
@@ -50,7 +80,7 @@ function pumpSaveQueue() {
   queuedMutation = null;
   const mutation = inFlightMutation;
   post({
-    type: "save-transaction",
+    type: "saveDocument",
     documentId: mutation.documentId,
     mutationId: mutation.mutationId,
     clientVersion: mutation.clientVersion,
@@ -66,7 +96,7 @@ function finishSaveDrain() {
 }
 
 function enqueueDocumentSave() {
-  if (!state) return;
+  if (!state?.note.id) return;
   saveFailure = null;
   const documentId = state.note.id;
   // Coalesced edits replace the queued snapshot; they must keep its version.
@@ -98,7 +128,51 @@ function handleSaveAck(message: { mutationId: string; documentId: string; client
   saveStatus.textContent = "已保存到本地数据库";
   pumpSaveQueue();
   finishSaveDrain();
+  if (!inFlightMutation && !queuedMutation && state?.references.some(reference => reference.targetDocumentId === message.documentId)) {
+    void refreshLiveReferences();
+  }
 }
+
+let deferredReferenceRefresh = false;
+let referenceRefreshSequence = 0;
+async function refreshLiveReferences() {
+  const current = state;
+  if (!current) return;
+  const sequence = ++referenceRefreshSequence;
+  try {
+    await commandTail;
+    const next = await host.loadDocument(current.note.id);
+    if (state !== current || sequence !== referenceRefreshSequence) return;
+    // Never replace an active local edit, including one whose command ACK is pending.
+    if (document.activeElement?.closest(".reference-card")) {
+      deferredReferenceRefresh = true;
+      return;
+    }
+    next.references.forEach(reference => {
+      const previous = current.references.find(item => item.id === reference.id);
+      if (JSON.stringify(previous) === JSON.stringify(reference)) return;
+      document.querySelectorAll<HTMLElement>(".reference-card[data-reference-id]").forEach(card => {
+        if (card.dataset.referenceId !== reference.id) return;
+        const replacement = renderReference(reference, reference.mode === "sidebar");
+        if (card.classList.contains("is-expanded")) replacement.querySelector<HTMLButtonElement>(".reference-expand")?.click();
+        card.replaceWith(replacement);
+      });
+      const shell = blockSurface.querySelector<HTMLElement>(`[data-id="${CSS.escape(reference.hostBlockId)}"]`);
+      shell?.querySelectorAll<HTMLElement>(".reference-heading strong, .sidebar-reference-entry strong").forEach(title => title.textContent = reference.targetTitle);
+    });
+    current.references = next.references;
+  } catch (error) {
+    saveStatus.textContent = "引用刷新失败：" + (error instanceof Error ? error.message : String(error));
+  }
+}
+document.addEventListener("focusout", () => {
+  if (!deferredReferenceRefresh) return;
+  queueMicrotask(() => {
+    if (document.activeElement?.closest(".reference-card")) return;
+    deferredReferenceRefresh = false;
+    void refreshLiveReferences();
+  });
+});
 
 function handleSaveNack(message: { mutationId: string; error: string }) {
   if (!inFlightMutation || inFlightMutation.mutationId !== message.mutationId) return;
@@ -108,11 +182,8 @@ function handleSaveNack(message: { mutationId: string; error: string }) {
   mutationVersion = state?.note.clientVersion ?? 0;
   saveFailure = error;
   saveStatus.textContent = `保存失败：${error}`;
-  window.localNotesError?.(error);
-  const requestId = flushRequestId;
-  flushRequestId = undefined;
-  saveDrainWaiters.splice(0);
-  if (requestId) post({ type: "editor-flush-failed", requestId, error });
+  showError(error);
+  saveDrainWaiters.splice(0).forEach(resolve => resolve());
 }
 
 function runAfterSaveDrain(action: () => void) {
@@ -121,7 +192,7 @@ function runAfterSaveDrain(action: () => void) {
   pumpSaveQueue();
 }
 
-function postAfterFlush(message: object) {
+function postAfterFlush(message: Message) {
   const documentId = state?.note.id;
   runAfterSaveDrain(() => post(message, documentId));
 }
@@ -189,7 +260,7 @@ function openWikiLink(event: MouseEvent) {
   if (!link || !state) return;
   const target = state.documents.find((document) => document.id === link.dataset.targetId) ??
     state.documents.find((document) => document.title.toLocaleLowerCase() === link.dataset.title?.toLocaleLowerCase());
-  if (target) postAfterFlush({ type: "open-document", documentId: target.id, blockId: link.dataset.targetBlockId });
+  if (target) postAfterFlush({ type: "openDocument", documentId: target.id, blockId: link.dataset.targetBlockId });
 }
 
 function blockDepth(block: Block, all: Block[]) {
@@ -207,8 +278,11 @@ function blockDepth(block: Block, all: Block[]) {
 function render(next: EditorState) {
   document.querySelector(".block-menu")?.remove();
   hideInlineLinkSuggestions();
+  const changed = state?.note.id !== next.note.id;
   state = next;
-  mutationVersion = Math.max(mutationVersion, next.note.clientVersion ?? 0);
+  activeEditable = null;
+  if (changed) { saveFailure = null; commandFailure = null; mutationVersion = next.note.clientVersion ?? 0; }
+  else mutationVersion = Math.max(mutationVersion, next.note.clientVersion ?? 0);
   titleInput.value = next.note.title;
   blockSurface.innerHTML = "";
   (next.blocks.length ? next.blocks : [createBlock()]).forEach((block) => renderOwnBlock(block));
@@ -243,8 +317,19 @@ function renderOwnBlock(block: Block) {
 
   if (block.type === "reference") {
     const reference = state.references.find((item) => item.hostBlockId === block.id);
-    shell.innerHTML = `<div class="reference-heading"><button type="button" class="grip" aria-label="块菜单">⠿</button><span>实时引用</span><strong>${escapeText(reference?.targetTitle ?? "未绑定")}</strong><span class="reference-state">${reference?.broken ? "引用失效" : reference?.mode ?? "inline"}</span></div>`;
-    if (reference) shell.append(renderReference(reference));
+    const mode = reference?.mode ?? "inline";
+    shell.innerHTML = `<div class="reference-heading"><button type="button" class="grip" aria-label="块菜单">⠿</button><span>实时引用</span><strong>${escapeText(reference?.targetTitle ?? "未绑定")}</strong><span class="reference-state">${reference?.broken ? "引用失效" : referenceModeLabels[mode]}</span></div>`;
+    if (reference && mode === "sidebar") {
+      const entry = document.createElement("button");
+      entry.type = "button";
+      entry.className = "sidebar-reference-entry";
+      entry.innerHTML = `<span class="sidebar-entry-icon">↗</span><span><strong>${escapeText(reference.targetTitle)}</strong><small>实时内容已放入右侧分栏</small></span>`;
+      entry.addEventListener("click", () => {
+        referenceSidebarSection.hidden = false;
+        referenceSidebarSection.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      });
+      shell.append(entry);
+    } else if (reference) shell.append(renderReference(reference));
   } else {
     shell.append(createEditableRow(block));
   }
@@ -328,10 +413,25 @@ function saveDocument() {
   enqueueDocumentSave();
 }
 
-function renderReference(reference: ReferenceInstance) {
+function renderReference(reference: ReferenceInstance, inSidebar = false) {
   const card = document.createElement("section");
-  card.className = `reference-card ${reference.mode === "collapsed" ? "collapsed" : ""} ${reference.mode === "sidebar" ? "sidebar" : ""}`;
+  card.className = `reference-card ${reference.mode === "collapsed" ? "collapsed is-collapsed" : ""} ${inSidebar ? "sidebar" : ""}`;
   card.dataset.referenceId = reference.id;
+  if (reference.mode === "collapsed") {
+    const summary = document.createElement("div");
+    summary.className = "reference-card-summary";
+    summary.innerHTML = `<span class="reference-summary-icon">▸</span><span class="reference-summary-copy"><strong>${escapeText(reference.targetTitle)}</strong><small>${reference.blocks.length} 个实时块 · ${referenceModeLabels.collapsed}</small></span><button type="button" class="reference-expand" aria-expanded="false">展开</button>`;
+    const toggle = summary.querySelector<HTMLButtonElement>(".reference-expand")!;
+    toggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const expanded = card.classList.toggle("is-expanded");
+      card.classList.toggle("is-collapsed", !expanded);
+      toggle.setAttribute("aria-expanded", String(expanded));
+      toggle.textContent = expanded ? "收起" : "展开";
+      summary.querySelector<HTMLElement>(".reference-summary-icon")!.textContent = expanded ? "▾" : "▸";
+    });
+    card.append(summary);
+  }
   const overrideMap = new Map(reference.overrides.map((item) => [item.targetBlockId, item]));
   const hidden = new Set(reference.hiddenBlockIds);
   const isHidden = (block: Block) => {
@@ -360,6 +460,7 @@ function renderReference(reference: ReferenceInstance) {
     const local = source.scopeType === "reference_instance";
     row.innerHTML = `<div class="reference-meta"><span>${local ? "本地新增" : override ? "已覆写" : "继承"}</span><button class="add-child" title="在引用中添加子块">+</button>${local ? "" : '<button class="reset" title="恢复源内容与位置">↺</button>'}<button class="hide" title="${local ? "删除本地块" : "在此引用中隐藏"}">×</button></div><button type="button" class="grip" aria-label="块菜单">⠿</button><div class="block-text ${source.type === "heading" ? "heading" : ""}" contenteditable="true"></div>`;
     const editable = row.querySelector<HTMLElement>(".block-text")!;
+    if (override && source.revision > override.baseRevision) row.querySelector(".reference-meta span")!.textContent = "已覆写 · 源内容已更新";
     editable.innerHTML = renderLinkedHtml(content.html || escapeText(content.text));
     editable.style.backgroundColor = properties.background ?? "";
     editable.style.color = properties.textColor ?? "";
@@ -368,9 +469,9 @@ function renderReference(reference: ReferenceInstance) {
     editable.addEventListener("input", () => local ? scheduleInstanceBlock(row, source) : scheduleOverride(row, source, properties));
     row.querySelector(".add-child")!.addEventListener("click", () => addInstanceBlock(reference, source.id, row));
     row.querySelector(".hide")!.addEventListener("click", () => postAfterFlush(local
-      ? { type: "delete-instance-block", referenceInstanceId: reference.id, blockId: source.id }
-      : { type: "hide-reference-block", referenceInstanceId: reference.id, targetBlockId: source.id }));
-    row.querySelector(".reset")?.addEventListener("click", () => postAfterFlush({ type: "reset-override", referenceInstanceId: reference.id, targetBlockId: source.id }));
+      ? { type: "deleteInstanceBlock", referenceInstanceId: reference.id, blockId: source.id }
+      : { type: "hideReferenceBlock", referenceInstanceId: reference.id, targetBlockId: source.id }));
+    row.querySelector(".reset")?.addEventListener("click", () => postAfterFlush({ type: "resetOverride", referenceInstanceId: reference.id, targetBlockId: source.id }));
     card.append(row);
   });
   const footer = document.createElement("footer");
@@ -379,10 +480,9 @@ function renderReference(reference: ReferenceInstance) {
   footer.querySelector(".add-root")!.addEventListener("click", () => addInstanceBlock(reference, null));
   footer.querySelector(".restore-hidden")?.addEventListener("click", () => {
     const documentId = state?.note.id;
-    runAfterSaveDrain(() => reference.hiddenBlockIds.forEach((id) => post({ type: "reset-override", referenceInstanceId: reference.id, targetBlockId: id }, documentId)));
+    runAfterSaveDrain(() => reference.hiddenBlockIds.forEach((id) => post({ type: "resetOverride", referenceInstanceId: reference.id, targetBlockId: id }, documentId)));
   });
   card.append(footer);
-  if (reference.mode === "collapsed") card.addEventListener("click", () => card.classList.remove("collapsed"), { once: true });
   return card;
 }
 
@@ -402,8 +502,8 @@ function scheduleInstanceBlock(row: HTMLElement, source: Block) {
   const referenceInstanceId = row.dataset.referenceInstanceId!;
   const block = blockFromReferenceRow(row, source);
   saveStatus.textContent = "正在保存引用专属块...";
-  post({ type: "save-instance-block", referenceInstanceId, block }, documentId);
-  saveStatus.textContent = "引用专属块已保存";
+  post({ type: "saveInstanceBlock", referenceInstanceId, block }, documentId);
+
 }
 
 function addInstanceBlock(reference: ReferenceInstance, parentId: string | null, afterRow?: HTMLElement) {
@@ -413,9 +513,8 @@ function addInstanceBlock(reference: ReferenceInstance, parentId: string | null,
   const rows = [...(afterRow?.closest(".reference-card") ?? blockSurface).querySelectorAll<HTMLElement>(".reference-row")];
   block.position = String((rows.length + 1) * 1000).padStart(8, "0");
   runAfterSaveDrain(() => {
-    post({ type: "save-instance-block", referenceInstanceId: reference.id, block }, documentId);
-    saveStatus.textContent = "已新增引用专属块";
-    window.setTimeout(() => post({ type: "reload-state" }, documentId), 50);
+    void post({ type: "saveInstanceBlock", referenceInstanceId: reference.id, block }, documentId)
+      .then(() => { if (!commandFailure) return post({ type: "reloadDocument", }, documentId); });
   });
 }
 
@@ -427,18 +526,22 @@ function scheduleOverride(row: HTMLElement, source: Block, originalProperties: B
   const content = editableContent(editable, source.content);
   const properties = { ...originalProperties, background: editable.style.backgroundColor || undefined, textColor: editable.style.color || undefined };
   saveStatus.textContent = "正在保存局部覆写...";
-  post({ type: "save-override", referenceInstanceId, targetBlockId, content, properties }, documentId);
-  saveStatus.textContent = "局部覆写已保存";
+  post({ type: "saveOverride", referenceInstanceId, targetBlockId, content, properties }, documentId);
+
 }
 
 function renderRelations() {
   if (!state) return;
+  referenceSidebarPanel.innerHTML = "";
+  const sidebarReferences = state.references.filter((reference) => reference.mode === "sidebar");
+  referenceSidebarSection.hidden = sidebarReferences.length === 0;
+  sidebarReferences.forEach((reference) => referenceSidebarPanel.append(renderReference(reference, true)));
   backlinksPanel.innerHTML = "";
   state.backlinks.forEach((link) => {
     const button = document.createElement("button");
     button.className = "relation-item";
     button.innerHTML = `<strong>${escapeText(link.sourceTitle)}</strong><span>${escapeText(link.excerpt)}</span>`;
-    button.addEventListener("click", () => postAfterFlush({ type: "open-document", documentId: link.sourceDocumentId }));
+    button.addEventListener("click", () => postAfterFlush({ type: "openDocument", documentId: link.sourceDocumentId }));
     backlinksPanel.append(button);
   });
   if (!state.backlinks.length) backlinksPanel.innerHTML = `<div class="empty">暂无反向链接</div>`;
@@ -449,7 +552,7 @@ function renderRelations() {
     button.className = `relation-item ${notice.sourceUpdated ? "warning" : ""}`;
     const labels = { content_style: "引用位置修改了内容或样式", hide: "引用位置隐藏了此块", move: "引用位置调整了层级或顺序", insert: "引用位置增加了专属块" };
     button.innerHTML = `<strong>${escapeText(notice.hostTitle)}</strong><span>${notice.sourceUpdated ? "源内容更新后仍保留覆写" : labels[notice.kind]}</span>`;
-    button.addEventListener("click", () => postAfterFlush({ type: "open-document", documentId: notice.hostDocumentId }));
+    button.addEventListener("click", () => postAfterFlush({ type: "openDocument", documentId: notice.hostDocumentId }));
     noticesPanel.append(button);
   });
   if (!state.overrideNotices.length) noticesPanel.innerHTML = `<div class="empty">暂无外部覆写</div>`;
@@ -487,36 +590,44 @@ function showReferenceMenu(anchor: HTMLElement, _block: Block | undefined, refer
     { label: "正文直显", run: () => setReferenceMode(reference, "inline") },
     { label: "折叠卡片", run: () => setReferenceMode(reference, "collapsed") },
     { label: "右侧分栏", run: () => setReferenceMode(reference, "sidebar") },
-    { label: "打开源文档", run: () => postAfterFlush({ type: "open-document", documentId: reference.targetDocumentId }) },
-    { label: "断开引用", run: () => postAfterFlush({ type: "remove-reference", referenceInstanceId: reference.id }) },
-    { label: "恢复全部继承内容", run: () => postAfterFlush({ type: "reset-reference", referenceInstanceId: reference.id }) }
+    { label: "打开源文档", run: () => postAfterFlush({ type: "openDocument", documentId: reference.targetDocumentId }) },
+    { label: "断开引用", run: () => postAfterFlush({ type: "removeReference", referenceInstanceId: reference.id }) },
+    { label: "恢复全部继承内容", run: () => postAfterFlush({ type: "resetReference", referenceInstanceId: reference.id }) }
   ]);
 }
 
 function setReferenceMode(reference: ReferenceInstance, mode: ReferenceMode) {
-  reference.mode = mode;
-  render(state!);
-  postAfterFlush({ type: "set-reference-mode", referenceInstanceId: reference.id, mode });
+  postAfterFlush({ type: "setReferenceMode", referenceInstanceId: reference.id, mode });
 }
 
-function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: string) {
+function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: string, mode: ReferenceMode = "inline") {
   if (!state || !targetDocumentId) return;
   const documentId = state.note.id;
   const block = createBlock("reference");
   block.content.targetDocumentId = targetDocumentId;
+  state.blocks = readOwnBlocks();
   state.blocks.push(block);
   render(state);
   saveDocument();
-  runAfterSaveDrain(() => post({ type: "create-reference", hostBlockId: block.id, targetDocumentId, targetBlockId }, documentId));
+  runAfterSaveDrain(() => {
+    void post({ type: "createReference", hostBlockId: block.id, targetDocumentId, targetBlockId }, documentId).then(() => {
+      if (mode === "inline") return;
+      const reference = state?.references.find((item) => item.hostBlockId === block.id);
+      if (reference) return post({ type: "setReferenceMode", referenceInstanceId: reference.id, mode }, documentId);
+    });
+  });
 }
 
 function insertTarget(targetBlockId?: string, targetDocumentId?: string, label = "链接") {
   if (!activeEditable || !targetDocumentId) return;
   activeEditable.focus();
   const escapedLabel = escapeText(label);
-  const html = `<span class="wiki-link" data-target-id="${escapeText(targetDocumentId)}"${targetBlockId ? ` data-target-block-id="${escapeText(targetBlockId)}"` : ""} data-target-title="${escapedLabel}">${targetBlockId ? `[[${escapedLabel}^${escapeText(targetBlockId)}]]` : `[[${escapedLabel}]]`}</span>`;
+  const html = `<span class="wiki-link" data-target-id="${escapeText(targetDocumentId)}"${targetBlockId ? ` data-target-block-id="${escapeText(targetBlockId)}"` : ""} data-target-title="${escapedLabel}">${escapedLabel}</span>`;
   document.execCommand("insertHTML", false, html);
   activeEditable.closest(".reference-row") ? activeEditable.dispatchEvent(new Event("input", { bubbles: true })) : scheduleDocumentSave(0);
+  const links = [...activeEditable.querySelectorAll<HTMLElement>(".wiki-link")];
+  const inserted = links[links.length - 1];
+  if (inserted) showLinkChoiceMenu(inserted, { id: targetDocumentId, blockId: targetBlockId, label });
 }
 
 function suggestionItems(query: string) {
@@ -599,18 +710,52 @@ function insertInlineSuggestion(item: { id: string; blockId?: string; label: str
   if (!startNode) return;
   range.setStart(startNode, Math.min(startOffset, startNode.length));
   range.deleteContents();
-  const label = item.blockId ? `${item.label}^${item.blockId}` : item.label;
   const link = document.createElement("span");
   link.className = "wiki-link";
   link.dataset.targetId = item.id;
   if (item.blockId) link.dataset.targetBlockId = item.blockId;
-  link.dataset.targetTitle = escapeText(item.label);
-  link.textContent = `[[${label}]]`;
+  link.dataset.targetTitle = item.label;
+  link.textContent = item.label;
   range.insertNode(link);
   range.collapse(false);
   selection.removeAllRanges(); selection.addRange(range);
   hideInlineLinkSuggestions();
   activeEditable.dispatchEvent(new Event("input", { bubbles: true }));
+  showLinkChoiceMenu(link, item);
+}
+
+function showLinkChoiceMenu(anchor: HTMLElement, item: { id: string; blockId?: string; label: string }) {
+  document.querySelector(".link-mode-menu")?.remove();
+  const menu = document.createElement("div");
+  menu.className = "link-mode-menu";
+  menu.setAttribute("role", "menu");
+  menu.innerHTML = `<strong>已插入双链</strong><span>选择后续操作</span>`;
+  const choices: Array<{ label: string; mode?: ReferenceMode }> = [
+    { label: "保持普通双链" },
+    { label: "嵌入实时引用 · 正文直显", mode: "inline" },
+    { label: "嵌入实时引用 · 折叠卡片", mode: "collapsed" },
+    { label: "嵌入实时引用 · 右侧分栏", mode: "sidebar" }
+  ];
+  choices.forEach((choice) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = choice.label;
+    button.addEventListener("click", () => {
+      menu.remove();
+      if (choice.mode) createReferenceForTarget(item.id, item.blockId, choice.mode);
+    });
+    menu.append(button);
+  });
+  document.body.append(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.left = `${Math.min(window.innerWidth - 260, Math.max(8, rect.left))}px`;
+  menu.style.top = `${Math.min(window.innerHeight - 210, rect.bottom + 8)}px`;
+  const close = (event: MouseEvent) => {
+    if (!menu.contains(event.target as Node) && event.target !== anchor) {
+      menu.remove(); document.removeEventListener("mousedown", close);
+    }
+  };
+  window.setTimeout(() => document.addEventListener("mousedown", close), 0);
 }
 
 function handleInlineLinkKeys(event: KeyboardEvent) {
@@ -649,7 +794,7 @@ function applyColor(property: "color" | "backgroundColor", value: string) {
   activeEditable.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
-function selectedOwnBlock() { return activeEditable?.closest<HTMLElement>("[data-own-block]") ?? null; }
+function selectedOwnBlock() { return selectedReferenceRow() ? null : activeEditable?.closest<HTMLElement>("[data-own-block]") ?? null; }
 function selectedReferenceRow() { return activeEditable?.closest<HTMLElement>(".reference-row") ?? null; }
 
 function persistReferenceStructure(row: HTMLElement) {
@@ -659,11 +804,11 @@ function persistReferenceStructure(row: HTMLElement) {
   if (!reference || !block) return;
   runAfterSaveDrain(() => {
     if (row.dataset.scopeType === "reference_instance") {
-      post({ type: "save-instance-block", referenceInstanceId: reference.id, block: blockFromReferenceRow(row, block) });
+      post({ type: "saveInstanceBlock", referenceInstanceId: reference.id, block: blockFromReferenceRow(row, block) });
     } else {
       post({
-        type: "move-reference-block", referenceInstanceId: reference.id, targetBlockId: block.id,
-        parentBlockId: row.dataset.parentId || null, position: row.dataset.position
+        type: "moveReferenceBlock", referenceInstanceId: reference.id, targetBlockId: block.id,
+        parentBlockId: row.dataset.parentId || null, position: row.dataset.position ?? "00001000"
       });
     }
   });
@@ -756,43 +901,16 @@ function escapeText(value: string) {
   return span.innerHTML;
 }
 
-window.localNotesError = (message: string) => saveStatus.textContent = `保存失败：${message}`;
-window.localNotesSaved = (documentId: string) => {
-  if (state?.note.id === documentId) saveStatus.textContent = "已保存到本地数据库";
-};
-window.localNotesFlush = (requestId?: string) => {
-  flushRequestId = requestId;
-  if (saveFailure) {
-    flushRequestId = undefined;
-    post({ type: "editor-flush-failed", requestId, error: saveFailure });
-    return;
+host.onEvent(event => {
+  if (event.kind === "documentChanged" && state?.references.some(reference => reference.targetDocumentId === event.payload.documentId)) void refreshLiveReferences();
+  if (event.kind === "documentLoaded") render(event.payload.state);
+  if (event.kind === "focusBlock") focusBlock(event.payload.blockId);
+  if (event.kind === "notification") saveStatus.textContent = event.payload.message;
+  if (event.kind === "flush") {
+    const requestId = event.payload.requestId;
+    void flush().then(() => host.emit({ protocolVersion: 1, kind: "flushResult", payload: { requestId, ok: true } }),
+      error => host.emit({ protocolVersion: 1, kind: "flushResult", payload: { requestId, ok: false, error: error.message } }));
   }
-  runAfterSaveDrain(() => {
-    const id = flushRequestId;
-    flushRequestId = undefined;
-    post({ type: "editor-flush-complete", requestId: id });
-  });
-};
-window.localNotesRunAcceptanceEdit = (marker: string) => {
-  window.setTimeout(() => {
-    const editable = document.querySelector<HTMLElement>('[data-own-block] .block-text');
-    if (!editable) return;
-    editable.focus();
-    editable.append(document.createTextNode(` ${marker}`));
-    editable.dispatchEvent(new Event("input", { bubbles: true }));
-  }, 500);
-};
-window.addEventListener("pagehide", () => window.localNotesFlush?.());
-window.addEventListener("beforeunload", () => window.localNotesFlush?.());
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") window.localNotesFlush?.();
-});
-window.addEventListener("message", (event: MessageEvent<string>) => {
-  const message = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
-  if (message.type === "load-state") render(message.state as EditorState);
-  if (message.type === "focus-block" && typeof message.blockId === "string") focusBlock(message.blockId);
-  if (message.type === "save-ack") handleSaveAck(message);
-  if (message.type === "save-nack") handleSaveNack(message);
 });
 
 document.querySelector("#add-paragraph")!.addEventListener("click", () => addBlock("paragraph"));
@@ -807,10 +925,6 @@ document.querySelector("#indent")!.addEventListener("click", () => indent("in"))
 document.querySelector("#outdent")!.addEventListener("click", () => indent("out"));
 document.querySelector("#move-up")!.addEventListener("click", () => move(-1));
 document.querySelector("#move-down")!.addEventListener("click", () => move(1));
-document.addEventListener("mousedown", (event) => {
-  const target = event.target as Node | null;
-  if (target && !linkSuggestions.contains(target) && !(target as HTMLElement).closest?.(".block-text")) hideInlineLinkSuggestions();
-});
 document.addEventListener("click", (event) => {
   const target = event.target as HTMLElement | null;
   const grip = target?.closest<HTMLElement>(".grip");
@@ -831,7 +945,7 @@ document.addEventListener("keydown", (event) => {
   if (event.altKey && !event.ctrlKey && !event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
     event.preventDefault();
     event.stopPropagation();
-    if (!event.repeat) post({ type: event.key === "ArrowLeft" ? "navigate-back" : "navigate-forward" });
+    if (!event.repeat) post({ type: event.key === "ArrowLeft" ? "navigateBack" : "navigateForward" });
     return;
   }
   const editable = (event.target as HTMLElement | null)?.closest<HTMLElement>(".block-text[contenteditable='true']");
@@ -839,3 +953,7 @@ document.addEventListener("keydown", (event) => {
 }, true);
 titleInput.addEventListener("input", () => scheduleDocumentSave());
 document.querySelectorAll<HTMLButtonElement>(".icon-tools button").forEach((button) => button.addEventListener("mousedown", (event) => event.preventDefault()));
+
+void host.request("ready", {}).catch(showError);
+return { flush, showError, retry: () => { saveFailure = null; commandFailure = null; enqueueDocumentSave(); }, load: render };
+}
