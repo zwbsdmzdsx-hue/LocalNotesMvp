@@ -378,7 +378,7 @@ public sealed partial class NoteStore : INoteRepository
 
     public void SetReferenceMode(SetReferenceModeRequest request)
     {
-        var mode = request.Mode is "inline" or "collapsed" or "sidebar" ? request.Mode : "inline";
+        var mode = request.Mode is "inline" or "collapsed" or "sidebar" or "link" ? request.Mode : "inline";
         using var connection = OpenConnection();
         using var command = connection.CreateCommand();
         command.CommandText = "UPDATE reference_instances SET mode=$mode, updated_at=$now WHERE id=$id AND deleted_at IS NULL";

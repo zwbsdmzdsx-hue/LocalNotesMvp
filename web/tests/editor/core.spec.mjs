@@ -42,7 +42,7 @@ test("candidate action can create a reference with a selected display mode", asy
   await page.locator(".link-suggestion").first().click();
   await page.getByRole("menu").getByText("嵌入实时引用 · 折叠卡片").click();
   await expect(page.locator(".reference-card.is-collapsed")).toBeVisible();
-  await expect(page.locator(".reference-expand")).toHaveText("展开");
+  await expect(page.locator(".reference-card.is-collapsed .reference-expand")).toHaveAttribute("aria-expanded", "false");
 });
 
 test("Mock Host can simulate a save error without freezing editing", async ({ page }) => {
@@ -106,7 +106,7 @@ test("same-page source edits update the reference without losing the typing care
   const source = page.locator('[data-own-block][data-id="a1"]');
   await source.locator(".grip").click();
   await page.getByRole("menu").getByText("嵌入为实时引用", { exact: true }).click();
-  const reference = page.locator('[data-own-block][data-type="reference"]').last();
+  const reference = page.locator('[data-own-block][data-type="reference"]').first();
   await expect(reference.locator(".reference-row")).toContainText("浏览器编辑器核心");
   await source.locator(".block-text").fill("同页源内容自动同步");
   await expect(reference.locator(".reference-row")).toContainText("同页源内容自动同步");
@@ -127,6 +127,7 @@ test("source updates preserve instance overrides and reset restores the newest s
   await page.locator('[data-doc="alpha"]').click();
   await expect(reference.locator(".block-text")).toHaveText("仅此引用的局部内容");
   await expect(reference.locator(".reference-meta")).toContainText("源内容已更新");
+  await reference.locator(".reference-row").hover();
   await reference.locator(".reset").click();
   await expect(reference.locator(".block-text")).toHaveText("源内容更新但不覆盖局部内容");
 });

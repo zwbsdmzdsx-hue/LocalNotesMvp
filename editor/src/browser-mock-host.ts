@@ -113,7 +113,7 @@ export class BrowserMockHost implements HostTransport {
                 hiddenBlockIds: []
               });
             }
-            if (payload.operation === "set-reference-mode" && payload.referenceInstanceId && (payload.mode === "inline" || payload.mode === "collapsed" || payload.mode === "sidebar")) {
+            if (payload.operation === "set-reference-mode" && payload.referenceInstanceId && (payload.mode === "inline" || payload.mode === "collapsed" || payload.mode === "sidebar" || payload.mode === "link")) {
               const reference = current.references.find((item) => item.id === payload.referenceInstanceId);
               if (reference) reference.mode = payload.mode;
             }

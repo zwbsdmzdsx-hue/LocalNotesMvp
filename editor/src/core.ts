@@ -27,7 +27,8 @@ let linkMenuIndex = 0;
 const referenceModeLabels: Record<ReferenceMode, string> = {
   inline: "正文直显",
   collapsed: "折叠卡片",
-  sidebar: "右侧分栏"
+  sidebar: "右侧分栏",
+  link: "仅标题链接"
 };
 
 type Message = { [K in keyof RequestMap]: { type: K } & RequestMap[K] }[keyof RequestMap];
@@ -131,6 +132,7 @@ function handleSaveAck(message: { mutationId: string; documentId: string; client
   if (!inFlightMutation && !queuedMutation && state?.references.some(reference => reference.targetDocumentId === message.documentId)) {
     void refreshLiveReferences();
   }
+  if (!inFlightMutation && !queuedMutation && sidebarLink?.documentId === message.documentId && !sidebarLink.referenceId) void showLinkSidebar(sidebarLink);
 }
 
 let deferredReferenceRefresh = false;
@@ -154,7 +156,6 @@ async function refreshLiveReferences() {
       document.querySelectorAll<HTMLElement>(".reference-card[data-reference-id]").forEach(card => {
         if (card.dataset.referenceId !== reference.id) return;
         const replacement = renderReference(reference, reference.mode === "sidebar");
-        if (card.classList.contains("is-expanded")) replacement.querySelector<HTMLButtonElement>(".reference-expand")?.click();
         card.replaceWith(replacement);
       });
       const shell = blockSurface.querySelector<HTMLElement>(`[data-id="${CSS.escape(reference.hostBlockId)}"]`);
@@ -211,11 +212,12 @@ function newId() {
 function sanitizeHtml(html: string) {
   const template = document.createElement("template");
   template.innerHTML = html;
+  template.content.querySelectorAll("[data-reference-host-id]").forEach(anchor => anchor.replaceChildren());
   const allowed = new Set(["B", "STRONG", "I", "EM", "MARK", "BR", "SPAN"]);
   [...template.content.querySelectorAll("*")].forEach((element) => {
     if (!allowed.has(element.tagName)) element.replaceWith(...element.childNodes);
     else [...element.attributes].forEach((attribute) => {
-      const allowedLinkAttribute = ["data-target-id", "data-target-block-id", "data-target-title"].includes(attribute.name);
+      const allowedLinkAttribute = ["data-target-id", "data-target-block-id", "data-target-title", "data-reference-host-id"].includes(attribute.name);
       if (attribute.name !== "style" && !allowedLinkAttribute || attribute.name === "style" && !/^(background-color|color):/i.test(attribute.value)) element.removeAttribute(attribute.name);
     });
   });
@@ -225,7 +227,7 @@ function sanitizeHtml(html: string) {
 function renderLinkedHtml(html: string) {
   const template = document.createElement("template");
   template.innerHTML = sanitizeHtml(html);
-  template.content.querySelectorAll<HTMLElement>("[data-target-id]").forEach((link) => link.className = "wiki-link");
+  template.content.querySelectorAll<HTMLElement>("[data-target-id]").forEach((link) => { link.className = "wiki-link"; link.contentEditable = "false"; });
   const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
   const textNodes: Text[] = [];
   while (walker.nextNode()) {
@@ -242,6 +244,7 @@ function renderLinkedHtml(html: string) {
       fragment.append(value.slice(offset, match.index));
       const link = document.createElement("span");
       link.className = "wiki-link";
+      link.contentEditable = "false";
       link.dataset.title = match[1].trim();
       const anchor = match[2]?.trim();
       if (anchor?.startsWith("^")) link.dataset.targetBlockId = anchor.slice(1);
@@ -255,13 +258,133 @@ function renderLinkedHtml(html: string) {
   return template.innerHTML;
 }
 
-function openWikiLink(event: MouseEvent) {
-  const link = (event.target as HTMLElement).closest<HTMLElement>(".wiki-link");
-  if (!link || !state) return;
-  const target = state.documents.find((document) => document.id === link.dataset.targetId) ??
-    state.documents.find((document) => document.title.toLocaleLowerCase() === link.dataset.title?.toLocaleLowerCase());
-  if (target) postAfterFlush({ type: "openDocument", documentId: target.id, blockId: link.dataset.targetBlockId });
+type LinkDestination = { documentId: string; blockId?: string; referenceId?: string; anchor: HTMLElement };
+let sidebarLink: LinkDestination | null = null;
+let sidebarSequence = 0;
+let previewSequence = 0;
+let previewTimer: ReturnType<typeof setTimeout> | undefined;
+function linkDestination(element: EventTarget | null): LinkDestination | null {
+  const anchor = (element as HTMLElement | null)?.closest<HTMLElement>(".wiki-link, .reference-title");
+  if (!anchor || !state) return null;
+  const documentId = anchor.dataset.targetId ?? state.documents.find(item => item.title === anchor.dataset.title)?.id;
+  return documentId ? { documentId, blockId: anchor.dataset.targetBlockId, referenceId: anchor.dataset.referenceId, anchor } : null;
 }
+function dismissPreview() {
+  clearTimeout(previewTimer); previewSequence++;
+  document.querySelector(".link-preview")?.remove();
+}
+async function targetProjection(target: LinkDestination): Promise<ReferenceInstance> {
+  const instance = state?.references.find(item => item.id === target.referenceId);
+  if (instance) return instance;
+  const source = await host.loadDocument(target.documentId);
+  let blocks = source.blocks;
+  if (target.blockId) {
+    const ids = new Set([target.blockId]);
+    for (let count = -1; count !== ids.size;) {
+      count = ids.size;
+      blocks.forEach(block => { if (block.parentId && ids.has(block.parentId)) ids.add(block.id); });
+    }
+    blocks = blocks.filter(block => ids.has(block.id));
+  }
+  return { id: "link-preview", hostBlockId: "", targetDocumentId: target.documentId, targetBlockId: target.blockId, targetTitle: source.note.title, mode: "link", blocks, overrides: [], hiddenBlockIds: [], broken: !!target.blockId && blocks.length === 0 };
+}
+function readOnlyProjection(reference: ReferenceInstance) {
+  const container = document.createElement("div");
+  container.className = "link-preview-content";
+  const hidden = new Set(reference.hiddenBlockIds);
+  const visible = (block: Block) => {
+    let current: Block | undefined = block;
+    const seen = new Set<string>();
+    while (current && !seen.has(current.id)) {
+      if (hidden.has(current.id)) return false;
+      seen.add(current.id); current = reference.blocks.find(item => item.id === current?.parentId);
+    }
+    return true;
+  };
+  reference.blocks.filter(visible).forEach(block => {
+    const override = reference.overrides.find(item => item.targetBlockId === block.id);
+    const content = override?.patch.content ?? block.content;
+    const paragraph = document.createElement("div");
+    paragraph.className = "preview-block";
+    paragraph.innerHTML = sanitizeHtml(content.html || escapeText(content.text));
+    container.append(paragraph);
+  });
+  if (!container.childElementCount) container.textContent = reference.broken ? "引用目标不存在" : "暂无内容";
+  return container;
+}
+async function showLinkPreview(target: LinkDestination) {
+  const sequence = ++previewSequence;
+  try {
+    const reference = await targetProjection(target);
+    if (sequence !== previewSequence || !target.anchor.isConnected) return;
+    const popup = document.createElement("aside");
+    popup.className = "link-preview"; popup.setAttribute("role", "tooltip");
+    const title = document.createElement("div"); title.className = "preview-title"; title.textContent = reference.targetTitle;
+    popup.append(title, readOnlyProjection(reference));
+    document.body.append(popup);
+    const rect = target.anchor.getBoundingClientRect();
+    popup.style.left = `${Math.max(8, Math.min(innerWidth - popup.offsetWidth - 8, rect.left))}px`;
+    popup.style.top = `${Math.max(8, Math.min(innerHeight - popup.offsetHeight - 8, rect.bottom + 6))}px`;
+    popup.addEventListener("mouseleave", dismissPreview);
+  } catch { if (sequence === previewSequence) dismissPreview(); }
+}
+async function showLinkSidebar(target: LinkDestination) {
+  dismissPreview(); sidebarLink = target;
+  const sequence = ++sidebarSequence;
+  const owner = state?.note.id;
+  try {
+    const reference = await targetProjection(target);
+    if (sequence !== sidebarSequence || owner !== state?.note.id) return;
+    referenceSidebarSection.hidden = false;
+    referenceSidebarPanel.replaceChildren();
+    const header = document.createElement("div"); header.className = "sidebar-preview-heading";
+    const title = document.createElement("span"); title.textContent = reference.targetTitle;
+    const close = document.createElement("button"); close.textContent = "×"; close.setAttribute("aria-label", "关闭分栏");
+    close.onclick = () => { sidebarLink = null; sidebarSequence++; renderRelations(); };
+    const embed = document.createElement("button"); embed.textContent = "嵌入正文";
+    embed.onclick = () => {
+      if (target.referenceId) {
+        sidebarLink = null;
+        const current = state?.references.find(item => item.id === target.referenceId);
+        if (current) setReferenceMode(current, "inline");
+      } else createReferenceForTarget(target.documentId, target.blockId, "inline", target.anchor);
+    };
+    header.append(title, embed, close);
+    referenceSidebarPanel.append(header, target.referenceId ? renderReference(reference, true) : readOnlyProjection(reference));
+  } catch (error) { showError(error); }
+}
+document.addEventListener("mouseover", event => {
+  const target = linkDestination(event.target);
+  if (!target || target.anchor.contains(event.relatedTarget as Node | null)) return;
+  dismissPreview(); previewTimer = setTimeout(() => void showLinkPreview(target), 400);
+});
+document.addEventListener("mouseout", event => {
+  const target = linkDestination(event.target);
+  if (!target || target.anchor.contains(event.relatedTarget as Node | null)) return;
+  if ((event.relatedTarget as HTMLElement | null)?.closest?.(".link-preview")) return;
+  dismissPreview();
+});
+document.addEventListener("click", event => {
+  const target = linkDestination(event.target);
+  if (!target) return;
+  event.preventDefault();
+  if (event.detail < 2) void showLinkSidebar(target);
+});
+document.addEventListener("dblclick", event => {
+  const target = linkDestination(event.target);
+  if (!target) return;
+  event.preventDefault(); dismissPreview(); sidebarSequence++;
+  postAfterFlush({ type: "openDocument", documentId: target.documentId, blockId: target.blockId });
+});
+document.addEventListener("contextmenu", event => {
+  const target = linkDestination(event.target);
+  if (!target) return;
+  event.preventDefault();
+  const instance = state?.references.find(item => item.id === target.referenceId);
+  if (instance) showReferenceMenu(target.anchor, undefined, instance);
+  else showLinkChoiceMenu(target.anchor, { id: target.documentId, blockId: target.blockId, label: target.anchor.textContent ?? "链接" });
+});
+document.addEventListener("keydown", event => { if (event.key === "Escape") dismissPreview(); });
 
 function blockDepth(block: Block, all: Block[]) {
   let depth = 0;
@@ -279,6 +402,8 @@ function render(next: EditorState) {
   document.querySelector(".block-menu")?.remove();
   hideInlineLinkSuggestions();
   const changed = state?.note.id !== next.note.id;
+  dismissPreview();
+  if (changed) { sidebarLink = null; sidebarSequence++; }
   state = next;
   activeEditable = null;
   if (changed) { saveFailure = null; commandFailure = null; mutationVersion = next.note.clientVersion ?? 0; }
@@ -286,8 +411,20 @@ function render(next: EditorState) {
   titleInput.value = next.note.title;
   blockSurface.innerHTML = "";
   (next.blocks.length ? next.blocks : [createBlock()]).forEach((block) => renderOwnBlock(block));
+  mountEmbeddedReferences();
   renderRelations();
   saveStatus.textContent = "已同步本地数据库";
+}
+
+function mountEmbeddedReferences() {
+  blockSurface.querySelectorAll<HTMLElement>("[data-reference-host-id]").forEach(anchor => {
+    const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(anchor.dataset.referenceHostId!)}"]`);
+    if (!shell || shell.contains(anchor)) return;
+    anchor.contentEditable = "false";
+    anchor.className = "embedded-reference";
+    shell.style.setProperty("--depth", "0");
+    anchor.replaceChildren(shell);
+  });
 }
 
 function focusBlock(blockId: string) {
@@ -318,16 +455,16 @@ function renderOwnBlock(block: Block) {
   if (block.type === "reference") {
     const reference = state.references.find((item) => item.hostBlockId === block.id);
     const mode = reference?.mode ?? "inline";
-    shell.innerHTML = `<div class="reference-heading"><button type="button" class="grip" aria-label="块菜单">⠿</button><span>实时引用</span><strong>${escapeText(reference?.targetTitle ?? "未绑定")}</strong><span class="reference-state">${reference?.broken ? "引用失效" : referenceModeLabels[mode]}</span></div>`;
-    if (reference && mode === "sidebar") {
+    shell.innerHTML = `<div class="reference-heading"><button type="button" class="grip" aria-label="引用菜单" title="引用显示方式">⠿</button></div>`;
+    if (reference && (mode === "sidebar" || mode === "link")) {
       const entry = document.createElement("button");
       entry.type = "button";
-      entry.className = "sidebar-reference-entry";
-      entry.innerHTML = `<span class="sidebar-entry-icon">↗</span><span><strong>${escapeText(reference.targetTitle)}</strong><small>实时内容已放入右侧分栏</small></span>`;
-      entry.addEventListener("click", () => {
-        referenceSidebarSection.hidden = false;
-        referenceSidebarSection.scrollIntoView({ block: "nearest", behavior: "smooth" });
-      });
+      entry.className = "sidebar-reference-entry reference-title";
+      entry.dataset.targetId = reference.targetDocumentId;
+      if (reference.targetBlockId) entry.dataset.targetBlockId = reference.targetBlockId;
+      entry.dataset.referenceId = reference.id;
+      entry.textContent = reference.targetTitle;
+      entry.title = "悬停预览 · 单击分栏 · 双击打开源";
       shell.append(entry);
     } else if (reference) shell.append(renderReference(reference));
   } else {
@@ -346,9 +483,8 @@ function createEditableRow(block: Block) {
   editable.style.backgroundColor = block.properties.background ?? "";
   editable.style.color = block.properties.textColor ?? "";
   editable.addEventListener("focus", () => activeEditable = editable);
-  editable.addEventListener("input", () => scheduleDocumentSave());
+  editable.addEventListener("input", event => { if (event.target === editable) scheduleDocumentSave(); });
   editable.addEventListener("keydown", handleBlockKeydown);
-  editable.addEventListener("click", openWikiLink);
   row.querySelector("input")?.addEventListener("change", () => scheduleDocumentSave(0));
   row.querySelector(".delete-block")?.addEventListener("click", () => {
     row.closest("[data-own-block]")?.remove();
@@ -359,6 +495,7 @@ function createEditableRow(block: Block) {
 }
 
 function handleBlockKeydown(event: KeyboardEvent) {
+  if (event.target !== event.currentTarget) return;
   if (event.defaultPrevented) return;
   if (event.key !== "Enter" || event.shiftKey) return;
   event.preventDefault();
@@ -395,14 +532,18 @@ function readOwnBlocks(): Block[] {
 }
 
 function editableContent(editable: HTMLElement, fallback: BlockContent = { text: "", html: "" }): BlockContent {
-  const text = editable.innerText;
+  const clean = editable.cloneNode(true) as HTMLElement;
+  clean.querySelectorAll("[data-reference-host-id]").forEach(anchor => anchor.replaceChildren());
+  const textOnly = clean.cloneNode(true) as HTMLElement;
+  textOnly.querySelectorAll("br").forEach(br => br.replaceWith("\n"));
+  const text = textOnly.textContent ?? "";
   const links: LinkToken[] = [];
-  editable.querySelectorAll<HTMLElement>(".wiki-link").forEach((link) => {
+  clean.querySelectorAll<HTMLElement>(".wiki-link").forEach((link) => {
     const targetText = link.textContent ?? "";
     const start = text.indexOf(targetText);
     links.push({ targetDocumentId: link.dataset.targetId, targetBlockId: link.dataset.targetBlockId, targetText, start: Math.max(0, start), end: Math.max(0, start) + targetText.length });
   });
-  return { ...fallback, text, html: sanitizeHtml(editable.innerHTML), links };
+  return { ...fallback, text, html: sanitizeHtml(clean.innerHTML), links };
 }
 
 function scheduleDocumentSave(_delay = 0) {
@@ -415,20 +556,19 @@ function saveDocument() {
 
 function renderReference(reference: ReferenceInstance, inSidebar = false) {
   const card = document.createElement("section");
-  card.className = `reference-card ${reference.mode === "collapsed" ? "collapsed is-collapsed" : ""} ${inSidebar ? "sidebar" : ""}`;
+  const collapsed = !inSidebar && reference.mode === "collapsed";
+  card.className = `reference-card ${collapsed ? "collapsed is-collapsed" : "is-expanded"} ${inSidebar ? "sidebar" : ""}`;
   card.dataset.referenceId = reference.id;
-  if (reference.mode === "collapsed") {
+  if (!inSidebar) {
     const summary = document.createElement("div");
     summary.className = "reference-card-summary";
-    summary.innerHTML = `<span class="reference-summary-icon">▸</span><span class="reference-summary-copy"><strong>${escapeText(reference.targetTitle)}</strong><small>${reference.blocks.length} 个实时块 · ${referenceModeLabels.collapsed}</small></span><button type="button" class="reference-expand" aria-expanded="false">展开</button>`;
+    summary.innerHTML = `<button type="button" class="reference-expand" aria-expanded="${!collapsed}" aria-label="${collapsed ? "展开" : "收起"}" title="${collapsed ? "展开引用正文" : "折叠引用正文"}">${collapsed ? "▸" : "▾"}</button><button type="button" class="reference-title" data-target-id="${escapeText(reference.targetDocumentId)}" data-reference-id="${escapeText(reference.id)}">${escapeText(reference.targetTitle)}</button>`;
+    const title = summary.querySelector<HTMLElement>(".reference-title")!;
+    if (reference.targetBlockId) title.dataset.targetBlockId = reference.targetBlockId;
     const toggle = summary.querySelector<HTMLButtonElement>(".reference-expand")!;
     toggle.addEventListener("click", (event) => {
       event.stopPropagation();
-      const expanded = card.classList.toggle("is-expanded");
-      card.classList.toggle("is-collapsed", !expanded);
-      toggle.setAttribute("aria-expanded", String(expanded));
-      toggle.textContent = expanded ? "收起" : "展开";
-      summary.querySelector<HTMLElement>(".reference-summary-icon")!.textContent = expanded ? "▾" : "▸";
+      setReferenceMode(reference, collapsed ? "inline" : "collapsed");
     });
     card.append(summary);
   }
@@ -465,7 +605,6 @@ function renderReference(reference: ReferenceInstance, inSidebar = false) {
     editable.style.backgroundColor = properties.background ?? "";
     editable.style.color = properties.textColor ?? "";
     editable.addEventListener("focus", () => activeEditable = editable);
-    editable.addEventListener("click", openWikiLink);
     editable.addEventListener("input", () => local ? scheduleInstanceBlock(row, source) : scheduleOverride(row, source, properties));
     row.querySelector(".add-child")!.addEventListener("click", () => addInstanceBlock(reference, source.id, row));
     row.querySelector(".hide")!.addEventListener("click", () => postAfterFlush(local
@@ -536,6 +675,7 @@ function renderRelations() {
   const sidebarReferences = state.references.filter((reference) => reference.mode === "sidebar");
   referenceSidebarSection.hidden = sidebarReferences.length === 0;
   sidebarReferences.forEach((reference) => referenceSidebarPanel.append(renderReference(reference, true)));
+  if (sidebarLink) void showLinkSidebar(sidebarLink);
   backlinksPanel.innerHTML = "";
   state.backlinks.forEach((link) => {
     const button = document.createElement("button");
@@ -577,6 +717,7 @@ function showMenu(anchor: HTMLElement, actions: Array<{ label: string; run: () =
 }
 
 function showOwnBlockMenu(anchor: HTMLElement, block: Block) {
+  activeEditable = anchor.closest("[data-own-block]")?.querySelector<HTMLElement>(".block-text") ?? activeEditable;
   showMenu(anchor, [
     { label: "复制块链接", run: () => navigator.clipboard?.writeText(`[[${state?.note.title}^${block.id}]]`) },
     { label: "插入块链接", run: () => insertTarget(block.id, state?.note.id, block.content.text || "块") },
@@ -587,6 +728,7 @@ function showOwnBlockMenu(anchor: HTMLElement, block: Block) {
 function showReferenceMenu(anchor: HTMLElement, _block: Block | undefined, reference?: ReferenceInstance) {
   if (!reference) return;
   showMenu(anchor, [
+    { label: "仅标题链接", run: () => setReferenceMode(reference, "link") },
     { label: "正文直显", run: () => setReferenceMode(reference, "inline") },
     { label: "折叠卡片", run: () => setReferenceMode(reference, "collapsed") },
     { label: "右侧分栏", run: () => setReferenceMode(reference, "sidebar") },
@@ -600,13 +742,24 @@ function setReferenceMode(reference: ReferenceInstance, mode: ReferenceMode) {
   postAfterFlush({ type: "setReferenceMode", referenceInstanceId: reference.id, mode });
 }
 
-function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: string, mode: ReferenceMode = "inline") {
+function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: string, mode: ReferenceMode = "inline", anchor?: HTMLElement) {
   if (!state || !targetDocumentId) return;
   const documentId = state.note.id;
   const block = createBlock("reference");
   block.content.targetDocumentId = targetDocumentId;
+  if (anchor?.closest(".reference-row")) { showError("请在普通正文块中嵌入引用；引用内的链接可在分栏预览。"); return; }
+  const ownerShell = (anchor ?? activeEditable)?.closest<HTMLElement>("[data-own-block]");
+  if (anchor?.isConnected && ownerShell) {
+    const marker = document.createElement("span");
+    marker.dataset.referenceHostId = block.id;
+    marker.contentEditable = "false";
+    anchor.replaceWith(marker);
+    block.parentId = ownerShell.dataset.id!;
+  } else block.parentId = ownerShell?.dataset.parentId || null;
   state.blocks = readOwnBlocks();
-  state.blocks.push(block);
+  const index = state.blocks.findIndex(item => item.id === ownerShell?.dataset.id);
+  state.blocks.splice(index < 0 ? state.blocks.length : index + 1, 0, block);
+  sidebarLink = null;
   render(state);
   saveDocument();
   runAfterSaveDrain(() => {
@@ -622,7 +775,7 @@ function insertTarget(targetBlockId?: string, targetDocumentId?: string, label =
   if (!activeEditable || !targetDocumentId) return;
   activeEditable.focus();
   const escapedLabel = escapeText(label);
-  const html = `<span class="wiki-link" data-target-id="${escapeText(targetDocumentId)}"${targetBlockId ? ` data-target-block-id="${escapeText(targetBlockId)}"` : ""} data-target-title="${escapedLabel}">${escapedLabel}</span>`;
+  const html = `<span contenteditable="false" class="wiki-link" data-target-id="${escapeText(targetDocumentId)}"${targetBlockId ? ` data-target-block-id="${escapeText(targetBlockId)}"` : ""} data-target-title="${escapedLabel}">${escapedLabel}</span>`;
   document.execCommand("insertHTML", false, html);
   activeEditable.closest(".reference-row") ? activeEditable.dispatchEvent(new Event("input", { bubbles: true })) : scheduleDocumentSave(0);
   const links = [...activeEditable.querySelectorAll<HTMLElement>(".wiki-link")];
@@ -712,12 +865,14 @@ function insertInlineSuggestion(item: { id: string; blockId?: string; label: str
   range.deleteContents();
   const link = document.createElement("span");
   link.className = "wiki-link";
+  link.contentEditable = "false";
   link.dataset.targetId = item.id;
   if (item.blockId) link.dataset.targetBlockId = item.blockId;
   link.dataset.targetTitle = item.label;
   link.textContent = item.label;
   range.insertNode(link);
-  range.collapse(false);
+  range.setStartAfter(link);
+  range.collapse(true);
   selection.removeAllRanges(); selection.addRange(range);
   hideInlineLinkSuggestions();
   activeEditable.dispatchEvent(new Event("input", { bubbles: true }));
@@ -742,7 +897,7 @@ function showLinkChoiceMenu(anchor: HTMLElement, item: { id: string; blockId?: s
     button.textContent = choice.label;
     button.addEventListener("click", () => {
       menu.remove();
-      if (choice.mode) createReferenceForTarget(item.id, item.blockId, choice.mode);
+      if (choice.mode) createReferenceForTarget(item.id, item.blockId, choice.mode, anchor);
     });
     menu.append(button);
   });
@@ -903,6 +1058,7 @@ function escapeText(value: string) {
 
 host.onEvent(event => {
   if (event.kind === "documentChanged" && state?.references.some(reference => reference.targetDocumentId === event.payload.documentId)) void refreshLiveReferences();
+  if (event.kind === "documentChanged" && sidebarLink?.documentId === event.payload.documentId && !sidebarLink.referenceId) void showLinkSidebar(sidebarLink);
   if (event.kind === "documentLoaded") render(event.payload.state);
   if (event.kind === "focusBlock") focusBlock(event.payload.blockId);
   if (event.kind === "notification") saveStatus.textContent = event.payload.message;
@@ -933,7 +1089,8 @@ document.addEventListener("click", (event) => {
   event.stopPropagation();
   const shell = grip.closest<HTMLElement>("[data-own-block]");
   const block = shell?.dataset.id ? state?.blocks.find((item) => item.id === shell.dataset.id) : undefined;
-  const reference = shell?.dataset.id ? state?.references.find((item) => item.hostBlockId === shell.dataset.id) : undefined;
+  const instanceId = grip.closest<HTMLElement>(".reference-card")?.dataset.referenceId;
+  const reference = instanceId ? state?.references.find(item => item.id === instanceId) : shell?.dataset.id ? state?.references.find((item) => item.hostBlockId === shell.dataset.id) : undefined;
   if (reference) showReferenceMenu(grip, block, reference);
   else if (block) showOwnBlockMenu(grip, block);
 }, true);

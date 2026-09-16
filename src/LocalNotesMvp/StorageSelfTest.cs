@@ -144,6 +144,38 @@ internal static class StorageSelfTest
         }
         catch (InvalidOperationException) { staleRejected = true; }
         if (!staleRejected) throw new InvalidOperationException("Stale transaction was accepted.");
+        foreach (var mode in new[] { "inline", "collapsed", "link", "sidebar", "collapsed" })
+        {
+            reloadedStore.SetReferenceMode(new SetReferenceModeRequest { ReferenceInstanceId = referenceId, Mode = mode });
+            var reopened = new NoteStore(path);
+            reopened.Load();
+            using var persisted = JsonDocument.Parse(JsonSerializer.Serialize(reopened.GetEditorState(source.Id)));
+            if (persisted.RootElement.GetProperty("references")[0].GetProperty("mode").GetString() != mode)
+                throw new InvalidOperationException($"Reference mode {mode} was not persisted after reopening SQLite.");
+        }
+        var embeddedNote = reloadedStore.Create();
+        var ownerId = FirstBlockId(reloadedStore, embeddedNote.Id);
+        var embeddedId = Guid.NewGuid().ToString("N");
+        var anchorHtml = $"Before <span data-reference-host-id=\"{embeddedId}\"></span> After";
+        reloadedStore.SaveDocument(embeddedNote.Id, new SaveDocumentRequest
+        {
+            Title = "Embedded reference persistence",
+            Blocks = [
+                new BlockRecord { Id = ownerId, Position = "00001000", Content = JsonSerializer.SerializeToElement(new { text = "Before  After", html = anchorHtml }), Properties = emptyProperties },
+                new BlockRecord { Id = embeddedId, ParentId = ownerId, Position = "00002000", Type = "reference", Content = JsonSerializer.SerializeToElement(new { text = "", html = "" }), Properties = emptyProperties }
+            ]
+        });
+        reloadedStore.CreateReference(embeddedNote.Id, embeddedId, target.Id, targetBlockId);
+        var embeddedReferenceId = ReferenceId(reloadedStore, embeddedNote.Id);
+        reloadedStore.SetReferenceMode(new SetReferenceModeRequest { ReferenceInstanceId = embeddedReferenceId, Mode = "collapsed" });
+        var finalStore = new NoteStore(path);
+        finalStore.Load();
+        using var embeddedState = JsonDocument.Parse(JsonSerializer.Serialize(finalStore.GetEditorState(embeddedNote.Id)));
+        var persistedBlocks = embeddedState.RootElement.GetProperty("blocks");
+        if (persistedBlocks[0].GetProperty("content").GetProperty("html").GetString() != anchorHtml ||
+            persistedBlocks[1].GetProperty("parentId").GetString() != ownerId ||
+            embeddedState.RootElement.GetProperty("references")[0].GetProperty("mode").GetString() != "collapsed")
+            throw new InvalidOperationException("Embedded reference placement or disclosure state was lost after SQLite reopen.");
         return JsonSerializer.Serialize(new { passed = true, counts });
     }
 

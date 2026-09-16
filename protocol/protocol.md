@@ -49,6 +49,23 @@ Reference mutations are carried by `executeCommand` with an operation such as
 ID, mutation ID, client version, title, and block snapshot. The response always
 returns the document ID, mutation ID, and persisted client version.
 
+## Reference presentation and placement
+
+`set-reference-mode` persists `inline` (expanded body), `collapsed` (folded
+body with a disclosure arrow), `link` (title only), or `sidebar`. The disclosure
+arrow sends the same acknowledged command as the mode menu; it is not temporary
+DOM state. These values reuse `reference_instances.mode`, without a schema change.
+
+Embedded references use an empty `<span data-reference-host-id="host-block-id">`
+anchor in the containing block's HTML. The reference host block has that block
+as its `parent_id`. Rendering mounts the reference at the exact anchor; saving
+strips its projected contents from the containing block. Only stable IDs and
+local overrides are stored, never the rendered source snapshot.
+
+Title links preview after 400 ms of hover. Single click opens a non-navigating
+side pane; double click navigates to the stable document/block ID. Plain-link
+previews are read-only; reference instances edit via their existing override API.
+
 ## Compatibility
 
 The legacy `type` messages remain supported by the existing Avalonia resource
