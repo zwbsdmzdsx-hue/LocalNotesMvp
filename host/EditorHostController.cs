@@ -63,6 +63,8 @@ public sealed class EditorHostController
         var payload = request.Payload.Deserialize<HostSaveDocumentPayload>(_json)
             ?? throw new HostRequestException("invalid_payload", "saveDocument payload 无效。");
         if (string.IsNullOrWhiteSpace(payload.DocumentId)) payload.DocumentId = GetDocumentId(request);
+        if (payload.DocumentId != GetDocumentId(request))
+            throw new HostRequestException("document_mismatch", "保存文档与请求归属不一致。");
         var version = _repository.SaveTransaction(new SaveTransactionRequest
         {
             DocumentId = payload.DocumentId,

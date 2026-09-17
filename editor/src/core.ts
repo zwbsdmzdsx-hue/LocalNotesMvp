@@ -1,16 +1,33 @@
-import type { BlockType, LinkToken, BlockContent, BlockProperties, Block, Note, Backlink, OverrideNotice, ReferenceOverride, ReferenceMode, ReferenceInstance, EditorState, SaveMutation, RequestMap } from "../../protocol/types";
+import { sanitizeHtml, editableContent } from "./block-content";
+import type { BlockType, BlockContent, BlockProperties, Block, Note, Backlink, OverrideNotice, ReferenceOverride, ReferenceMode, ReferenceInstance, EditorState, SaveMutation, RequestMap } from "../../protocol/types";
 import type { EditorHostApi } from "./editor-host-api";
+import { EditorHistory, type HistoryModel, type HistoryMove } from "./history";
 
 // The existing renderer and editing operations are shared by browser and desktop.
-export function mountEditor(host: EditorHostApi) {
+export function mountEditor(host: EditorHostApi, ui: {
+  showReferences?(): void;
+  showHistory?(): void;
+  updateHistory?(model: HistoryModel): void;
+} = {}) {
 const titleInput = document.querySelector<HTMLInputElement>("#title")!;
 const blockSurface = document.querySelector<HTMLDivElement>("#blocks")!;
 const saveStatus = document.querySelector<HTMLSpanElement>("#status")!;
 const linkSuggestions = document.querySelector<HTMLDivElement>("#link-suggestions")!;
-const backlinksPanel = document.querySelector<HTMLDivElement>("#backlinks")!;
-const noticesPanel = document.querySelector<HTMLDivElement>("#override-notices")!;
-const referenceSidebarSection = document.querySelector<HTMLElement>("#reference-sidebar-section")!;
-const referenceSidebarPanel = document.querySelector<HTMLDivElement>("#reference-sidebar")!;
+function getSlot(name: string): HTMLElement {
+  let slot = document.querySelector<HTMLElement>(`[data-slot="${name}"]`);
+  if (!slot) {
+    // Shell hasn't built slots yet (e.g. core used standalone). Create a fallback inside the workspace
+    // so the standalone usage still renders relations and shell mount can later relocate them.
+    slot = document.createElement("div");
+    slot.dataset.slot = name;
+    document.body.append(slot);
+  }
+  return slot;
+}
+const backlinksPanel = getSlot("backlinks") as HTMLDivElement;
+const noticesPanel = getSlot("override-notices") as HTMLDivElement;
+const referenceSidebarPanel = getSlot("reference-sidebar") as HTMLDivElement;
+// The shell owns section visibility and tab selection. The core renders slot contents only.
 let state: EditorState | null = null;
 let mutationVersion = 0;
 let inFlightMutation: SaveMutation | null = null;
@@ -18,11 +35,19 @@ let queuedMutation: SaveMutation | null = null;
 let commandTail: Promise<void> = Promise.resolve();
 let commandFailure: Error | null = null;
 let saveFailure: string | null = null;
+const history = new EditorHistory();
+let pendingHistoryMove: HistoryMove | null = null;
+let historySaveInProgress = false;
 const saveDrainWaiters: Array<() => void> = [];
 let activeEditable: HTMLElement | null = null;
 let activeBlock: HTMLElement | null = null;
 let linkMenuItems: Array<{ id: string; blockId?: string; title: string; meta: string; label: string }> = [];
 let linkMenuIndex = 0;
+const sidebarCollapsedIds = new Set<string>();
+
+// Drag & drop state
+let draggingBlockId: string | null = null;
+let dropIndicator: { targetId: string; position: "before" | "after" | "child" } | null = null;
 
 const referenceModeLabels: Record<ReferenceMode, string> = {
   inline: "正文直显",
@@ -44,22 +69,506 @@ function post(message: Message, sourceDocumentId = state?.note.id): Promise<void
   }
   const owner = sourceDocumentId;
   if (!owner) return Promise.resolve();
+  // Open on the user's action, not its delayed ACK: they may select another tab while waiting.
+  if (type === "setReferenceMode" && (payload as RequestMap["setReferenceMode"]).mode === "sidebar")
+    ui.showReferences?.();
   const commandKinds = new Set(["createReference", "setReferenceMode", "saveOverride", "saveInstanceBlock", "moveReferenceBlock", "deleteInstanceBlock", "hideReferenceBlock", "resetOverride", "resetReference", "removeReference"]);
   const operationName = (value: string) => value.replace(/[A-Z]/g, letter => "-" + letter.toLowerCase());
-  commandTail = commandTail.catch(() => undefined).then(async () => {
+    commandTail = commandTail.catch(() => undefined).then(async () => {
     const result = commandKinds.has(type)
       ? await host.executeCommand({ operation: operationName(type), ...(payload as Record<string, unknown>) }, owner)
       : await host.request(type, payload as RequestMap[typeof type], owner);
     commandFailure = null;
     if (result && "state" in result && state?.note.id === owner) {
-      // Text edits keep the caret; structural commands redraw after their ACK.
-      if (type === "saveOverride" || type === "saveInstanceBlock" || type === "moveReferenceBlock") {
-        state.references = result.state.references;
-      } else render(result.state);
+      // Single render entry point. After every state-mutating ACK, sync both the main
+      // blockSurface and the right-side reference/backlinks/notices panels from `result.state`.
+      // The individual renderers (renderOwnBlock diff, renderRelations diff, renderBacklinks,
+      // renderNotices) are diff-based and atomic — no panel ever flashes empty mid-update.
+      // For text edits on a focused contentEditable, we preserve caret/IME across re-render.
+      applyServerState(result.state, type);
     }
     saveStatus.textContent = "已保存";
   }).catch(error => { commandFailure = error; showError(error); });
-  return commandTail;
+  return commandTail as Promise<void>;
+}
+
+/**
+ * Apply a server-authoritative state to the editor. Replaces every previous per-command
+ * branching (was: "if saveOverride skip re-render, if createReference skip re-render, …").
+ * All renderers are diff-based, so this is safe to call after every ACK — no DOM thrash,
+ * no intermediate empty states, and any panel that drifted out of sync is self-corrected.
+ *
+ * For commands that don't carry `state` (loadDocument, navigateBack/Forward) the caller
+ * still goes through `render()` — this function is purely for command ACKs.
+ */
+function applyServerState(next: EditorState, sourceType: string) {
+  if (!state) return;
+  // Capture caret on any focused contentEditable row so text-edit ACKs (saveOverride,
+  // saveInstanceBlock) can restore it after a partial row re-render.
+  const caret = captureCaret();
+  state = next;
+  // Sync DOM. This rebuilds only what changed (rows added/moved/removed, cards added/removed).
+  renderAllPanels();
+  // For text-edit commands, restore caret. For structural commands we don't restore —
+  // structural changes inherently move focus and re-render is correct.
+  if (sourceType === "saveOverride" || sourceType === "saveInstanceBlock") restoreCaret(caret);
+  if (!historySaveInProgress) history.record(next, historyLabel(sourceType), sourceType === "saveDocument" ? "edit" : "command");
+  else {
+    historySaveInProgress = false;
+    if (pendingHistoryMove) { history.commit(pendingHistoryMove); pendingHistoryMove = null; }
+  }
+  publishHistory();
+  saveStatus.textContent = "已同步本地数据库";
+}
+
+function historyLabel(sourceType: string) {
+  return ({
+    saveDocument: "编辑正文",
+    createReference: "新增引用",
+    setReferenceMode: "切换引用显示",
+    saveOverride: "编辑引用覆写",
+    saveInstanceBlock: "编辑引用块",
+    moveReferenceBlock: "移动引用块",
+    deleteInstanceBlock: "删除引用块",
+    hideReferenceBlock: "隐藏引用块",
+    resetOverride: "恢复引用继承",
+    resetReference: "恢复全部引用",
+    removeReference: "删除引用",
+    "restore-snapshot": "恢复历史版本"
+  } as Record<string, string>)[sourceType] ?? "更新文档";
+}
+
+async function moveHistory(direction: "undo" | "redo") {
+  if (!state || pendingHistoryMove) return;
+  try {
+    await flush();
+    const move = direction === "undo" ? history.beginUndo() : history.beginRedo();
+    if (!move) return;
+    pendingHistoryMove = move;
+    historySaveInProgress = true;
+    saveStatus.textContent = direction === "undo" ? "正在撤销..." : "正在重做...";
+    const snapshot = history.stateFor(move);
+    await post({ type: "executeCommand", operation: "restore-snapshot", state: snapshot } as Message, state.note.id);
+  } catch (error) {
+    historySaveInProgress = false;
+    if (pendingHistoryMove) { history.rollback(pendingHistoryMove); pendingHistoryMove = null; }
+    publishHistory();
+    showError(error);
+  }
+}
+
+async function restoreHistory(id: string) {
+  if (!state || pendingHistoryMove) return;
+  try {
+    await flush();
+    const move = history.beginRestore(id);
+    if (!move) return;
+    pendingHistoryMove = move;
+    historySaveInProgress = true;
+    saveStatus.textContent = "正在恢复历史版本...";
+    const snapshot = history.stateFor(move);
+    await post({ type: "executeCommand", operation: "restore-snapshot", state: snapshot } as Message, state.note.id);
+  } catch (error) {
+    historySaveInProgress = false;
+    if (pendingHistoryMove) { history.rollback(pendingHistoryMove); pendingHistoryMove = null; }
+    publishHistory();
+    showError(error);
+  }
+}
+
+function publishHistory() {
+  if (!state) return;
+  const model = history.model();
+  ui.updateHistory?.(model);
+  const undo = document.querySelector<HTMLButtonElement>("#undo");
+  const redo = document.querySelector<HTMLButtonElement>("#redo");
+  if (undo) undo.disabled = !model.canUndo;
+  if (redo) redo.disabled = !model.canRedo;
+}
+
+function captureCaret(): { editable: HTMLElement; offset: number; marker: string } | null {
+  const active = document.activeElement as HTMLElement | null;
+  if (!active || !active.classList?.contains("block-text")) return null;
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return null;
+  const range = sel.getRangeAt(0);
+  if (!active.contains(range.startContainer) && range.startContainer !== active) return null;
+  const pre = range.cloneRange();
+  pre.selectNodeContents(active);
+  pre.setEnd(range.startContainer, range.startOffset);
+  // Capture a unique identifier for the editable that survives re-render. For contentEditable
+  // inside a reference row, the row has data-target-block-id; for regular own blocks, the
+  // shell has data-id. We look outward for the most specific marker.
+  const refRow = active.closest<HTMLElement>(".reference-row");
+  const marker = refRow
+    ? `refRow:${refRow.dataset.referenceInstanceId}:${refRow.dataset.targetBlockId}`
+    : (active.closest<HTMLElement>("[data-own-block]")?.dataset.id ?? "");
+  return { editable: active, offset: pre.toString().length, marker };
+}
+
+function restoreCaret(caret: ReturnType<typeof captureCaret>) {
+  if (!caret) return;
+  // Find the editable that matches the marker. For ref-row markers, locate by reference-id
+  // + target-block-id (preserves which instance row the user was typing in). For own-block
+  // markers, locate by block id.
+  let newEditable: HTMLElement | null = null;
+  if (caret.marker.startsWith("refRow:")) {
+    const [, refId, targetBlockId] = caret.marker.split(":");
+    const sel = `[data-reference-instance-id="${CSS.escape(refId)}"][data-target-block-id="${CSS.escape(targetBlockId)}"] .block-text`;
+    newEditable = document.querySelector<HTMLElement>(sel);
+  } else if (caret.marker) {
+    newEditable = document.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(caret.marker)}"] .block-text`);
+  }
+  // Fallback to the original (likely now-detached) editable if we couldn't find a match.
+  if (!newEditable || !newEditable.isConnected) newEditable = caret.editable.isConnected ? caret.editable : null;
+  if (!newEditable) return;
+  const offset = Math.min(caret.offset, (newEditable.textContent ?? "").length);
+  newEditable.focus({ preventScroll: true });
+  const range = document.createRange();
+  const walker = document.createTreeWalker(newEditable, NodeFilter.SHOW_TEXT, null);
+  let remaining = offset;
+  let node: Node | null = walker.nextNode();
+  while (node) {
+    const len = (node.nodeValue ?? "").length;
+    if (remaining <= len) {
+      range.setStart(node, remaining);
+      range.collapse(true);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+      return;
+    }
+    remaining -= len;
+    node = walker.nextNode();
+  }
+}
+
+/**
+ * Sync every right-side panel + the main block surface with the current `state`.
+ * This is the single point where state → DOM conversion happens (after every ACK).
+ */
+function renderAllPanels() {
+  if (!state) return;
+  // Main area: diff the blockSurface (preserve focusable rows, replace structural diff).
+  syncBlockSurface();
+  // Right-side panels: each is a self-contained diff.
+  renderRelations();
+  syncBacklinks();
+  syncNotices();
+  titleInput.value = state.note.title;
+}
+
+/** Diff the main block surface against current state.blocks. */
+function syncBlockSurface() {
+  if (!state) return;
+  const wantedIds = new Set(state.blocks.map(b => b.id));
+  // Remove shells that no longer belong
+  blockSurface.querySelectorAll<HTMLElement>("[data-own-block]").forEach((shell) => {
+    const id = shell.dataset.id!;
+    if (!wantedIds.has(id)) shell.remove();
+  });
+  // Insert / update in order
+  let prev: Element | null = null;
+  for (const block of state.blocks) {
+    const id = block.id;
+    const existing = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(id)}"]`);
+    let shell: HTMLElement;
+    if (existing) {
+      // Update properties + depth without destroying the row (preserves focused contentEditable)
+      existing.style.setProperty("--depth", String(blockDepth(block, state.blocks)));
+      existing.dataset.type = block.type;
+      existing.dataset.parentId = block.parentId ?? "";
+      // For reference-type shells, the inner card may need re-rendering when the underlying
+      // reference's structure changed (e.g. blocks hidden/added/overridden). We replace the
+      // inner card only when its row signature differs from current state — typing inside a
+      // focused contentEditable row is safe because the row DOM is only touched when the
+      // number/order of rows actually changed.
+      if (block.type === "reference") {
+        const reference = state.references.find((ref) => ref.hostBlockId === id);
+        const mode = reference?.mode ?? "inline";
+        // Ensure the inline detach (×) button exists in the card summary for existing shells.
+        const summary = existing.querySelector(".reference-card-summary");
+        if (summary && !summary.querySelector(".reference-detach")) {
+          const delBtn = document.createElement("button");
+          delBtn.type = "button";
+          delBtn.className = "reference-detach";
+          delBtn.title = "断开引用（保留为正文）";
+          delBtn.setAttribute("aria-label", "断开引用（保留为正文）");
+          delBtn.textContent = "×";
+          delBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const ref = state!.references.find(r => r.hostBlockId === id);
+            if (!ref) return;
+            detachReferenceAsPlainText(ref);
+          });
+          summary.append(delBtn);
+        }
+        const newBody = renderReferenceBody(reference, mode, id);
+        const oldBody = existing.querySelector<HTMLElement>(":scope > .reference-card, :scope > .sidebar-reference-entry");
+        if (oldBody) {
+          const oldSig = oldBody.dataset.rowSignature ?? "";
+          const newSig = newBody?.dataset.rowSignature ?? "";
+          if (oldSig !== newSig) {
+            oldBody.replaceWith(newBody!);
+          }
+        } else if (newBody) {
+          // No body yet (heading-only mode previously); add it if reference now warrants one.
+          existing.append(newBody);
+        } else if (mode === "sidebar" || mode === "link") {
+          // We were in entry mode and still should be — leave existing entry alone if any.
+          const entry = existing.querySelector<HTMLElement>(".sidebar-reference-entry");
+          if (!entry && reference) {
+            const e = document.createElement("button");
+            e.type = "button";
+            e.className = "sidebar-reference-entry reference-title";
+            e.dataset.targetId = reference.targetDocumentId;
+            if (reference.targetBlockId) e.dataset.targetBlockId = reference.targetBlockId;
+            e.dataset.referenceId = reference.id;
+            e.textContent = reference.targetTitle;
+            e.title = "悬停预览 · 单击分栏 · 双击打开源";
+            existing.append(e);
+          }
+        }
+      }
+      shell = existing;
+    } else {
+      shell = renderOwnBlockShell(block);
+    }
+    const nextSibling: Element | null = (prev?.nextElementSibling ?? blockSurface.firstElementChild) as Element | null;
+    if (nextSibling !== shell) blockSurface.insertBefore(shell, nextSibling);
+    prev = shell;
+  }
+  mountEmbeddedReferences();
+}
+
+/**
+ * Build the body element that goes after the reference heading (inside the main block-surface
+ * shell). Returns either a reference-card, a sidebar-reference-entry, or null if there's
+ * nothing to render. The returned element carries a `data-row-signature` for diff use.
+ */
+function renderReferenceBody(reference: ReferenceInstance | undefined, mode: ReferenceMode, hostBlockId: string): HTMLElement | null {
+  if (!reference) return null;
+  if (mode === "sidebar" || mode === "link") {
+    const entry = document.createElement("button");
+    entry.type = "button";
+    entry.className = "sidebar-reference-entry reference-title";
+    entry.dataset.targetId = reference.targetDocumentId;
+    if (reference.targetBlockId) entry.dataset.targetBlockId = reference.targetBlockId;
+    entry.dataset.referenceId = reference.id;
+    entry.textContent = reference.targetTitle;
+    entry.title = "悬停预览 · 单击分栏 · 双击打开源";
+    return entry;
+  }
+  const card = renderReference(reference, false);
+  // Stash a structural signature so syncBlockSurface can detect structural changes.
+  card.dataset.rowSignature = rowSignature(reference);
+  return card;
+}
+
+/** Compact representation of a reference's currently visible rows. Includes mode, hidden
+ * list, overrides fingerprint, and any visible row ids/parents/positions. Used by both
+ * syncBlockSurface and renderRelations to decide whether to reuse existing DOM or rebuild.
+ */
+function rowSignature(r: ReferenceInstance): string {
+  const hidden = new Set(r.hiddenBlockIds);
+  const isHidden = (block: Block): boolean => {
+    let candidate: Block | undefined = block;
+    const visited = new Set<string>();
+    while (candidate && !visited.has(candidate.id)) {
+      if (hidden.has(candidate.id)) return true;
+      visited.add(candidate.id);
+      candidate = r.blocks.find((item) => item.id === candidate?.parentId);
+    }
+    return false;
+  };
+  const rows = r.blocks.filter((b) => !isHidden(b)).map((b) => `${b.id}:${b.parentId ?? ""}:${b.position}`).join("|");
+  // Fingerprint overrides so source content edits and resetOverride re-render the row.
+  const ov = r.overrides.map((o) => `${o.targetBlockId}:${o.baseRevision}:${o.patch.content?.text?.length ?? 0}`).join(";");
+  return `${r.mode}|${rows}|${ov}`;
+}
+
+function renderOwnBlockShell(block: Block): HTMLElement {
+  const shell = document.createElement("div");
+  shell.className = "block-shell";
+  shell.dataset.ownBlock = "true";
+  shell.dataset.id = block.id;
+  shell.dataset.parentId = block.parentId ?? "";
+  shell.dataset.type = block.type;
+  shell.style.setProperty("--depth", String(blockDepth(block, state!.blocks)));
+  if (block.type === "reference") {
+    const reference = state!.references.find((item) => item.hostBlockId === block.id);
+    const mode = reference?.mode ?? "inline";
+    shell.innerHTML = `<div class="reference-heading"><button type="button" class="grip" aria-label="引用菜单" title="引用显示方式" draggable="true">⠿</button></div>`;
+    const body = renderReferenceBody(reference, mode, block.id);
+    if (body) {
+      shell.append(body);
+      // Add a × button to the card summary so the user can detach this reference inline
+      // without needing to open the menu. Inserted at the END of the summary to avoid
+      // intercepting clicks on existing summary buttons (expand/mode-menu).
+      const summary = body.querySelector(".reference-card-summary");
+      if (summary) {
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "reference-detach";
+        delBtn.title = "断开引用（保留为正文）";
+        delBtn.setAttribute("aria-label", "断开引用（保留为正文）");
+        delBtn.textContent = "×";
+        delBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const ref = state!.references.find(r => r.hostBlockId === block.id);
+          if (!ref) return;
+          detachReferenceAsPlainText(ref);
+        });
+        summary.append(delBtn);
+      }
+    }
+  } else {
+    shell.append(createEditableRow(block));
+  }
+  return shell;
+}
+
+function syncBacklinks() {
+  if (!state) return;
+  // Diff: same pattern as renderRelations but for backlinks.
+  const desired = state.backlinks;
+  const existing = new Map<string, HTMLElement>();
+  backlinksPanel.querySelectorAll<HTMLElement>(".backlink-card").forEach((el) => {
+    const key = el.dataset.sourceId ?? el.outerHTML;
+    existing.set(key, el);
+  });
+  const fragment = document.createDocumentFragment();
+  if (!desired.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "暂无反向链接。在其他文档中链接或嵌入引用此处时会自动出现。";
+    fragment.append(empty);
+  } else {
+    const intro = document.createElement("div");
+    intro.className = "panel-intro";
+    intro.textContent = `${desired.length} 处引用了此文档`;
+    fragment.append(intro);
+    desired.forEach((link) => {
+      const key = `${link.sourceDocumentId}:${link.sourceBlockId ?? ""}`;
+      let card = existing.get(key);
+      if (!card) {
+        card = document.createElement("div");
+        card.className = "backlink-card";
+        card.dataset.sourceId = key;
+        const head = document.createElement("div");
+        head.className = "backlink-head";
+        const icon = document.createElement("span");
+        icon.className = "backlink-icon";
+        icon.textContent = "🔗";
+        const title = document.createElement("span");
+        title.className = "backlink-title";
+        title.textContent = link.sourceTitle;
+        const open = document.createElement("button");
+        open.type = "button";
+        open.className = "backlink-open";
+        open.textContent = "打开";
+        open.title = "打开源文档";
+        head.append(icon, title, open);
+        const excerpt = document.createElement("div");
+        excerpt.className = "backlink-excerpt";
+        excerpt.textContent = link.excerpt || "(无文本)";
+        card.append(head, excerpt);
+        card.addEventListener("click", (event) => {
+          if ((event.target as HTMLElement).closest(".backlink-open")) return;
+          open.click();
+        });
+        open.addEventListener("click", () => {
+          if (link.sourceBlockId) {
+            postAfterFlush({ type: "openDocument", documentId: link.sourceDocumentId, blockId: link.sourceBlockId });
+          } else {
+            postAfterFlush({ type: "openDocument", documentId: link.sourceDocumentId });
+          }
+        });
+      }
+      fragment.append(card);
+      existing.delete(key);
+    });
+  }
+  existing.forEach((el) => el.remove());
+  backlinksPanel.replaceChildren(fragment);
+}
+
+function syncNotices() {
+  if (!state) return;
+  const labels = {
+    content_style: "修改了内容或样式",
+    hide: "隐藏了此块",
+    move: "调整了层级或顺序",
+    insert: "增加了专属块"
+  } as const;
+  const desired = state.overrideNotices;
+  const fragment = document.createDocumentFragment();
+  if (!desired.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "暂无外部覆写通知。当其他文档修改、重排或隐藏了本块的引用副本时，会在此列出。";
+    fragment.append(empty);
+  } else {
+    const intro = document.createElement("div");
+    intro.className = "panel-intro";
+    intro.textContent = `${desired.length} 条来自其他引用的覆写通知`;
+    fragment.append(intro);
+    desired.forEach((notice) => {
+      const card = document.createElement("div");
+      card.className = "notice-card" + (notice.sourceUpdated ? " warning" : "");
+      const head = document.createElement("div");
+      head.className = "notice-head";
+      const badge = document.createElement("span");
+      badge.className = `notice-badge kind-${notice.kind}`;
+      badge.textContent = ({ content_style: "改", hide: "隐", move: "移", insert: "增" } as const)[notice.kind];
+      const title = document.createElement("span");
+      title.className = "notice-title";
+      title.textContent = notice.hostTitle;
+      head.append(badge, title);
+      const desc = document.createElement("div");
+      desc.className = "notice-desc";
+      const kindLabel = labels[notice.kind] ?? "修改";
+      desc.innerHTML = notice.sourceUpdated
+        ? `<strong>源内容已更新</strong> · ${escapeText(notice.hostTitle)} ${escapeText(kindLabel)}了 <em>${escapeText(notice.excerpt || "此块")}</em>`
+        : `${escapeText(notice.hostTitle)} ${escapeText(kindLabel)}了 <em>${escapeText(notice.excerpt || "此块")}</em>`;
+      card.append(head, desc);
+      const actions = document.createElement("div");
+      actions.className = "notice-actions";
+      const openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.textContent = "打开";
+      openBtn.onclick = () => postAfterFlush({ type: "openDocument", documentId: notice.hostDocumentId });
+      actions.append(openBtn);
+      if (notice.kind === "hide") {
+        const reset = document.createElement("button");
+        reset.type = "button";
+        reset.textContent = "取消隐藏";
+        reset.onclick = () => postAfterFlush({ type: "resetOverride", referenceInstanceId: notice.referenceInstanceId, targetBlockId: notice.targetBlockId });
+        actions.append(reset);
+      } else if (notice.kind === "content_style") {
+        const reset = document.createElement("button");
+        reset.type = "button";
+        reset.textContent = "恢复继承";
+        reset.onclick = () => postAfterFlush({ type: "resetOverride", referenceInstanceId: notice.referenceInstanceId, targetBlockId: notice.targetBlockId });
+        actions.append(reset);
+      } else if (notice.kind === "insert") {
+        const reset = document.createElement("button");
+        reset.type = "button";
+        reset.textContent = "删除专属块";
+        reset.onclick = () => postAfterFlush({ type: "deleteInstanceBlock", referenceInstanceId: notice.referenceInstanceId, blockId: notice.targetBlockId });
+        actions.append(reset);
+      } else if (notice.kind === "move") {
+        const reset = document.createElement("button");
+        reset.type = "button";
+        reset.textContent = "恢复位置";
+        reset.onclick = () => postAfterFlush({ type: "resetOverride", referenceInstanceId: notice.referenceInstanceId, targetBlockId: notice.targetBlockId });
+        actions.append(reset);
+      }
+      card.append(actions);
+      fragment.append(card);
+    });
+  }
+  noticesPanel.replaceChildren(fragment);
 }
 function showError(error: unknown) {
   saveStatus.textContent = "保存失败：" + (error instanceof Error ? error.message : String(error));
@@ -126,13 +635,21 @@ function handleSaveAck(message: { mutationId: string; documentId: string; client
   if (state?.note.id === message.documentId) state.note.clientVersion = message.clientVersion;
   saveFailure = null;
   inFlightMutation = null;
+  if (state?.note.id === message.documentId) {
+    if (!historySaveInProgress) history.record(state, "编辑正文", "edit");
+    else {
+      historySaveInProgress = false;
+      if (pendingHistoryMove) { history.commit(pendingHistoryMove); pendingHistoryMove = null; }
+    }
+    publishHistory();
+  }
   saveStatus.textContent = "已保存到本地数据库";
   pumpSaveQueue();
   finishSaveDrain();
   if (!inFlightMutation && !queuedMutation && state?.references.some(reference => reference.targetDocumentId === message.documentId)) {
     void refreshLiveReferences();
   }
-  if (!inFlightMutation && !queuedMutation && sidebarLink?.documentId === message.documentId && !sidebarLink.referenceId) void showLinkSidebar(sidebarLink);
+  if (!inFlightMutation && !queuedMutation && sidebarLink?.documentId === message.documentId && !sidebarLink.referenceId) void showLinkSidebar(sidebarLink, false);
 }
 
 let deferredReferenceRefresh = false;
@@ -162,6 +679,10 @@ async function refreshLiveReferences() {
       shell?.querySelectorAll<HTMLElement>(".reference-heading strong, .sidebar-reference-entry strong").forEach(title => title.textContent = reference.targetTitle);
     });
     current.references = next.references;
+    // Backlinks and override notices also depend on cross-document data, refresh them as well.
+    current.backlinks = next.backlinks;
+    current.overrideNotices = next.overrideNotices;
+    renderRelations();
   } catch (error) {
     saveStatus.textContent = "引用刷新失败：" + (error instanceof Error ? error.message : String(error));
   }
@@ -182,6 +703,11 @@ function handleSaveNack(message: { mutationId: string; error: string }) {
   queuedMutation = null;
   mutationVersion = state?.note.clientVersion ?? 0;
   saveFailure = error;
+  if (historySaveInProgress) {
+    historySaveInProgress = false;
+    if (pendingHistoryMove) { history.rollback(pendingHistoryMove); pendingHistoryMove = null; }
+    publishHistory();
+  }
   saveStatus.textContent = `保存失败：${error}`;
   showError(error);
   saveDrainWaiters.splice(0).forEach(resolve => resolve());
@@ -207,21 +733,6 @@ function newId() {
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
-}
-
-function sanitizeHtml(html: string) {
-  const template = document.createElement("template");
-  template.innerHTML = html;
-  template.content.querySelectorAll("[data-reference-host-id]").forEach(anchor => anchor.replaceChildren());
-  const allowed = new Set(["B", "STRONG", "I", "EM", "MARK", "BR", "SPAN"]);
-  [...template.content.querySelectorAll("*")].forEach((element) => {
-    if (!allowed.has(element.tagName)) element.replaceWith(...element.childNodes);
-    else [...element.attributes].forEach((attribute) => {
-      const allowedLinkAttribute = ["data-target-id", "data-target-block-id", "data-target-title", "data-reference-host-id"].includes(attribute.name);
-      if (attribute.name !== "style" && !allowedLinkAttribute || attribute.name === "style" && !/^(background-color|color):/i.test(attribute.value)) element.removeAttribute(attribute.name);
-    });
-  });
-  return template.innerHTML;
 }
 
 function renderLinkedHtml(html: string) {
@@ -328,30 +839,47 @@ async function showLinkPreview(target: LinkDestination) {
     popup.addEventListener("mouseleave", dismissPreview);
   } catch { if (sequence === previewSequence) dismissPreview(); }
 }
-async function showLinkSidebar(target: LinkDestination) {
+function renderSidebarPreview(reference: ReferenceInstance, target: LinkDestination) {
+  const header = document.createElement("div"); header.className = "sidebar-preview-heading";
+  const title = document.createElement("span"); title.textContent = reference.targetTitle;
+  const close = document.createElement("button"); close.textContent = "×"; close.setAttribute("aria-label", "关闭分栏");
+  close.onclick = () => { sidebarLink = null; sidebarSequence++; renderRelations(); };
+  const embed = document.createElement("button"); embed.textContent = "嵌入正文";
+  embed.onclick = () => {
+    if (target.referenceId) {
+      sidebarLink = null;
+      sidebarSequence++;
+      const current = state?.references.find(item => item.id === target.referenceId);
+      if (current) setReferenceMode(current, "inline");
+    } else createReferenceForTarget(target.documentId, target.blockId, "inline", target.anchor);
+  };
+  header.append(title, embed, close);
+  referenceSidebarPanel.replaceChildren(header, target.referenceId ? renderReference(reference, true) : readOnlyProjection(reference));
+}
+
+async function showLinkSidebar(target: LinkDestination, activate = true) {
   dismissPreview(); sidebarLink = target;
   const sequence = ++sidebarSequence;
   const owner = state?.note.id;
+  if (activate) ui.showReferences?.();
+  if (!referenceSidebarPanel.hasChildNodes()) {
+    const loading = document.createElement("div"); loading.className = "empty"; loading.textContent = "正在加载引用…";
+    referenceSidebarPanel.append(loading);
+  }
   try {
     const reference = await targetProjection(target);
     if (sequence !== sidebarSequence || owner !== state?.note.id) return;
-    referenceSidebarSection.hidden = false;
-    referenceSidebarPanel.replaceChildren();
-    const header = document.createElement("div"); header.className = "sidebar-preview-heading";
-    const title = document.createElement("span"); title.textContent = reference.targetTitle;
-    const close = document.createElement("button"); close.textContent = "×"; close.setAttribute("aria-label", "关闭分栏");
+    renderSidebarPreview(reference, target);
+  } catch (error) {
+    if (sequence !== sidebarSequence || owner !== state?.note.id) return;
+    const msg = document.createElement("div");
+    msg.className = "empty";
+    msg.textContent = "无法加载分栏预览：" + (error instanceof Error ? error.message : String(error));
+    const close = document.createElement("button"); close.textContent = "关闭分栏";
     close.onclick = () => { sidebarLink = null; sidebarSequence++; renderRelations(); };
-    const embed = document.createElement("button"); embed.textContent = "嵌入正文";
-    embed.onclick = () => {
-      if (target.referenceId) {
-        sidebarLink = null;
-        const current = state?.references.find(item => item.id === target.referenceId);
-        if (current) setReferenceMode(current, "inline");
-      } else createReferenceForTarget(target.documentId, target.blockId, "inline", target.anchor);
-    };
-    header.append(title, embed, close);
-    referenceSidebarPanel.append(header, target.referenceId ? renderReference(reference, true) : readOnlyProjection(reference));
-  } catch (error) { showError(error); }
+    referenceSidebarPanel.replaceChildren(msg, close);
+    showError(error);
+  }
 }
 document.addEventListener("mouseover", event => {
   const target = linkDestination(event.target);
@@ -406,13 +934,29 @@ function render(next: EditorState) {
   if (changed) { sidebarLink = null; sidebarSequence++; }
   state = next;
   activeEditable = null;
-  if (changed) { saveFailure = null; commandFailure = null; mutationVersion = next.note.clientVersion ?? 0; }
+  if (changed) {
+    saveFailure = null;
+    commandFailure = null;
+    mutationVersion = next.note.clientVersion ?? 0;
+    pendingHistoryMove = null;
+    historySaveInProgress = false;
+    history.load(next.note.id, next);
+  }
   else mutationVersion = Math.max(mutationVersion, next.note.clientVersion ?? 0);
+  // Normalize blocks list: an empty doc still needs at least one shell to edit.
+  if (next.blocks.length === 0) next.blocks.push(createBlock());
   titleInput.value = next.note.title;
-  blockSurface.innerHTML = "";
-  (next.blocks.length ? next.blocks : [createBlock()]).forEach((block) => renderOwnBlock(block));
-  mountEmbeddedReferences();
-  renderRelations();
+  // Wipe and rebuild blockSurface for a doc switch (changed === true). For same-doc refreshes,
+  // run a diff via renderAllPanels so focused contentEditables survive. We fall back to a full
+  // rebuild for the doc-switch path because the old shells belong to a different document.
+  if (changed) {
+    blockSurface.innerHTML = "";
+    next.blocks.forEach((block) => blockSurface.append(renderOwnBlockShell(block)));
+    mountEmbeddedReferences();
+  }
+  // Always re-sync right-side panels + diff main area for same-doc updates.
+  renderAllPanels();
+  publishHistory();
   saveStatus.textContent = "已同步本地数据库";
 }
 
@@ -442,42 +986,24 @@ function createBlock(type: BlockType = "paragraph", parentId: string | null = nu
   return { id: newId(), parentId, position: "", type, content: { text: "", html: "", checked: false }, properties: {}, revision: 1 };
 }
 
-function renderOwnBlock(block: Block) {
-  if (!state) return;
-  const shell = document.createElement("div");
-  shell.className = "block-shell";
-  shell.dataset.ownBlock = "true";
-  shell.dataset.id = block.id;
-  shell.dataset.parentId = block.parentId ?? "";
-  shell.dataset.type = block.type;
-  shell.style.setProperty("--depth", String(blockDepth(block, state.blocks)));
-
-  if (block.type === "reference") {
-    const reference = state.references.find((item) => item.hostBlockId === block.id);
-    const mode = reference?.mode ?? "inline";
-    shell.innerHTML = `<div class="reference-heading"><button type="button" class="grip" aria-label="引用菜单" title="引用显示方式">⠿</button></div>`;
-    if (reference && (mode === "sidebar" || mode === "link")) {
-      const entry = document.createElement("button");
-      entry.type = "button";
-      entry.className = "sidebar-reference-entry reference-title";
-      entry.dataset.targetId = reference.targetDocumentId;
-      if (reference.targetBlockId) entry.dataset.targetBlockId = reference.targetBlockId;
-      entry.dataset.referenceId = reference.id;
-      entry.textContent = reference.targetTitle;
-      entry.title = "悬停预览 · 单击分栏 · 双击打开源";
-      shell.append(entry);
-    } else if (reference) shell.append(renderReference(reference));
-  } else {
-    shell.append(createEditableRow(block));
-  }
-  blockSurface.append(shell);
+function removeOwnBlock(shell: HTMLElement | null) {
+  if (!shell) return;
+  // Keep surviving children at the deleted block's level, never with a dangling parent ID.
+  blockSurface.querySelectorAll<HTMLElement>("[data-own-block]").forEach(child => {
+    if (child.dataset.parentId === shell.dataset.id && !shell.contains(child))
+      child.dataset.parentId = shell.dataset.parentId ?? "";
+  });
+  shell.remove();
+  recalculateDepths();
+  if (!blockSurface.querySelector("[data-own-block]")) addBlock("paragraph");
+  scheduleDocumentSave(0);
 }
 
 function createEditableRow(block: Block) {
   const row = document.createElement("div");
   row.className = "block-row";
   const checkbox = block.type === "todo" ? `<input class="todo-check" type="checkbox" ${block.content.checked ? "checked" : ""}>` : "";
-  row.innerHTML = `<button type="button" class="grip" aria-label="块菜单">⠿</button>${checkbox}<div class="block-text ${block.type === "heading" ? "heading" : ""}" contenteditable="true"></div><button class="delete-block" title="删除块">×</button>`;
+  row.innerHTML = `<button type="button" class="grip" aria-label="块菜单" draggable="true">⠿</button>${checkbox}<div class="block-text ${block.type === "heading" ? "heading" : ""}" contenteditable="true"></div><button class="delete-block" title="删除块">×</button>`;
   const editable = row.querySelector<HTMLElement>(".block-text")!;
   editable.innerHTML = renderLinkedHtml(block.content.html || escapeText(block.content.text));
   editable.style.backgroundColor = block.properties.background ?? "";
@@ -487,9 +1013,7 @@ function createEditableRow(block: Block) {
   editable.addEventListener("keydown", handleBlockKeydown);
   row.querySelector("input")?.addEventListener("change", () => scheduleDocumentSave(0));
   row.querySelector(".delete-block")?.addEventListener("click", () => {
-    row.closest("[data-own-block]")?.remove();
-    if (!blockSurface.querySelector("[data-own-block]")) addBlock("paragraph");
-    scheduleDocumentSave(0);
+    removeOwnBlock(row.closest<HTMLElement>("[data-own-block]"));
   });
   return row;
 }
@@ -531,21 +1055,6 @@ function readOwnBlocks(): Block[] {
   });
 }
 
-function editableContent(editable: HTMLElement, fallback: BlockContent = { text: "", html: "" }): BlockContent {
-  const clean = editable.cloneNode(true) as HTMLElement;
-  clean.querySelectorAll("[data-reference-host-id]").forEach(anchor => anchor.replaceChildren());
-  const textOnly = clean.cloneNode(true) as HTMLElement;
-  textOnly.querySelectorAll("br").forEach(br => br.replaceWith("\n"));
-  const text = textOnly.textContent ?? "";
-  const links: LinkToken[] = [];
-  clean.querySelectorAll<HTMLElement>(".wiki-link").forEach((link) => {
-    const targetText = link.textContent ?? "";
-    const start = text.indexOf(targetText);
-    links.push({ targetDocumentId: link.dataset.targetId, targetBlockId: link.dataset.targetBlockId, targetText, start: Math.max(0, start), end: Math.max(0, start) + targetText.length });
-  });
-  return { ...fallback, text, html: sanitizeHtml(clean.innerHTML), links };
-}
-
 function scheduleDocumentSave(_delay = 0) {
   enqueueDocumentSave();
 }
@@ -554,24 +1063,81 @@ function saveDocument() {
   enqueueDocumentSave();
 }
 
+/**
+ * Compare two references' rendered structure (which blocks are visible, in what order,
+ * with what hidden/override flags). Returns true when the two would render the same set
+ * of rows — useful for deciding whether a saveInstanceBlock / moveReferenceBlock /
+ * hideReferenceBlock ACK requires a card re-render (which would clobber focused
+ * contentEditables). Returns false when blocks were added/removed/moved/re-parented
+ * or hidden state changed.
+ */
+function sameInstanceStructure(a: ReferenceInstance, b: ReferenceInstance): boolean {
+  return visibleRowSignature(a) === visibleRowSignature(b);
+}
+
+/**
+ * Signature of a reference's currently visible rows. Used both for change detection
+ * and to skip re-rendering sidebar cards whose DOM already matches state.
+ */
+function visibleRowSignature(r: ReferenceInstance): string {
+  const hidden = new Set(r.hiddenBlockIds);
+  const isHidden = (block: Block): boolean => {
+    let candidate: Block | undefined = block;
+    const visited = new Set<string>();
+    while (candidate && !visited.has(candidate.id)) {
+      if (hidden.has(candidate.id)) return true;
+      visited.add(candidate.id);
+      candidate = r.blocks.find((item) => item.id === candidate?.parentId);
+    }
+    return false;
+  };
+  return r.blocks.filter((b) => !isHidden(b)).map((b) => `${b.id}:${b.parentId ?? ""}:${b.position}`).join("|");
+}
+
+// (sameInstanceStructure / visibleRowSignature are no longer needed: renderRelations runs on
+// every ACK and diffs against current state, so we always re-render stale cards.)
+
 function renderReference(reference: ReferenceInstance, inSidebar = false) {
   const card = document.createElement("section");
   const collapsed = !inSidebar && reference.mode === "collapsed";
-  card.className = `reference-card ${collapsed ? "collapsed is-collapsed" : "is-expanded"} ${inSidebar ? "sidebar" : ""}`;
+  const sidebarCollapsed = inSidebar && sidebarCollapsedIds.has(reference.id);
+  card.className = `reference-card ${collapsed ? "collapsed is-collapsed" : "is-expanded"} ${inSidebar ? (sidebarCollapsed ? "sidebar is-collapsed" : "sidebar") : ""}`;
   card.dataset.referenceId = reference.id;
-  if (!inSidebar) {
-    const summary = document.createElement("div");
-    summary.className = "reference-card-summary";
-    summary.innerHTML = `<button type="button" class="reference-expand" aria-expanded="${!collapsed}" aria-label="${collapsed ? "展开" : "收起"}" title="${collapsed ? "展开引用正文" : "折叠引用正文"}">${collapsed ? "▸" : "▾"}</button><button type="button" class="reference-title" data-target-id="${escapeText(reference.targetDocumentId)}" data-reference-id="${escapeText(reference.id)}">${escapeText(reference.targetTitle)}</button>`;
-    const title = summary.querySelector<HTMLElement>(".reference-title")!;
-    if (reference.targetBlockId) title.dataset.targetBlockId = reference.targetBlockId;
-    const toggle = summary.querySelector<HTMLButtonElement>(".reference-expand")!;
-    toggle.addEventListener("click", (event) => {
+  // Every reference card has a summary header with collapse/expand toggle.
+  const summary = document.createElement("div");
+  summary.className = "reference-card-summary";
+  const isOpen = inSidebar ? !sidebarCollapsed : !collapsed;
+  const toggleLabel = isOpen ? "收起" : "展开";
+  const toggleIcon = isOpen ? "▾" : "▸";
+  const refTitle = escapeText(reference.targetTitle);
+  const targetDocId = escapeText(reference.targetDocumentId);
+  const refIdAttr = escapeText(reference.id);
+  summary.innerHTML = `<button type="button" class="reference-expand" aria-expanded="${isOpen}" aria-label="${toggleLabel}" title="${inSidebar ? (isOpen ? "折叠此引用" : "展开此引用") : (collapsed ? "展开引用正文" : "折叠引用正文")}">${toggleIcon}</button><button type="button" class="reference-title" data-target-id="${targetDocId}" data-reference-id="${refIdAttr}">${refTitle}</button>${inSidebar ? `<button type="button" class="reference-mode-menu" aria-label="引用显示方式" title="切换显示方式">⠿</button>` : ""}`;
+  const title = summary.querySelector<HTMLElement>(".reference-title")!;
+  if (reference.targetBlockId) title.dataset.targetBlockId = reference.targetBlockId;
+  const toggle = summary.querySelector<HTMLButtonElement>(".reference-expand")!;
+  toggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (inSidebar) {
+      // Sidebar-local collapse state, no protocol change needed.
+      if (sidebarCollapsedIds.has(reference.id)) sidebarCollapsedIds.delete(reference.id);
+      else sidebarCollapsedIds.add(reference.id);
+      const replacement = renderReference(reference, true);
+      card.replaceWith(replacement);
+      return;
+    }
+    setReferenceMode(reference, collapsed ? "inline" : "collapsed");
+  });
+  const modeMenuBtn = summary.querySelector<HTMLButtonElement>(".reference-mode-menu");
+  if (modeMenuBtn) {
+    modeMenuBtn.addEventListener("click", (event) => {
       event.stopPropagation();
-      setReferenceMode(reference, collapsed ? "inline" : "collapsed");
+      showReferenceMenu(modeMenuBtn, undefined, reference);
     });
-    card.append(summary);
   }
+  card.append(summary);
+  // Sidebar collapsed: skip row/footer rendering entirely (only show the summary header).
+  if (sidebarCollapsed) return card;
   const overrideMap = new Map(reference.overrides.map((item) => [item.targetBlockId, item]));
   const hidden = new Set(reference.hiddenBlockIds);
   const isHidden = (block: Block) => {
@@ -598,7 +1164,7 @@ function renderReference(reference: ReferenceInstance, inSidebar = false) {
     row.dataset.type = source.type;
     row.style.setProperty("--depth", String(blockDepth(source, reference.blocks)));
     const local = source.scopeType === "reference_instance";
-    row.innerHTML = `<div class="reference-meta"><span>${local ? "本地新增" : override ? "已覆写" : "继承"}</span><button class="add-child" title="在引用中添加子块">+</button>${local ? "" : '<button class="reset" title="恢复源内容与位置">↺</button>'}<button class="hide" title="${local ? "删除本地块" : "在此引用中隐藏"}">×</button></div><button type="button" class="grip" aria-label="块菜单">⠿</button><div class="block-text ${source.type === "heading" ? "heading" : ""}" contenteditable="true"></div>`;
+    row.innerHTML = `<div class="reference-meta"><span>${local ? "本地新增" : override ? "已覆写" : "继承"}</span><button class="add-sibling" title="在同级新增块">+</button>${local ? "" : '<button class="reset" title="恢复源内容与位置">↺</button>'}<button class="hide" title="${local ? "删除本地块" : "在此引用中隐藏"}">×</button></div><button type="button" class="grip" aria-label="块菜单" draggable="true">⠿</button><div class="block-text ${source.type === "heading" ? "heading" : ""}" contenteditable="true"></div>`;
     const editable = row.querySelector<HTMLElement>(".block-text")!;
     if (override && source.revision > override.baseRevision) row.querySelector(".reference-meta span")!.textContent = "已覆写 · 源内容已更新";
     editable.innerHTML = renderLinkedHtml(content.html || escapeText(content.text));
@@ -606,17 +1172,26 @@ function renderReference(reference: ReferenceInstance, inSidebar = false) {
     editable.style.color = properties.textColor ?? "";
     editable.addEventListener("focus", () => activeEditable = editable);
     editable.addEventListener("input", () => local ? scheduleInstanceBlock(row, source) : scheduleOverride(row, source, properties));
-    row.querySelector(".add-child")!.addEventListener("click", () => addInstanceBlock(reference, source.id, row));
-    row.querySelector(".hide")!.addEventListener("click", () => postAfterFlush(local
-      ? { type: "deleteInstanceBlock", referenceInstanceId: reference.id, blockId: source.id }
-      : { type: "hideReferenceBlock", referenceInstanceId: reference.id, targetBlockId: source.id }));
+    row.querySelector(".add-sibling")!.addEventListener("click", () => addInstanceBlock(reference, source.parentId ?? null, row));
+    row.querySelector(".hide")!.addEventListener("click", () => {
+      // Optimistic UI: dim the row while we wait for the host command
+      row.style.opacity = "0.35";
+      saveStatus.textContent = local ? "正在删除本地块..." : "正在隐藏源块...";
+      const documentId = state?.note.id;
+      const cmd = local
+        ? { type: "deleteInstanceBlock" as const, referenceInstanceId: reference.id, blockId: source.id }
+        : { type: "hideReferenceBlock" as const, referenceInstanceId: reference.id, targetBlockId: source.id };
+      void post(cmd, documentId).then(() => {
+        // post owns ACK/NACK status; do not overwrite a rejection with a success label.
+        row.style.opacity = "";
+      });
+    });
     row.querySelector(".reset")?.addEventListener("click", () => postAfterFlush({ type: "resetOverride", referenceInstanceId: reference.id, targetBlockId: source.id }));
     card.append(row);
   });
   const footer = document.createElement("footer");
   footer.className = "reference-footer";
-  footer.innerHTML = `<button class="add-root">+ 引用内新增</button>${hidden.size ? `<span>已隐藏 ${hidden.size} 块</span><button class="restore-hidden">恢复隐藏块</button>` : ""}`;
-  footer.querySelector(".add-root")!.addEventListener("click", () => addInstanceBlock(reference, null));
+  footer.innerHTML = `${hidden.size ? `<span>已隐藏 ${hidden.size} 块</span><button class="restore-hidden">恢复隐藏块</button>` : ""}`;
   footer.querySelector(".restore-hidden")?.addEventListener("click", () => {
     const documentId = state?.note.id;
     runAfterSaveDrain(() => reference.hiddenBlockIds.forEach((id) => post({ type: "resetOverride", referenceInstanceId: reference.id, targetBlockId: id }, documentId)));
@@ -651,10 +1226,79 @@ function addInstanceBlock(reference: ReferenceInstance, parentId: string | null,
   block.scopeType = "reference_instance";
   const rows = [...(afterRow?.closest(".reference-card") ?? blockSurface).querySelectorAll<HTMLElement>(".reference-row")];
   block.position = String((rows.length + 1) * 1000).padStart(8, "0");
-  runAfterSaveDrain(() => {
-    void post({ type: "saveInstanceBlock", referenceInstanceId: reference.id, block }, documentId)
-      .then(() => { if (!commandFailure) return post({ type: "reloadDocument", }, documentId); });
+  runAfterSaveDrain(() => post({ type: "saveInstanceBlock", referenceInstanceId: reference.id, block }, documentId));
+}
+
+/**
+ * 断开引用 → 把当前显示内容（应用覆写 + 隐藏过滤后）作为普通文本块保留。
+ * 1. 在 DOM/state 中把 hostBlockId 替换为多个普通块
+ * 2. 立即保存当前文档（写入新的纯文本块）
+ * 3. 调用 removeReference 让 host 清理引用记录（此时 hostBlockId 已不存在，安全）
+ */
+function detachReferenceAsPlainText(reference: ReferenceInstance) {
+  if (!state) return;
+  const hostShell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(reference.hostBlockId)}"]`);
+  if (!hostShell) {
+    // 兜底：直接发命令
+    postAfterFlush({ type: "removeReference", referenceInstanceId: reference.id });
+    return;
+  }
+  const hostBlock = state.blocks.find(b => b.id === reference.hostBlockId);
+  if (!hostBlock) return;
+
+  const hidden = new Set(reference.hiddenBlockIds);
+  const overrideMap = new Map(reference.overrides.map(o => [o.targetBlockId, o]));
+  const visible = reference.blocks
+    .filter(b => b.scopeType !== "reference_instance")
+    .filter(b => !hidden.has(b.id));
+
+  const newBlocks: Block[] = visible.map(src => {
+    const ov = overrideMap.get(src.id);
+    const content = ov?.patch.content ?? src.content;
+    const properties = ov?.patch.properties ?? src.properties;
+    return {
+      id: newId(),
+      parentId: hostBlock.parentId,
+      position: src.position,
+      type: src.type,
+      content: { text: content.text ?? "", html: content.html ?? "", links: content.links },
+      properties: { ...(properties ?? {}) },
+      revision: 1
+    };
   });
+
+  if (newBlocks.length === 0) {
+    newBlocks.push({ ...createBlock("paragraph", hostBlock.parentId), position: hostBlock.position });
+  }
+
+  // Update state.blocks: replace hostBlock with new blocks
+  const idx = state.blocks.findIndex(b => b.id === reference.hostBlockId);
+  state.blocks.splice(idx, 1, ...newBlocks);
+
+  // Update DOM: replace hostShell with new shells
+  const fragment = document.createDocumentFragment();
+  for (const b of newBlocks) {
+    const shell = document.createElement("div");
+    shell.className = "block-shell";
+    shell.dataset.ownBlock = "true";
+    shell.dataset.id = b.id;
+    shell.dataset.parentId = b.parentId ?? "";
+    shell.dataset.type = b.type;
+    shell.style.setProperty("--depth", String(blockDepth(b, state!.blocks)));
+    shell.append(createEditableRow(b));
+    fragment.append(shell);
+  }
+  hostShell.replaceWith(fragment);
+
+  // Focus first new block
+  fragment.querySelector<HTMLElement>(".block-text")?.focus();
+
+  // Save immediately (sends new plain blocks + removes the hostBlock).
+  // Queue the removeReference command AFTER the save drains so the host processes
+  // document changes before cleaning up the reference record.
+  postAfterFlush({ type: "removeReference", referenceInstanceId: reference.id });
+  saveDocument();
+  saveStatus.textContent = "引用已断开，内容保留为正文";
 }
 
 function scheduleOverride(row: HTMLElement, source: Block, originalProperties: BlockProperties) {
@@ -671,34 +1315,67 @@ function scheduleOverride(row: HTMLElement, source: Block, originalProperties: B
 
 function renderRelations() {
   if (!state) return;
-  referenceSidebarPanel.innerHTML = "";
-  const sidebarReferences = state.references.filter((reference) => reference.mode === "sidebar");
-  referenceSidebarSection.hidden = sidebarReferences.length === 0;
-  sidebarReferences.forEach((reference) => referenceSidebarPanel.append(renderReference(reference, true)));
-  if (sidebarLink) void showLinkSidebar(sidebarLink);
-  backlinksPanel.innerHTML = "";
-  state.backlinks.forEach((link) => {
-    const button = document.createElement("button");
-    button.className = "relation-item";
-    button.innerHTML = `<strong>${escapeText(link.sourceTitle)}</strong><span>${escapeText(link.excerpt)}</span>`;
-    button.addEventListener("click", () => postAfterFlush({ type: "openDocument", documentId: link.sourceDocumentId }));
-    backlinksPanel.append(button);
+  if (sidebarLink) {
+    // Ordinary previews own the slot until explicitly closed; unrelated command ACKs
+    // must not erase them. Instance previews update from the acknowledged local state.
+    if (!sidebarLink.referenceId) return;
+    const reference = state.references.find(item => item.id === sidebarLink!.referenceId);
+    if (reference) { renderSidebarPreview(reference, sidebarLink); return; }
+    sidebarLink = null;
+    sidebarSequence++;
+  }
+  // Diff the right-side reference sidebar against `state.references`. Cards whose rendered
+  // row signature still matches current state are reused (preserves focused contentEditables
+  // and scroll position). Cards that no longer belong are removed. New cards are inserted.
+  // The whole fragment is applied with `replaceChildren` so the panel never paints empty.
+  const desiredSidebarRefs = state.references.filter((reference) => reference.mode === "sidebar");
+  let showCards: ReferenceInstance[] = desiredSidebarRefs;
+  let introOrEmpty: "intro" | "empty" | null = null;
+  if (desiredSidebarRefs.length === 0) {
+    showCards = state.references.filter(r => r.mode === "inline" || r.mode === "collapsed");
+    introOrEmpty = showCards.length > 0 ? "intro" : "empty";
+  }
+  // Index existing cards by their data-reference-id so we can decide reuse vs. rebuild.
+  const existingCards = new Map<string, HTMLElement>();
+  referenceSidebarPanel.querySelectorAll<HTMLElement>(".reference-card[data-reference-id]").forEach((el) => {
+    existingCards.set(el.dataset.referenceId!, el);
   });
-  if (!state.backlinks.length) backlinksPanel.innerHTML = `<div class="empty">暂无反向链接</div>`;
-
-  noticesPanel.innerHTML = "";
-  state.overrideNotices.forEach((notice) => {
-    const button = document.createElement("button");
-    button.className = `relation-item ${notice.sourceUpdated ? "warning" : ""}`;
-    const labels = { content_style: "引用位置修改了内容或样式", hide: "引用位置隐藏了此块", move: "引用位置调整了层级或顺序", insert: "引用位置增加了专属块" };
-    button.innerHTML = `<strong>${escapeText(notice.hostTitle)}</strong><span>${notice.sourceUpdated ? "源内容更新后仍保留覆写" : labels[notice.kind]}</span>`;
-    button.addEventListener("click", () => postAfterFlush({ type: "openDocument", documentId: notice.hostDocumentId }));
-    noticesPanel.append(button);
-  });
-  if (!state.overrideNotices.length) noticesPanel.innerHTML = `<div class="empty">暂无外部覆写</div>`;
+  // Collect everything into the fragment BEFORE replaceChildren, so the panel is never
+  // temporarily blank even if showCards is empty or an error occurs mid-render.
+  const fragment = document.createDocumentFragment();
+  for (const reference of showCards) {
+    const existing = existingCards.get(reference.id);
+    const sig = rowSignature(reference);
+    if (existing && (existing as HTMLElement & { __rowSig?: string }).__rowSig === sig) {
+      // Structure unchanged → reuse existing DOM (preserves focused contentEditable).
+      fragment.append(existing);
+    } else {
+      // Either no existing card (new) or structural change (rows added/hidden/moved).
+      const fresh = renderReference(reference, true);
+      (fresh as HTMLElement & { __rowSig?: string }).__rowSig = sig;
+      fragment.append(fresh);
+    }
+    existingCards.delete(reference.id);
+  }
+  // Remove cards that no longer belong (e.g. reference was removed).
+  existingCards.forEach((el) => el.remove());
+  if (introOrEmpty === "intro") {
+    const intro = document.createElement("div");
+    intro.className = "ref-sidebar-intro";
+    intro.textContent = `当前文档包含 ${showCards.length} 处实时引用（不是右侧分栏模式）。可在引用菜单选择「右侧分栏」以在此处查看。`;
+    fragment.append(intro);
+  } else if (introOrEmpty === "empty") {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "暂无右侧分栏。双链预览会自动展开在此区域。";
+    fragment.append(empty);
+  }
+  // Swap the whole panel atomically — intro/empty is already in the fragment.
+  referenceSidebarPanel.replaceChildren(fragment);
+  // An empty result is still a visible selected panel. Only the shell changes tabs.
 }
 
-function showMenu(anchor: HTMLElement, actions: Array<{ label: string; run: () => void }>) {
+function showMenu(anchor: HTMLElement, actions: Array<{ label: string; run: () => void; danger?: boolean }>) {
   document.querySelector(".block-menu")?.remove();
   const menu = document.createElement("div");
   menu.className = "block-menu";
@@ -706,6 +1383,7 @@ function showMenu(anchor: HTMLElement, actions: Array<{ label: string; run: () =
   actions.forEach((action) => {
     const button = document.createElement("button");
     button.textContent = action.label;
+    if (action.danger) button.className = "danger";
     button.addEventListener("click", () => { menu.remove(); action.run(); });
     menu.append(button);
   });
@@ -721,7 +1399,10 @@ function showOwnBlockMenu(anchor: HTMLElement, block: Block) {
   showMenu(anchor, [
     { label: "复制块链接", run: () => navigator.clipboard?.writeText(`[[${state?.note.title}^${block.id}]]`) },
     { label: "插入块链接", run: () => insertTarget(block.id, state?.note.id, block.content.text || "块") },
-    { label: "嵌入为实时引用", run: () => createReferenceForTarget(state?.note.id, block.id) }
+    { label: "嵌入为实时引用", run: () => createReferenceForTarget(state?.note.id, block.id) },
+    { label: "删除块", run: () => {
+      removeOwnBlock(anchor.closest<HTMLElement>("[data-own-block]"));
+    }, danger: true }
   ]);
 }
 
@@ -733,7 +1414,21 @@ function showReferenceMenu(anchor: HTMLElement, _block: Block | undefined, refer
     { label: "折叠卡片", run: () => setReferenceMode(reference, "collapsed") },
     { label: "右侧分栏", run: () => setReferenceMode(reference, "sidebar") },
     { label: "打开源文档", run: () => postAfterFlush({ type: "openDocument", documentId: reference.targetDocumentId }) },
-    { label: "断开引用", run: () => postAfterFlush({ type: "removeReference", referenceInstanceId: reference.id }) },
+    { label: "删除引用", danger: true, run: () => {
+      // Remove the host block shell from DOM immediately
+      const shell = blockSurface.querySelector<HTMLElement>(
+        `[data-own-block][data-id="${CSS.escape(reference.hostBlockId)}"]`
+      );
+      shell?.remove();
+      // Remove from state
+      state!.references = state!.references.filter(r => r.id !== reference.id);
+      state!.blocks = state!.blocks.filter(b => b.id !== reference.hostBlockId);
+      // Ensure at least one block exists
+      if (!blockSurface.querySelector("[data-own-block]")) addBlock("paragraph");
+      // Flush the save queue then remove the reference record
+      postAfterFlush({ type: "removeReference", referenceInstanceId: reference.id });
+    }},
+    { label: "断开引用（保留为正文）", run: () => detachReferenceAsPlainText(reference) },
     { label: "恢复全部继承内容", run: () => postAfterFlush({ type: "resetReference", referenceInstanceId: reference.id }) }
   ]);
 }
@@ -760,14 +1455,33 @@ function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: str
   const index = state.blocks.findIndex(item => item.id === ownerShell?.dataset.id);
   state.blocks.splice(index < 0 ? state.blocks.length : index + 1, 0, block);
   sidebarLink = null;
+  sidebarSequence++;
+
+  // Optimistically add the new reference to state so renderRelations() shows it immediately,
+  // avoiding a brief blank/old-state flash while the createReference command is in flight.
+  const optimisticRef: ReferenceInstance = {
+    id: `pending-${block.id}`,
+    hostBlockId: block.id,
+    targetDocumentId,
+    targetBlockId,
+    targetTitle: state.documents.find(d => d.id === targetDocumentId)?.title ?? targetDocumentId,
+    mode,
+    blocks: [],
+    overrides: [],
+    hiddenBlockIds: []
+  };
+  state.references.push(optimisticRef);
+
   render(state);
   saveDocument();
-  runAfterSaveDrain(() => {
-    void post({ type: "createReference", hostBlockId: block.id, targetDocumentId, targetBlockId }, documentId).then(() => {
-      if (mode === "inline") return;
+  runAfterSaveDrain(async () => {
+    await post({ type: "createReference", hostBlockId: block.id, targetDocumentId, targetBlockId }, documentId);
+    // applyServerState in post's ACK already synced state.references.
+    // For non-inline modes, switch the newly-created reference to the requested mode.
+    if (mode !== "inline") {
       const reference = state?.references.find((item) => item.hostBlockId === block.id);
-      if (reference) return post({ type: "setReferenceMode", referenceInstanceId: reference.id, mode }, documentId);
-    });
+      if (reference) void post({ type: "setReferenceMode", referenceInstanceId: reference.id, mode }, documentId);
+    }
   });
 }
 
@@ -931,8 +1645,9 @@ function addBlock(type: BlockType) {
   if (!state) return;
   const block = createBlock(type);
   state.blocks.push(block);
-  renderOwnBlock(block);
-  blockSurface.lastElementChild?.querySelector<HTMLElement>(".block-text")?.focus();
+  const shell = renderOwnBlockShell(block);
+  blockSurface.append(shell);
+  shell.querySelector<HTMLElement>(".block-text")?.focus();
   scheduleDocumentSave(0);
 }
 
@@ -1058,7 +1773,7 @@ function escapeText(value: string) {
 
 host.onEvent(event => {
   if (event.kind === "documentChanged" && state?.references.some(reference => reference.targetDocumentId === event.payload.documentId)) void refreshLiveReferences();
-  if (event.kind === "documentChanged" && sidebarLink?.documentId === event.payload.documentId && !sidebarLink.referenceId) void showLinkSidebar(sidebarLink);
+  if (event.kind === "documentChanged" && sidebarLink?.documentId === event.payload.documentId && !sidebarLink.referenceId) void showLinkSidebar(sidebarLink, false);
   if (event.kind === "documentLoaded") render(event.payload.state);
   if (event.kind === "focusBlock") focusBlock(event.payload.blockId);
   if (event.kind === "notification") saveStatus.textContent = event.payload.message;
@@ -1081,10 +1796,14 @@ document.querySelector("#indent")!.addEventListener("click", () => indent("in"))
 document.querySelector("#outdent")!.addEventListener("click", () => indent("out"));
 document.querySelector("#move-up")!.addEventListener("click", () => move(-1));
 document.querySelector("#move-down")!.addEventListener("click", () => move(1));
+document.querySelector("#undo")?.addEventListener("click", () => void moveHistory("undo"));
+document.querySelector("#redo")?.addEventListener("click", () => void moveHistory("redo"));
+document.querySelector("#history")?.addEventListener("click", () => ui.showHistory?.());
 document.addEventListener("click", (event) => {
   const target = event.target as HTMLElement | null;
   const grip = target?.closest<HTMLElement>(".grip");
   if (!grip) return;
+  if (draggingBlockId) return; // suppress menu during drag
   event.preventDefault();
   event.stopPropagation();
   const shell = grip.closest<HTMLElement>("[data-own-block]");
@@ -1099,6 +1818,14 @@ document.addEventListener("input", (event) => {
   if (editable) updateInlineLinkSuggestions(editable);
 }, true);
 document.addEventListener("keydown", (event) => {
+  const modifier = event.ctrlKey || event.metaKey;
+  if (modifier && !event.altKey && !event.isComposing && (event.key.toLowerCase() === "z" || event.key.toLowerCase() === "y")) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key.toLowerCase() === "y" || (event.key.toLowerCase() === "z" && event.shiftKey)) void moveHistory("redo");
+    else void moveHistory("undo");
+    return;
+  }
   if (event.altKey && !event.ctrlKey && !event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
     event.preventDefault();
     event.stopPropagation();
@@ -1111,6 +1838,178 @@ document.addEventListener("keydown", (event) => {
 titleInput.addEventListener("input", () => scheduleDocumentSave());
 document.querySelectorAll<HTMLButtonElement>(".icon-tools button").forEach((button) => button.addEventListener("mousedown", (event) => event.preventDefault()));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Drag & drop for block reordering
+// ─────────────────────────────────────────────────────────────────────────────
+
+function clearDropIndicator() {
+  document.querySelectorAll(".block-shell").forEach(el => {
+    el.classList.remove("is-dragging", "drop-before", "drop-after", "drop-child");
+  });
+  dropIndicator = null;
+}
+
+function setDropIndicator(targetShell: HTMLElement, position: "before" | "after" | "child") {
+  clearDropIndicator();
+  targetShell.classList.add(position === "child" ? "drop-child" : position === "before" ? "drop-before" : "drop-after");
+  dropIndicator = { targetId: targetShell.dataset.id!, position };
+}
+
+/** Whether targetId is inside the subtree of sourceId (own blocks only). */
+function isDescendant(sourceId: string, targetId: string): boolean {
+  if (!state) return false;
+  const parentOf = new Map<string, string | null>();
+  for (const block of state.blocks) parentOf.set(block.id, block.parentId);
+  let current: string | null = targetId;
+  const visited = new Set<string>();
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    if (current === sourceId) return true;
+    current = parentOf.get(current) ?? null;
+  }
+  return false;
+}
+
+function handleDragStart(event: DragEvent) {
+  const grip = (event.target as HTMLElement).closest<HTMLElement>(".grip");
+  if (!grip) return;
+  const shell = grip.closest<HTMLElement>(".block-shell[data-own-block]");
+  if (!shell?.dataset.id) return;
+  // Prevent dragging reference rows (they stay within their card)
+  if (grip.closest(".reference-row")) return;
+  draggingBlockId = shell.dataset.id;
+  shell.classList.add("is-dragging");
+  // Use block text as drag image label
+  const textEl = shell.querySelector<HTMLElement>(".block-text");
+  if (textEl && event.dataTransfer) {
+    event.dataTransfer.setData("text/plain", textEl.textContent ?? "");
+    event.dataTransfer.effectAllowed = "move";
+    // Custom drag image: a small ghost with the block text
+    const ghost = document.createElement("div");
+    ghost.className = "drag-ghost";
+    ghost.textContent = (textEl.textContent ?? "").slice(0, 60) || "块";
+    ghost.style.position = "absolute";
+    ghost.style.top = "-1000px";
+    document.body.append(ghost);
+    event.dataTransfer.setDragImage(ghost, 10, 14);
+    setTimeout(() => ghost.remove(), 0);
+  }
+}
+
+function handleDragOver(event: DragEvent) {
+  if (!draggingBlockId) return;
+  const shell = (event.target as HTMLElement).closest<HTMLElement>(".block-shell[data-own-block]");
+  if (!shell || !shell.dataset.id || shell.dataset.id === draggingBlockId) return;
+
+  // Reference rows are not valid drop targets for own blocks
+  if (shell.closest(".reference-row")) return;
+
+  // Block being dragged cannot be dropped into its own subtree
+  if (isDescendant(draggingBlockId, shell.dataset.id)) return;
+
+  const rect = shell.getBoundingClientRect();
+  const relY = (event.clientY - rect.top) / rect.height;
+
+  // Smart indent: top → before, middle → child (indent), bottom → after
+  if (relY < 0.33) {
+    setDropIndicator(shell, "before");
+  } else if (relY > 0.67) {
+    setDropIndicator(shell, "after");
+  } else {
+    setDropIndicator(shell, "child");
+  }
+
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+}
+
+function handleDragLeave(event: DragEvent) {
+  const related = event.relatedTarget as HTMLElement | null;
+  const shell = (event.target as HTMLElement).closest<HTMLElement>(".block-shell[data-own-block]");
+  if (!shell || (related && shell.contains(related))) return;
+  shell.classList.remove("drop-before", "drop-after", "drop-child");
+}
+
+function handleDrop(event: DragEvent) {
+  event.preventDefault();
+  if (!draggingBlockId || !dropIndicator || !state) {
+    clearDropIndicator();
+    draggingBlockId = null;
+    return;
+  }
+  const { targetId, position } = dropIndicator;
+  if (targetId === draggingBlockId) {
+    clearDropIndicator();
+    draggingBlockId = null;
+    return;
+  }
+
+  const rows = [...blockSurface.querySelectorAll<HTMLElement>("[data-own-block]")];
+  const draggedIdx = rows.findIndex(r => r.dataset.id === draggingBlockId);
+  const targetIdx = rows.findIndex(r => r.dataset.id === targetId);
+  const draggedRow = rows[draggedIdx];
+  const targetRow = rows[targetIdx];
+  if (!draggedRow || !targetRow) {
+    clearDropIndicator();
+    draggingBlockId = null;
+    return;
+  }
+
+  if (position === "before") {
+    targetRow.before(draggedRow);
+  } else if (position === "after") {
+    targetRow.after(draggedRow);
+  } else {
+    // child: dragged becomes last child of target
+    draggedRow.dataset.parentId = targetId;
+  }
+
+  recalculateDepths();
+  scheduleDocumentSave(0);
+  clearDropIndicator();
+  draggingBlockId = null;
+}
+
+function handleDragEnd() {
+  clearDropIndicator();
+  document.querySelectorAll(".block-shell").forEach(el => el.classList.remove("is-dragging"));
+  draggingBlockId = null;
+}
+
+// Register drag events on block surface (delegated)
+blockSurface.addEventListener("dragstart", handleDragStart as EventListener);
+blockSurface.addEventListener("dragover", handleDragOver as EventListener);
+blockSurface.addEventListener("dragleave", handleDragLeave as EventListener);
+blockSurface.addEventListener("drop", handleDrop as EventListener);
+blockSurface.addEventListener("dragend", handleDragEnd);
+
 void host.request("ready", {}).catch(showError);
-return { flush, showError, retry: () => { saveFailure = null; commandFailure = null; enqueueDocumentSave(); }, load: render };
+function clear() {
+  state = null;
+  activeEditable = null;
+  sidebarLink = null;
+  sidebarSequence++;
+  dismissPreview();
+  hideInlineLinkSuggestions();
+  titleInput.value = "";
+  blockSurface.replaceChildren();
+  backlinksPanel.replaceChildren();
+  noticesPanel.replaceChildren();
+  referenceSidebarPanel.replaceChildren();
+  pendingHistoryMove = null;
+  historySaveInProgress = false;
+  ui.updateHistory?.({ documentId: "", entries: [], currentId: "", canUndo: false, canRedo: false });
+  saveStatus.textContent = "请选择或新建笔记";
+}
+return {
+  flush,
+  showError,
+  focusBlock,
+  clear,
+  undo: () => moveHistory("undo"),
+  redo: () => moveHistory("redo"),
+  restoreHistory,
+  retry: () => { saveFailure = null; commandFailure = null; enqueueDocumentSave(); },
+  load: render
+};
 }

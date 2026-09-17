@@ -2,13 +2,14 @@
 
 本地优先的笔记 + 便签 MVP：Avalonia/C# 宿主、Avalonia WebView 原生引擎、TypeScript 块编辑器。
 
+项目交接先读 [项目全景说明](PROJECT_OVERVIEW.md)；AI 开发先读 [AGENTS.md](AGENTS.md)（另有 [agent.md](agent.md) 入口）。全景说明区分新版浏览器编辑器与桌面兼容入口，列出数据模型、构建、验收与未完成项。
+
 ## Run
 
 ```powershell
 cd web
 npm install
 npm run build
-Copy-Item src\index.html,src\style.css -Destination dist -Force
 cd ..
 dotnet run --project src\LocalNotesMvp\LocalNotesMvp.csproj
 ```

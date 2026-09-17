@@ -338,6 +338,7 @@ public sealed partial class NoteStore : INoteRepository
 
     private void SaveDocumentCore(SqliteConnection connection, SqliteTransaction transaction, string documentId, SaveDocumentRequest request, long? clientVersion)
     {
+        ValidateDocumentSnapshot(connection, transaction, documentId, request.Blocks);
         using (var update = connection.CreateCommand())
         {
             update.Transaction = transaction;
@@ -832,7 +833,8 @@ public sealed partial class NoteStore : INoteRepository
                     THEN blocks.revision+1 ELSE blocks.revision END,
                 updated_at=CASE WHEN blocks.parent_id IS NOT excluded.parent_id OR blocks.position<>excluded.position OR
                     blocks.type<>excluded.type OR blocks.content_json<>excluded.content_json OR blocks.properties_json<>excluded.properties_json
-                    THEN excluded.updated_at ELSE blocks.updated_at END, deleted_at=NULL;
+                    THEN excluded.updated_at ELSE blocks.updated_at END, deleted_at=NULL
+            WHERE blocks.document_id=excluded.document_id AND blocks.scope_type='canonical';
             """;
         command.Parameters.AddWithValue("$id", block.Id);
         command.Parameters.AddWithValue("$documentId", documentId);
@@ -842,7 +844,8 @@ public sealed partial class NoteStore : INoteRepository
         command.Parameters.AddWithValue("$content", content);
         command.Parameters.AddWithValue("$properties", properties);
         command.Parameters.AddWithValue("$now", UtcNow());
-        command.ExecuteNonQuery();
+        if (command.ExecuteNonQuery() == 0)
+            throw new InvalidOperationException("Block belongs to another document or reference instance.");
     }
 
     private static void SoftDeleteMissingBlocks(SqliteConnection connection, SqliteTransaction transaction, string documentId, HashSet<string> incomingIds)

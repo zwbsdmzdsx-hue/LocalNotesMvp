@@ -82,7 +82,8 @@ test('body collapse persists and differs from title-only mode', async ({ page },
   await expect(page.locator('#reference-sidebar .reference-row')).toHaveCount(1);
   await page.getByRole('button', { name: '嵌入正文', exact: true }).click();
   await expect(shell.locator('.reference-card')).toHaveClass(/is-expanded/);
-  await expect(page.locator('#reference-sidebar-section')).toBeHidden();
+  await expect(page.locator('#reference-sidebar-section')).toBeVisible();
+  await expect(page.locator('#reference-sidebar-section > .panel-head')).toHaveText('实时引用');
   await shell.getByRole('button', { name: '收起', exact: true }).click();
   await page.screenshot({ path: info.outputPath('collapsed-reference.png'), fullPage: true });
 });

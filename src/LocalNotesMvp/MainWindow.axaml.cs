@@ -18,8 +18,8 @@ public partial class MainWindow : Window
     private bool _suppressSelectionChanged;
     private bool _editorReady;
     private int _selectionVersion;
-    private TaskCompletionSource<bool>? _flushCompletion;
-    private string? _flushRequestId;
+    private readonly EditorFlushCoordinator _flush = new();
+    private bool _closePending;
     private readonly bool _acceptanceTest = Environment.GetCommandLineArgs().Contains("--acceptance-test");
     private bool _closing;
     private bool _acceptanceTriggered;
@@ -215,24 +215,23 @@ public partial class MainWindow : Window
     private async Task<bool> FlushEditorAsync()
     {
         if (!_editorReady) return true;
-        var requestId = Guid.NewGuid().ToString("N");
-        _flushRequestId = requestId;
-        _flushCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        await EditorView.ExecuteScriptAsync($"window.localNotesFlush?.({JsonSerializer.Serialize(requestId)});");
-        var completed = await Task.WhenAny(_flushCompletion.Task, Task.Delay(TimeSpan.FromSeconds(10)));
-        var succeeded = completed == _flushCompletion.Task && _flushCompletion.Task.Result;
-        _flushCompletion = null;
-        _flushRequestId = null;
-        return succeeded;
+        return await _flush.FlushAsync(async requestId =>
+            await EditorView.ExecuteScriptAsync($"window.localNotesFlush?.({JsonSerializer.Serialize(requestId)});"));
     }
 
     private async void MainWindowClosing(object? sender, WindowClosingEventArgs e)
     {
         if (_closing) return;
         e.Cancel = true;
-        if (!await FlushEditorAsync()) return;
-        _closing = true;
-        Close();
+        if (_closePending) return;
+        _closePending = true;
+        try
+        {
+            if (!await FlushEditorAsync()) return;
+            _closing = true;
+            Close();
+        }
+        finally { _closePending = false; }
     }
 
     private void OnWebMessageReceived(object? sender, WebViewMessageReceivedEventArgs e)
@@ -240,6 +239,7 @@ public partial class MainWindow : Window
         try
         {
             using var doc = ParseWebMessage(e.Message);
+            if (_flush.TryHandle(doc.RootElement)) return;
             if (doc.RootElement.TryGetProperty("protocolVersion", out var protocolVersion) && protocolVersion.GetInt32() == HostProtocol.Version)
             {
                 var request = doc.RootElement.Deserialize<HostRequest>(_json)
@@ -258,22 +258,6 @@ public partial class MainWindow : Window
                     SendClientMessage(new { type = "command-ack", requestId, documentId = owner, state = result });
                 }
                 catch (Exception error) { SendClientMessage(new { type = "command-nack", requestId, documentId = owner, error = error.Message }); }
-                return;
-            }
-            if (type == "editor-flush-complete")
-            {
-                var completedRequestId = doc.RootElement.TryGetProperty("requestId", out var requestIdElement)
-                    ? requestIdElement.GetString()
-                    : null;
-                if (completedRequestId == _flushRequestId) _flushCompletion?.TrySetResult(true);
-                return;
-            }
-            if (type == "editor-flush-failed")
-            {
-                var failedRequestId = doc.RootElement.TryGetProperty("requestId", out var requestIdElement)
-                    ? requestIdElement.GetString()
-                    : null;
-            if (failedRequestId == _flushRequestId) _flushCompletion?.TrySetResult(false);
                 return;
             }
             if (type == "navigate-back")

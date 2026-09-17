@@ -20,6 +20,9 @@ web/playwright-report/
 tests/*.png
 tests/*.zip
 web/tests/*.png
+assets/verify-*.png
+web/_verify_bugs.mjs
+web/tests/editor/_repro.spec.mjs
 *.db
 *.db-shm
 *.db-wal

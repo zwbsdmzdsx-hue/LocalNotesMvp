@@ -29,6 +29,14 @@ test.beforeEach(async ({ page }) => {
 });
 test.afterEach(() => expect(errors).toEqual([]));
 
+test('deleting a parent preserves its child with a valid parent ID', async ({ page }) => {
+  await page.locator('[data-id="b1"] .delete-block').click();
+  await expect(page.locator('[data-id="b2"] .block-text')).toHaveText('Nested paragraph');
+  const saved = await page.evaluate(() => window.testMessages.filter(m => m.type === 'save-transaction').at(-1));
+  expect(saved.blocks).toHaveLength(1);
+  expect(saved.blocks[0]).toMatchObject({ id: 'b2', parentId: null });
+});
+
 test('typing opens candidates and Enter inserts exactly one stable link', async ({ page }) => {
   const edit = page.locator('.block-text').first();
   await edit.click(); await page.keyboard.press('End'); await page.keyboard.type(' [[');

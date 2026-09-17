@@ -4,41 +4,104 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Local Notes Editor</title>
-  
 </head>
 <body>
-  <main class="app">
-    <header class="toolbar">
-      <div class="tool-group">
-        <button id="add-paragraph" title="添加段落">段落</button>
-        <button id="add-heading" title="添加标题">标题</button>
-        <button id="add-todo" title="添加待办">待办</button>
+  <!-- 顶层菜单栏 -->
+  <header class="app-menu" id="app-menu">
+    <div class="menu-left">
+      <div class="menu-dropdown" id="menu-file">
+        <button class="menu-trigger" id="menu-file-btn">文件</button>
+        <div class="menu-popup" id="menu-file-popup" hidden>
+          <button class="menu-item" id="menu-new-notebook">新建笔记本</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" id="menu-export">导出当前文档</button>
+        </div>
       </div>
-      <div class="tool-group icon-tools">
-        <button id="bold" title="加粗"><strong>B</strong></button>
-        <button id="italic" title="斜体"><em>I</em></button>
-        <button id="highlight" title="高亮">▰</button>
-        <label class="color-tool" title="文字颜色"><input id="text-color" type="color" value="#182230"><span>A</span></label>
-        <label class="color-tool" title="块背景色"><input id="background-color" type="color" value="#fff2a8"><span>■</span></label>
-        <button id="outdent" title="提升层级">←</button>
-        <button id="indent" title="缩进为子级">→</button>
-        <button id="move-up" title="向上移动">↑</button>
-        <button id="move-down" title="向下移动">↓</button>
-      </div>
-      <span id="status">加载中</span>
-    </header>
-    <div id="link-suggestions" class="link-suggestions" hidden></div>
-    <div class="workspace">
-      <article class="editor">
-        <input id="title" placeholder="未命名笔记" autocomplete="off">
-        <section id="blocks"></section>
-      </article>
-      <aside class="relations">
-        <section id="reference-sidebar-section" hidden><h2>右侧实时引用</h2><div id="reference-sidebar"></div></section>
-        <section><h2>反向链接</h2><div id="backlinks"></div></section>
-        <section><h2>外部覆写</h2><div id="override-notices"></div></section>
-      </aside>
     </div>
+    <!-- 笔记本 tab 栏（动态生成） -->
+    <div class="notebook-tabs" id="notebook-tabs">
+      <!-- 动态填充 -->
+    </div>
+    <div class="notebook-tabs-right">
+      <button class="notebook-add-btn" id="notebook-add-btn" title="添加笔记本">+</button>
+    </div>
+  </header>
+
+  <!-- 添加笔记本浮窗 -->
+  <div class="notebook-add-popup" id="notebook-add-popup" hidden>
+    <div class="notebook-add-popup-head">选择笔记本</div>
+    <div class="notebook-add-popup-list" id="notebook-add-popup-list">
+      <!-- 动态填充 -->
+    </div>
+    <div class="notebook-add-popup-empty" id="notebook-add-popup-empty">暂无其他笔记本</div>
+  </div>
+
+  <main class="app">
+    <!-- 左侧：三层结构面板 -->
+    <aside class="sidebar sidebar-left" id="sidebar-left" data-pane="sidebar-left">
+      <div class="sidebar-body" id="sidebar-body">
+        <!-- 动态生成：书签便签条 + 文档列表 -->
+      </div>
+      <div class="sidebar-foot">
+        <button id="sidebar-left-toggle" title="折叠侧栏" aria-label="折叠侧栏">‹</button>
+      </div>
+    </aside>
+
+    <div class="splitter splitter-vertical" id="splitter-left" data-target="sidebar-left"></div>
+
+    <section class="content">
+      <header class="toolbar">
+        <div class="tool-group">
+          <button id="add-paragraph" title="添加段落">段落</button>
+          <button id="add-heading" title="添加标题">标题</button>
+          <button id="add-todo" title="添加待办">待办</button>
+        </div>
+        <div class="tool-group icon-tools">
+          <button id="bold" title="加粗"><strong>B</strong></button>
+          <button id="italic" title="斜体"><em>I</em></button>
+          <button id="highlight" title="高亮">▰</button>
+          <label class="color-tool" title="文字颜色"><input id="text-color" type="color" value="#182230"><span>A</span></label>
+          <label class="color-tool" title="块背景色"><input id="background-color" type="color" value="#fff2a8"><span>■</span></label>
+          <button id="outdent" title="提升层级">←</button>
+          <button id="indent" title="缩进为子级">→</button>
+          <button id="move-up" title="向上移动">↑</button>
+          <button id="move-down" title="向下移动">↓</button>
+          <button id="undo" title="撤销 (Ctrl/Cmd+Z)" disabled>↶</button>
+          <button id="redo" title="重做 (Ctrl/Cmd+Y)" disabled>↷</button>
+          <button id="history" title="打开历史记录">历史</button>
+        </div>
+        <button id="open-sticky" title="打开便签">📝 便签</button>
+        <button id="navigate-back" title="后退">←</button>
+        <button id="navigate-forward" title="前进">→</button>
+        <span id="status">加载中</span>
+      </header>
+
+      <div class="workspace">
+        <article class="editor">
+          <input id="title" placeholder="未命名笔记" autocomplete="off">
+          <section id="blocks"></section>
+        </article>
+      </div>
+
+      <div id="link-suggestions" class="link-suggestions" hidden></div>
+    </section>
+
+    <div class="splitter splitter-vertical" id="splitter-right" data-target="sidebar-right"></div>
+
+    <aside class="sidebar sidebar-right" id="sidebar-right" data-pane="sidebar-right">
+      <div class="sidebar-tabs" role="tablist">
+        <button class="sidebar-tab" data-pane-btn="reference-sidebar" title="实时引用" aria-label="实时引用">📎</button>
+        <button class="sidebar-tab" data-pane-btn="backlinks" title="反向链接" aria-label="反向链接">🔗</button>
+        <button class="sidebar-tab active" data-pane-btn="overrides" title="外部覆写" aria-label="外部覆写">✎</button>
+        <button class="sidebar-tab" data-pane-btn="history" title="历史记录" aria-label="历史记录">🕘</button>
+      </div>
+      <div class="sidebar-body" id="sidebar-right-body">
+        <!-- sections moved here from .relations by shell.ts -->
+      </div>
+      <div class="sidebar-foot">
+        <button id="sidebar-right-toggle" title="折叠侧栏" aria-label="折叠侧栏">›</button>
+      </div>
+    </aside>
   </main>
   <script type="module" src="/src/main.ts"></script>
 </body>

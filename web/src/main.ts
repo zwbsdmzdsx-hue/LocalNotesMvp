@@ -266,7 +266,15 @@ function createEditableRow(block: Block) {
   editable.addEventListener("click", openWikiLink);
   row.querySelector("input")?.addEventListener("change", () => scheduleDocumentSave(0));
   row.querySelector(".delete-block")?.addEventListener("click", () => {
-    row.closest("[data-own-block]")?.remove();
+    const shell = row.closest<HTMLElement>("[data-own-block]");
+    if (shell) {
+      blockSurface.querySelectorAll<HTMLElement>("[data-own-block]").forEach(child => {
+        if (child.dataset.parentId === shell.dataset.id && !shell.contains(child))
+          child.dataset.parentId = shell.dataset.parentId ?? "";
+      });
+      shell.remove();
+      recalculateDepths();
+    }
     if (!blockSurface.querySelector("[data-own-block]")) addBlock("paragraph");
     scheduleDocumentSave(0);
   });

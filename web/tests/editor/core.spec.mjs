@@ -88,7 +88,7 @@ test("reference modes provide inline, collapsible, and sidebar views", async ({ 
   await expect(page.locator("#reference-sidebar-section")).toBeVisible();
   await expect(page.locator("#reference-sidebar .reference-row")).toContainText("Beta 的内容");
   await expect(referenceShell.locator(".sidebar-reference-entry")).toContainText("Beta");
-  await expect(page.locator('#reference-sidebar [data-reference-id="ref1"]')).toHaveCount(1);
+  await expect(page.locator('#reference-sidebar .reference-card.sidebar[data-reference-id="ref1"]')).toHaveCount(1);
   await expect(page.locator('[data-own-block][data-type="reference"] .reference-card')).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("sidebar.png"), fullPage: true });
 });

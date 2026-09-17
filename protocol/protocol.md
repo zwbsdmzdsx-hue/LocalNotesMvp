@@ -49,6 +49,18 @@ Reference mutations are carried by `executeCommand` with an operation such as
 ID, mutation ID, client version, title, and block snapshot. The response always
 returns the document ID, mutation ID, and persisted client version.
 
+The envelope `sourceDocumentId` must match the payload document ID. Replaying a
+mutation returns its original persisted version without writing again. A new
+mutation must have a client version greater than the stored version; skipped
+client versions are allowed and the committed version advances by exactly one.
+
+A block snapshot contains unique, nonempty canonical block IDs owned by that
+document (ownership also applies to soft-deleted IDs). Every parent must appear
+in the snapshot, and parent cycles are rejected. Content must be a JSON object;
+missing properties default to `{}`, but explicit null content/properties and a
+null block list are rejected. Rejection rolls back the entire transaction.
+The browser Mock and SQLite run the same cases in `tests/contracts/save-cases.json`.
+
 ## Reference presentation and placement
 
 `set-reference-mode` persists `inline` (expanded body), `collapsed` (folded

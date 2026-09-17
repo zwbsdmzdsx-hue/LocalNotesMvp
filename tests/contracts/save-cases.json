@@ -1,0 +1,17 @@
+[
+  { "name": "first save", "mutationId": "first", "version": 1, "text": "saved", "ok": true, "ack": 1, "expectedText": "saved" },
+  { "name": "duplicate returns original ACK without writing", "mutationId": "first", "version": 1, "text": "must not replace", "ok": true, "ack": 1, "expectedText": "saved" },
+  { "name": "stale version rejected", "mutationId": "stale", "version": 1, "text": "stale", "ok": false, "expectedText": "saved" },
+  { "name": "jump normalized", "mutationId": "jump", "version": 99, "text": "jumped", "ok": true, "ack": 2, "expectedText": "jumped" },
+  { "name": "cross document block rejected atomically", "mutationId": "cross", "version": 3, "text": "corrupt", "blocks": [{"id":"a1"},{"id":"b1"}], "ok": false, "expectedText": "jumped" },
+  { "name": "duplicate block IDs rejected", "mutationId": "duplicate-block", "version": 3, "blocks": [{"id":"a1"},{"id":"a1"}], "ok": false, "expectedText": "jumped" },
+  { "name": "foreign parent rejected", "mutationId": "foreign-parent", "version": 3, "blocks": [{"id":"a1","parentId":"b1"}], "ok": false, "expectedText": "jumped" },
+  { "name": "missing parent rejected", "mutationId": "missing-parent", "version": 3, "blocks": [{"id":"a1","parentId":"missing"}], "ok": false, "expectedText": "jumped" },
+  { "name": "cycle rejected", "mutationId": "cycle", "version": 3, "blocks": [{"id":"a1","parentId":"a2"},{"id":"a2","parentId":"a1"}], "ok": false, "expectedText": "jumped" },
+  { "name": "null content rejected", "mutationId": "null-content", "version": 3, "blocks": [{"id":"a1","content":null}], "ok": false, "expectedText": "jumped" },
+  { "name": "null properties rejected", "mutationId": "null-properties", "version": 3, "blocks": [{"id":"a1","properties":null}], "ok": false, "expectedText": "jumped" },
+  { "name": "null blocks rejected", "mutationId": "null-blocks", "version": 3, "blocks": null, "ok": false, "expectedText": "jumped" },
+  { "name": "omitted content rejected", "mutationId": "omitted-content", "version": 3, "blocks": [{"id":"a1","omitContent":true}], "ok": false, "expectedText": "jumped" },
+  { "name": "valid tree survives failed mutations", "mutationId": "tree", "version": 3, "text": "tree", "blocks": [{"id":"a1"},{"id":"a2","parentId":"a1"}], "ok": true, "ack": 3, "expectedText": "tree" },
+  { "name": "omitted properties normalize to object", "mutationId": "omitted-properties", "version": 4, "text": "defaults", "blocks": [{"id":"a1","omitProperties":true},{"id":"a2","parentId":"a1"}], "ok": true, "ack": 4, "expectedText": "defaults" }
+]

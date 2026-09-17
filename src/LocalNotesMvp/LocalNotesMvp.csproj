@@ -22,6 +22,7 @@
     <Compile Include="..\..\storage\DomainModels.cs" Link="storage\DomainModels.cs" />
     <Compile Include="..\..\host\WebViewMessageChannel.cs" Link="host\WebViewMessageChannel.cs" />
     <Compile Include="..\..\host\EditorHostController.cs" Link="host\EditorHostController.cs" />
+    <Compile Include="..\..\host\EditorFlushCoordinator.cs" Link="host\EditorFlushCoordinator.cs" />
     <Compile Include="..\..\host\MainWindowHostAdapter.cs" Link="host\MainWindowHostAdapter.cs" />
     <Compile Include="..\..\host\StickyWindowHostAdapter.cs" Link="host\StickyWindowHostAdapter.cs" />
   </ItemGroup>

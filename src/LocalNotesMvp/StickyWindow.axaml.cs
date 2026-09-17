@@ -11,6 +11,9 @@ public partial class StickyWindow : Window
     private readonly Note _note;
     private readonly JsonSerializerOptions _json = new(JsonSerializerDefaults.Web) { PropertyNameCaseInsensitive = true };
     private bool _closing;
+    private bool _closePending;
+    private bool _editorReady;
+    private readonly EditorFlushCoordinator _flush = new();
 
     public StickyWindow() : this(new NoteStore(), new Note { IsSticky = true })
     {
@@ -26,16 +29,25 @@ public partial class StickyWindow : Window
         EditorView.HtmlContent = EditorPage.Load();
     }
 
-    private void StickyWindowClosing(object? sender, WindowClosingEventArgs e)
+    private async void StickyWindowClosing(object? sender, WindowClosingEventArgs e)
     {
         if (_closing) return;
         e.Cancel = true;
-        _closing = true;
-        Close();
+        if (_closePending) return;
+        _closePending = true;
+        try
+        {
+            if (_editorReady && !await _flush.FlushAsync(async requestId =>
+                await EditorView.ExecuteScriptAsync($"window.localNotesFlush?.({JsonSerializer.Serialize(requestId)});"))) return;
+            _closing = true;
+            Close();
+        }
+        finally { _closePending = false; }
     }
 
     private async void OnNavigationCompleted(object? sender, WebViewUrlLoadedEventArg e)
     {
+        _editorReady = true;
         var payload = JsonSerializer.Serialize(new { type = "load-state", state = _store.GetEditorState(_note.Id) }, _json);
         await EditorView.ExecuteScriptAsync($"window.dispatchEvent(new MessageEvent('message', {{ data: {JsonSerializer.Serialize(payload)} }}));");
     }
@@ -45,6 +57,7 @@ public partial class StickyWindow : Window
         try
         {
             using var doc = ParseWebMessage(e.Message);
+            if (_flush.TryHandle(doc.RootElement)) return;
             var type = doc.RootElement.GetProperty("type").GetString();
             if (type == "editor-command")
             {
@@ -104,7 +117,7 @@ public partial class StickyWindow : Window
                     break;
             }
         }
-        catch (Exception exception) when (exception is JsonException or InvalidOperationException)
+        catch (Exception exception)
         {
             using var failedDoc = ParseWebMessage(e.Message);
             if (failedDoc.RootElement.TryGetProperty("type", out var failedType) && failedType.GetString() == "save-transaction" &&
