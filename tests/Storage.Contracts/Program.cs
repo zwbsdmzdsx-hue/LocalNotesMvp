@@ -45,6 +45,16 @@ foreach (var test in cases.RootElement.EnumerateArray())
     Console.WriteLine("PASS " + name);
 }
 
+var markdownNote = store.Create();
+const string markdownSource = "# Markdown 标题\n\n**粗体** 与 [[Beta]]\n\n![[#^reference-host]]";
+store.SaveDocument(markdownNote.Id, new() { Title = "Markdown", Blocks = [new() {
+    Id = "markdown-body", Content = Json(new { text = "Markdown 标题 粗体 与 Beta", html = "<h1>Markdown 标题</h1>", markdown = markdownSource }), Properties = Json(new { })
+}] });
+var markdownReopened = new NoteStore(path); markdownReopened.Load();
+var persistedMarkdown = State(markdownReopened, markdownNote.Id).GetProperty("blocks")[0].GetProperty("content").GetProperty("markdown").GetString();
+Check(persistedMarkdown == markdownSource, "Markdown source did not survive SQLite reopen");
+Console.WriteLine("PASS Markdown content JSON survives SQLite reopen");
+
 // Ownership is retained after soft deletion and cannot be bypassed through the legacy save path.
 store.SaveDocument(b.Id, new() { Title = "Beta", Blocks = [] });
 try { store.SaveDocument(a.Id, new() { Blocks = [Block("b1", "resurrect foreign")] }); throw new Exception("Foreign deleted block accepted"); }
@@ -76,3 +86,4 @@ Check(await retry, "Retry did not complete");
 Check(!await flush.FlushAsync(_ => Task.CompletedTask), "Timeout allowed close");
 Console.WriteLine("PASS ownership, protocol and flush coordinator contracts");
 Console.WriteLine("Database: " + path);
+HistoryContracts.Run();

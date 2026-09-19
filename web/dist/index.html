@@ -25,6 +25,7 @@
         <button id="move-up" title="向上移动">↑</button>
         <button id="move-down" title="向下移动">↓</button>
       </div>
+      <div class="tool-group"><button id="undo" title="撤销 (Ctrl+Z)" disabled>↶</button><button id="redo" title="重做 (Ctrl+Y / Ctrl+Shift+Z)" disabled>↷</button><button id="history">历史记录</button></div>
       <span id="status">加载中</span>
     </header>
     <div id="link-suggestions" class="link-suggestions" hidden></div>
@@ -34,6 +35,7 @@
         <section id="blocks"></section>
       </article>
       <aside class="relations">
+        <section id="history-panel" hidden></section>
         <section><h2>反向链接</h2><div id="backlinks"></div></section>
         <section><h2>外部覆写</h2><div id="override-notices"></div></section>
       </aside>

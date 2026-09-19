@@ -1,4 +1,12 @@
 {
-  "compilerOptions": { "target": "ES2020", "module": "ESNext", "moduleResolution": "Bundler", "strict": true, "noEmit": true, "lib": ["ES2020", "DOM", "DOM.Iterable"] },
+  "compilerOptions": {
+    "target": "ES2020", "module": "ESNext", "moduleResolution": "Bundler", "strict": true, "noEmit": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"], "baseUrl": ".",
+    "paths": {
+      "dompurify": ["../web/node_modules/dompurify/dist/purify.es.d.mts"],
+      "marked": ["../web/node_modules/marked/lib/marked.d.ts"],
+      "turndown": ["../web/node_modules/@types/turndown/index.d.ts"]
+    }
+  },
   "include": ["src/**/*.ts", "../protocol/types.ts"]
 }

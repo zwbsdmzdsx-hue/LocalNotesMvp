@@ -281,7 +281,7 @@ public partial class MainWindow : Window
                     if (saveTransaction is null || saveTransaction.DocumentId != sourceDocumentId)
                         throw new InvalidOperationException("Save transaction document ID mismatch.");
                     var savedVersion = _store.SaveTransaction(saveTransaction);
-                    SendClientMessage(new { type = "save-ack", documentId = sourceDocumentId, mutationId = saveTransaction.MutationId, clientVersion = savedVersion });
+                    SendClientMessage(new { type = "save-ack", documentId = sourceDocumentId, mutationId = saveTransaction.MutationId, clientVersion = savedVersion, history = _store.GetDocumentHistory(sourceDocumentId) });
                     if (_acceptanceTest && !_acceptanceSaveAcknowledged && saveTransaction.DocumentId == _acceptanceDocumentId)
                     {
                         _acceptanceSaveAcknowledged = true;
@@ -470,7 +470,7 @@ public partial class MainWindow : Window
 
     private void SendClientMessage(object message)
     {
-        var payload = JsonSerializer.Serialize(JsonSerializer.Serialize(message));
+        var payload = JsonSerializer.Serialize(JsonSerializer.Serialize(message, _json));
         _ = EditorView.ExecuteScriptAsync($"window.dispatchEvent(new MessageEvent('message', {{ data: {payload} }}));");
     }
 

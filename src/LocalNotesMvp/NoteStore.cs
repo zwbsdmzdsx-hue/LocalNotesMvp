@@ -31,6 +31,50 @@ public sealed partial class NoteStore : INoteRepository
         RefreshNotes();
     }
 
+    public MediaAssetRecord StoreMedia(StoreMediaRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.MimeType))
+            throw new InvalidOperationException("媒体类型不能为空。");
+        var mimeType = request.MimeType.Trim().ToLowerInvariant();
+        var kind = mimeType switch
+        {
+            var value when value.StartsWith("image/", StringComparison.Ordinal) => "image",
+            var value when value.StartsWith("video/", StringComparison.Ordinal) => "video",
+            var value when value.StartsWith("audio/", StringComparison.Ordinal) => "audio",
+            _ => throw new InvalidOperationException("仅支持图片、视频和音频文件。")
+        };
+        if (string.IsNullOrWhiteSpace(request.Data)) throw new InvalidOperationException("媒体内容不能为空。");
+        byte[] bytes;
+        try { bytes = Convert.FromBase64String(request.Data); }
+        catch (FormatException) { throw new InvalidOperationException("媒体内容不是有效的 base64 数据。"); }
+        const long maxBytes = 100L * 1024 * 1024;
+        if (bytes.LongLength > maxBytes) throw new InvalidOperationException("媒体文件不能超过 100 MB。");
+        if (request.Size > 0 && request.Size != bytes.LongLength)
+            throw new InvalidOperationException("媒体文件大小与请求元数据不一致。");
+
+        var mediaDirectory = Path.Combine(Path.GetDirectoryName(_databasePath)!, "media");
+        Directory.CreateDirectory(mediaDirectory);
+        var id = Guid.NewGuid().ToString("N");
+        var extension = mimeType switch
+        {
+            "image/jpeg" => ".jpg", "image/png" => ".png", "image/gif" => ".gif", "image/webp" => ".webp", "image/svg+xml" => ".svg",
+            "video/mp4" => ".mp4", "video/webm" => ".webm", "video/ogg" => ".ogv",
+            "audio/mpeg" => ".mp3", "audio/ogg" => ".oga", "audio/wav" => ".wav", "audio/webm" => ".weba",
+            _ => kind == "image" ? ".img" : kind == "video" ? ".vid" : ".aud"
+        };
+        var path = Path.Combine(mediaDirectory, id + extension);
+        File.WriteAllBytes(path, bytes);
+        return new MediaAssetRecord
+        {
+            Id = id,
+            Kind = kind,
+            Name = string.IsNullOrWhiteSpace(request.Name) ? id + extension : Path.GetFileName(request.Name),
+            MimeType = mimeType,
+            Size = bytes.LongLength,
+            Url = new Uri(path).AbsoluteUri
+        };
+    }
+
     public IReadOnlyList<Workspace> GetWorkspaces()
     {
         using var connection = OpenConnection();
@@ -232,12 +276,15 @@ public sealed partial class NoteStore : INoteRepository
         using var connection = OpenConnection();
         return new
         {
-            note,
+            note = new { note.Id, note.Title, note.IsSticky, note.ClientVersion, workspaceId = note.WorkspaceId },
             blocks = ReadBlocks(connection, documentId),
             documents = ReadLinkCatalog(connection),
             backlinks = ReadBacklinks(connection, documentId),
             overrideNotices = ReadOverrideNotices(connection, documentId),
-            references = ReadReferenceInstances(connection, documentId)
+            references = ReadReferenceInstances(connection, documentId),
+            history = GetDocumentHistory(documentId),
+            documentStyles = ReadStyles(connection, "document", documentId),
+            notebookStyles = note.WorkspaceId is null ? Array.Empty<StyleSheetRecord>() : ReadStyles(connection, "workspace", note.WorkspaceId)
         };
     }
 
@@ -275,7 +322,10 @@ public sealed partial class NoteStore : INoteRepository
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
+        var historyDocumentId = documentId;
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         SaveDocumentCore(connection, transaction, documentId, request, null);
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "编辑正文");
         transaction.Commit();
         RefreshNotes();
     }
@@ -314,6 +364,8 @@ public sealed partial class NoteStore : INoteRepository
             throw new InvalidOperationException($"Stale save rejected. Expected a version newer than {currentVersion}, received {request.ClientVersion}.");
 
         var persistedVersion = currentVersion + 1;
+        var historyDocumentId = request.DocumentId;
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
 
         SaveDocumentCore(connection, transaction, request.DocumentId, new SaveDocumentRequest
         {
@@ -331,6 +383,7 @@ public sealed partial class NoteStore : INoteRepository
             record.Parameters.AddWithValue("$now", UtcNow());
             record.ExecuteNonQuery();
         }
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "编辑正文", request.HistoryGroup);
         transaction.Commit();
         RefreshNotes();
         return persistedVersion;
@@ -361,7 +414,11 @@ public sealed partial class NoteStore : INoteRepository
     public void CreateReference(string hostDocumentId, string hostBlockId, string targetDocumentId, string? targetBlockId = null)
     {
         using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+        var historyDocumentId = hostDocumentId;
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO reference_instances
                 (id, host_document_id, host_block_id, target_document_id, target_block_id, mode, update_policy, conflict_policy, created_at, updated_at)
@@ -375,34 +432,50 @@ public sealed partial class NoteStore : INoteRepository
         command.Parameters.AddWithValue("$targetBlockId", (object?)targetBlockId ?? DBNull.Value);
         command.Parameters.AddWithValue("$now", UtcNow());
         command.ExecuteNonQuery();
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "新增引用");
+        transaction.Commit();
     }
 
     public void SetReferenceMode(SetReferenceModeRequest request)
     {
         var mode = request.Mode is "inline" or "collapsed" or "sidebar" or "link" ? request.Mode : "inline";
         using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+        var historyDocumentId = HistoryOwner(connection, transaction, request.ReferenceInstanceId);
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = "UPDATE reference_instances SET mode=$mode, updated_at=$now WHERE id=$id AND deleted_at IS NULL";
         command.Parameters.AddWithValue("$mode", mode);
         command.Parameters.AddWithValue("$now", UtcNow());
         command.Parameters.AddWithValue("$id", request.ReferenceInstanceId);
         if (command.ExecuteNonQuery() == 0) throw new InvalidOperationException("Reference instance no longer exists.");
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "切换引用显示");
+        transaction.Commit();
     }
 
     public void RemoveReference(string referenceInstanceId)
     {
         using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+        var historyDocumentId = HistoryOwner(connection, transaction, referenceInstanceId);
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = "UPDATE reference_instances SET deleted_at=$now, updated_at=$now WHERE id=$id AND deleted_at IS NULL";
         command.Parameters.AddWithValue("$now", UtcNow());
         command.Parameters.AddWithValue("$id", referenceInstanceId);
         command.ExecuteNonQuery();
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "删除引用");
+        transaction.Commit();
     }
 
     public void ResetReference(string referenceInstanceId)
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
+        var historyDocumentId = HistoryOwner(connection, transaction, referenceInstanceId);
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         foreach (var sql in new[]
         {
             "DELETE FROM block_overrides WHERE reference_instance_id=$id",
@@ -417,6 +490,7 @@ public sealed partial class NoteStore : INoteRepository
             command.Parameters.AddWithValue("$now", UtcNow());
             command.ExecuteNonQuery();
         }
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "恢复全部引用");
         transaction.Commit();
     }
 
@@ -424,11 +498,13 @@ public sealed partial class NoteStore : INoteRepository
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
+        var historyDocumentId = HistoryOwner(connection, transaction, request.ReferenceInstanceId);
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         int revision;
         string baseContent;
         using (var source = connection.CreateCommand())
         {
-            source.Transaction = transaction;
+                source.Transaction = transaction;
             source.CommandText = "SELECT revision, content_json FROM blocks WHERE id=$id AND deleted_at IS NULL";
             source.Parameters.AddWithValue("$id", request.TargetBlockId);
             using var reader = source.ExecuteReader();
@@ -455,17 +531,22 @@ public sealed partial class NoteStore : INoteRepository
         command.Parameters.AddWithValue("$baseContent", baseContent);
         command.Parameters.AddWithValue("$now", UtcNow());
         command.ExecuteNonQuery();
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "编辑引用覆写", request.HistoryGroup);
         transaction.Commit();
     }
 
     public void HideReferencedBlock(string referenceInstanceId, string targetBlockId)
     {
         using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+        var historyDocumentId = HistoryOwner(connection, transaction, referenceInstanceId);
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         int revision;
         string? parentId;
         string position;
         using (var source = connection.CreateCommand())
         {
+            source.Transaction = transaction;
             source.CommandText = "SELECT revision, parent_id, position FROM blocks WHERE id=$id AND scope_type='canonical' AND deleted_at IS NULL";
             source.Parameters.AddWithValue("$id", targetBlockId);
             using var reader = source.ExecuteReader();
@@ -475,6 +556,7 @@ public sealed partial class NoteStore : INoteRepository
             position = reader.GetString(2);
         }
         using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO instance_tree_operations
                 (id, reference_instance_id, operation, target_block_id, base_parent_id, base_position,
@@ -492,12 +574,16 @@ public sealed partial class NoteStore : INoteRepository
         command.Parameters.AddWithValue("$revision", revision);
         command.Parameters.AddWithValue("$now", UtcNow());
         command.ExecuteNonQuery();
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "隐藏引用块");
+        transaction.Commit();
     }
 
     public void SaveInstanceBlock(SaveInstanceBlockRequest request)
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
+        var historyDocumentId = HistoryOwner(connection, transaction, request.ReferenceInstanceId);
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         string hostDocumentId;
         using (var instance = connection.CreateCommand())
         {
@@ -559,17 +645,22 @@ public sealed partial class NoteStore : INoteRepository
             operation.Parameters.AddWithValue("$now", UtcNow());
             operation.ExecuteNonQuery();
         }
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "编辑引用块", request.HistoryGroup);
         transaction.Commit();
     }
 
     public void MoveReferencedBlock(MoveReferencedBlockRequest request)
     {
         using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+        var historyDocumentId = HistoryOwner(connection, transaction, request.ReferenceInstanceId);
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         int revision;
         string? baseParentId;
         string basePosition;
         using (var source = connection.CreateCommand())
         {
+            source.Transaction = transaction;
             source.CommandText = "SELECT revision, parent_id, position FROM blocks WHERE id=$id AND scope_type='canonical' AND deleted_at IS NULL";
             source.Parameters.AddWithValue("$id", request.TargetBlockId);
             using var reader = source.ExecuteReader();
@@ -579,6 +670,7 @@ public sealed partial class NoteStore : INoteRepository
             basePosition = reader.GetString(2);
         }
         using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO instance_tree_operations
                 (id, reference_instance_id, operation, target_block_id, parent_block_id, position,
@@ -599,12 +691,16 @@ public sealed partial class NoteStore : INoteRepository
         command.Parameters.AddWithValue("$revision", revision);
         command.Parameters.AddWithValue("$now", UtcNow());
         command.ExecuteNonQuery();
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "移动引用块");
+        transaction.Commit();
     }
 
     public void DeleteInstanceBlock(string referenceInstanceId, string blockId)
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
+        var historyDocumentId = HistoryOwner(connection, transaction, referenceInstanceId);
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         using (var block = connection.CreateCommand())
         {
             block.Transaction = transaction;
@@ -623,6 +719,7 @@ public sealed partial class NoteStore : INoteRepository
             operation.Parameters.AddWithValue("$blockId", blockId);
             operation.ExecuteNonQuery();
         }
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "删除引用块");
         transaction.Commit();
     }
 
@@ -630,6 +727,8 @@ public sealed partial class NoteStore : INoteRepository
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
+        var historyDocumentId = HistoryOwner(connection, transaction, referenceInstanceId);
+        var historyBefore = CaptureHistory(connection, transaction, historyDocumentId);
         foreach (var sql in new[]
         {
             "DELETE FROM block_overrides WHERE reference_instance_id=$referenceId AND target_block_id=$targetBlockId",
@@ -643,6 +742,7 @@ public sealed partial class NoteStore : INoteRepository
             command.Parameters.AddWithValue("$targetBlockId", targetBlockId);
             command.ExecuteNonQuery();
         }
+        RecordHistory(connection, transaction, historyDocumentId, historyBefore, "恢复引用继承");
         transaction.Commit();
     }
 
@@ -679,6 +779,16 @@ public sealed partial class NoteStore : INoteRepository
                 created_at TEXT NOT NULL, PRIMARY KEY(document_id, mutation_id),
                 UNIQUE(document_id, client_version)
             );
+            CREATE TABLE IF NOT EXISTS document_history (
+                document_id TEXT PRIMARY KEY REFERENCES documents(id), data_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS styles (
+                id TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
+                title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', css TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1, position TEXT NOT NULL DEFAULT '00001000',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_styles_scope ON styles(scope_type, scope_id, position);
             CREATE TABLE IF NOT EXISTS blocks (
                 id TEXT PRIMARY KEY, document_id TEXT NOT NULL, parent_id TEXT, position TEXT NOT NULL,
                 type TEXT NOT NULL, content_json TEXT NOT NULL DEFAULT '{}', properties_json TEXT NOT NULL DEFAULT '{}',
@@ -861,6 +971,15 @@ public sealed partial class NoteStore : INoteRepository
         }
         foreach (var id in removed)
         {
+            using (var reference = connection.CreateCommand())
+            {
+                reference.Transaction = transaction;
+                reference.CommandText = "UPDATE reference_instances SET deleted_at=$now, updated_at=$now WHERE host_document_id=$documentId AND host_block_id=$id AND deleted_at IS NULL";
+                reference.Parameters.AddWithValue("$now", UtcNow());
+                reference.Parameters.AddWithValue("$documentId", documentId);
+                reference.Parameters.AddWithValue("$id", id);
+                reference.ExecuteNonQuery();
+            }
             using var remove = connection.CreateCommand();
             remove.Transaction = transaction;
             remove.CommandText = "UPDATE blocks SET deleted_at=$now, revision=revision+1 WHERE id=$id";
@@ -923,9 +1042,9 @@ public sealed partial class NoteStore : INoteRepository
         command.CommandText = "SELECT id, parent_id, position, type, content_json, properties_json, revision FROM blocks WHERE document_id=$id AND deleted_at IS NULL AND scope_type='canonical' ORDER BY position";
         command.Parameters.AddWithValue("$id", documentId);
         using var reader = command.ExecuteReader();
-        var blocks = new List<object>();
-        while (reader.Read()) blocks.Add(BlockPayload(reader));
-        return blocks;
+        var blocks = new List<BlockPayloadRow>();
+        while (reader.Read()) blocks.Add(ReadBlockPayloadRow(reader));
+        return OrderBlockTree(blocks, includeScope: false);
     }
 
     private static List<object> ReadBacklinks(SqliteConnection connection, string documentId)
@@ -1052,23 +1171,41 @@ public sealed partial class NoteStore : INoteRepository
         command.Parameters.AddWithValue("$referenceId", referenceInstanceId);
         command.Parameters.AddWithValue("$targetBlockId", (object?)targetBlockId ?? DBNull.Value);
         using var reader = command.ExecuteReader();
-        var blocks = new List<object>();
-        while (reader.Read()) blocks.Add(new
-        {
-            id = reader.GetString(0), parentId = reader.IsDBNull(1) ? null : reader.GetString(1), position = reader.GetString(2),
-            type = reader.GetString(3), content = JsonDocument.Parse(reader.GetString(4)).RootElement.Clone(),
-            properties = JsonDocument.Parse(reader.GetString(5)).RootElement.Clone(), revision = reader.GetInt32(6),
-            scopeType = reader.GetString(7)
-        });
-        return blocks;
+        var blocks = new List<BlockPayloadRow>();
+        while (reader.Read()) blocks.Add(ReadBlockPayloadRow(reader, reader.GetString(7)));
+        return OrderBlockTree(blocks, includeScope: true);
     }
 
-    private static object BlockPayload(SqliteDataReader reader) => new
+    private sealed record BlockPayloadRow(string Id, string? ParentId, string Position, string Type,
+        JsonElement Content, JsonElement Properties, int Revision, string? ScopeType);
+
+    private static BlockPayloadRow ReadBlockPayloadRow(SqliteDataReader reader, string? scopeType = null) => new(
+        reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1), reader.GetString(2),
+        reader.GetString(3), JsonDocument.Parse(reader.GetString(4)).RootElement.Clone(),
+        JsonDocument.Parse(reader.GetString(5)).RootElement.Clone(), reader.GetInt32(6), scopeType);
+
+    private static List<object> OrderBlockTree(List<BlockPayloadRow> rows, bool includeScope)
     {
-        id = reader.GetString(0), parentId = reader.IsDBNull(1) ? null : reader.GetString(1), position = reader.GetString(2),
-        type = reader.GetString(3), content = JsonDocument.Parse(reader.GetString(4)).RootElement.Clone(),
-        properties = JsonDocument.Parse(reader.GetString(5)).RootElement.Clone(), revision = reader.GetInt32(6)
-    };
+        var ids = rows.Select(row => row.Id).ToHashSet(StringComparer.Ordinal);
+        var children = rows.GroupBy(row => row.ParentId is not null && ids.Contains(row.ParentId) ? row.ParentId : "")
+            .ToDictionary(group => group.Key, group => group.OrderBy(row => row.Position, StringComparer.Ordinal)
+                .ThenBy(row => row.Id, StringComparer.Ordinal).ToList(), StringComparer.Ordinal);
+        var ordered = new List<BlockPayloadRow>();
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        void Append(BlockPayloadRow row)
+        {
+            if (!visited.Add(row.Id)) return;
+            ordered.Add(row);
+            if (children.TryGetValue(row.Id, out var descendants)) descendants.ForEach(Append);
+        }
+        if (children.TryGetValue("", out var roots)) roots.ForEach(Append);
+        rows.OrderBy(row => row.Position, StringComparer.Ordinal).ThenBy(row => row.Id, StringComparer.Ordinal).ToList().ForEach(Append);
+        return ordered.Select(row => includeScope
+            ? (object)new { id = row.Id, parentId = row.ParentId, position = row.Position, type = row.Type,
+                content = row.Content, properties = row.Properties, revision = row.Revision, scopeType = row.ScopeType }
+            : new { id = row.Id, parentId = row.ParentId, position = row.Position, type = row.Type,
+                content = row.Content, properties = row.Properties, revision = row.Revision }).ToList();
+    }
 
     private List<Note> ReadDocuments()
     {

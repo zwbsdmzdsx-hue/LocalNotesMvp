@@ -33,6 +33,7 @@ public sealed class EditorHostController
                 "ready" => null,
                 "loadDocument" or "reloadDocument" => LoadDocument(request),
                 "saveDocument" => SaveDocument(request),
+                "storeMedia" => StoreMedia(request),
                 "executeCommand" => ExecuteCommand(request),
                 "openDocument" => await OpenDocumentAsync(request),
                 "navigateBack" => await NavigateAsync(false),
@@ -69,11 +70,26 @@ public sealed class EditorHostController
         {
             DocumentId = payload.DocumentId,
             MutationId = payload.MutationId,
+            HistoryGroup = payload.HistoryGroup,
             ClientVersion = payload.ClientVersion,
             Title = payload.Title,
             Blocks = payload.Blocks
         });
-        return new { documentId = payload.DocumentId, mutationId = payload.MutationId, clientVersion = version };
+        return new { documentId = payload.DocumentId, mutationId = payload.MutationId, clientVersion = version, history = _repository.GetDocumentHistory(payload.DocumentId) };
+    }
+
+    private object StoreMedia(HostRequest request)
+    {
+        var payload = request.Payload.Deserialize<StoreMediaPayload>(_json)
+            ?? throw new HostRequestException("invalid_payload", "storeMedia payload 无效。");
+        var media = _repository.StoreMedia(new StoreMediaRequest
+        {
+            Name = payload.Name,
+            MimeType = payload.MimeType,
+            Size = payload.Size,
+            Data = payload.Data
+        });
+        return new { media };
     }
 
     private object ExecuteCommand(HostRequest request)

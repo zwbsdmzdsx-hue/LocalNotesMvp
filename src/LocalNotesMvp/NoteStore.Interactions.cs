@@ -95,6 +95,10 @@ public sealed partial class NoteStore
         }
         switch (operation)
         {
+            case "save-style": SaveStyle(documentId, Read<StyleSheetRecord>()); break;
+            case "delete-style": DeleteStyle(documentId, Text("styleId"), Optional("scope")); break;
+            case "history-undo": case "history-redo": case "history-restore":
+                MoveHistory(documentId, operation, message); break;
             case "create-reference":
                 CreateReferenceAtomic(documentId, Text("hostBlockId"), Text("targetDocumentId"), Optional("targetBlockId"));
                 break;
@@ -113,10 +117,68 @@ public sealed partial class NoteStore
         return GetEditorState(documentId);
     }
 
+    private void SaveStyle(string documentId, StyleSheetRecord style)
+    {
+        if (string.IsNullOrWhiteSpace(style.Title)) style.Title = "未命名样式";
+        style.Scope = string.Equals(style.Scope, "notebook", StringComparison.OrdinalIgnoreCase) ? "workspace" : "document";
+        if (style.Scope == "document") style.Scope = "document";
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+        var targetId = documentId;
+        if (style.Scope == "workspace")
+        {
+            using var workspace = connection.CreateCommand(); workspace.Transaction = transaction;
+            workspace.CommandText = "SELECT workspace_id FROM documents WHERE id=$id AND deleted_at IS NULL";
+            workspace.Parameters.AddWithValue("$id", documentId);
+            targetId = workspace.ExecuteScalar() as string ?? throw new InvalidOperationException("文档没有所属笔记本。");
+        }
+        if (!string.IsNullOrWhiteSpace(style.Id))
+        {
+            using var ownership = connection.CreateCommand(); ownership.Transaction = transaction;
+            ownership.CommandText = "SELECT scope_type, scope_id FROM styles WHERE id=$id AND deleted_at IS NULL";
+            ownership.Parameters.AddWithValue("$id", style.Id);
+            using (var existing = ownership.ExecuteReader())
+                if (existing.Read() && (existing.GetString(0) != style.Scope || existing.GetString(1) != targetId))
+                    throw new InvalidOperationException("样式不属于当前作用域。");
+        }
+        var now = UtcNow();
+        using var command = connection.CreateCommand(); command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO styles(id,scope_type,scope_id,title,description,css,enabled,position,created_at,updated_at)
+            VALUES($id,$scope,$scopeId,$title,$description,$css,$enabled,$position,$now,$now)
+            ON CONFLICT(id) DO UPDATE SET title=excluded.title,description=excluded.description,css=excluded.css,
+              enabled=excluded.enabled,position=excluded.position,scope_type=excluded.scope_type,scope_id=excluded.scope_id,
+              updated_at=excluded.updated_at,deleted_at=NULL
+            """;
+        command.Parameters.AddWithValue("$id", string.IsNullOrWhiteSpace(style.Id) ? Guid.NewGuid().ToString("N") : style.Id);
+        command.Parameters.AddWithValue("$scope", style.Scope); command.Parameters.AddWithValue("$scopeId", targetId);
+        command.Parameters.AddWithValue("$title", style.Title.Trim()); command.Parameters.AddWithValue("$description", style.Description ?? "");
+        command.Parameters.AddWithValue("$css", style.Css ?? ""); command.Parameters.AddWithValue("$enabled", style.Enabled ? 1 : 0);
+        command.Parameters.AddWithValue("$position", string.IsNullOrWhiteSpace(style.Position) ? "00001000" : style.Position); command.Parameters.AddWithValue("$now", now);
+        command.ExecuteNonQuery(); transaction.Commit();
+    }
+
+    private void DeleteStyle(string documentId, string styleId, string? scope)
+    {
+        using var connection = OpenConnection(); using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE styles SET deleted_at=$now WHERE id=$id AND ((scope_type='document' AND scope_id=$doc) OR (scope_type='workspace' AND scope_id=(SELECT workspace_id FROM documents WHERE id=$doc)))";
+        command.Parameters.AddWithValue("$id", styleId); command.Parameters.AddWithValue("$doc", documentId); command.Parameters.AddWithValue("$now", UtcNow()); command.ExecuteNonQuery();
+    }
+
+    private static List<StyleSheetRecord> ReadStyles(SqliteConnection connection, string scope, string scopeId)
+    {
+        using var command = connection.CreateCommand(); command.CommandText = "SELECT id,title,description,css,enabled,position,scope_type FROM styles WHERE scope_type=$scope AND scope_id=$scopeId AND deleted_at IS NULL ORDER BY position, created_at";
+        command.Parameters.AddWithValue("$scope", scope); command.Parameters.AddWithValue("$scopeId", scopeId);
+        using var reader = command.ExecuteReader(); var result = new List<StyleSheetRecord>();
+        while (reader.Read()) result.Add(new StyleSheetRecord { Id = reader.GetString(0), Title = reader.GetString(1), Description = reader.GetString(2), Css = reader.GetString(3), Enabled = reader.GetInt32(4) != 0, Position = reader.GetString(5), Scope = reader.GetString(6) == "workspace" ? "notebook" : "document" });
+        return result;
+    }
+
     private void CreateReferenceAtomic(string documentId, string hostBlockId, string targetDocumentId, string? targetBlockId)
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
+        var historyBefore = CaptureHistory(connection, transaction, documentId);
         using var check = connection.CreateCommand();
         check.Transaction = transaction;
         check.CommandText = "SELECT COUNT(*) FROM blocks WHERE id=$id AND document_id=$doc AND deleted_at IS NULL AND scope_type='canonical'";
@@ -152,6 +214,7 @@ public sealed partial class NoteStore
         insert.Parameters.AddWithValue("$block", (object?)targetBlockId ?? DBNull.Value);
         insert.Parameters.AddWithValue("$now", UtcNow());
         insert.ExecuteNonQuery();
+        RecordHistory(connection, transaction, documentId, historyBefore, "新增引用");
         transaction.Commit();
     }
 
@@ -159,6 +222,7 @@ public sealed partial class NoteStore
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
+        var historyBefore = CaptureHistory(connection, transaction, documentId);
         using var query = connection.CreateCommand();
         query.Transaction = transaction;
         query.CommandText = "SELECT ri.host_block_id, ri.target_document_id, ri.target_block_id, COALESCE(d.title, '已删除文档') FROM reference_instances ri LEFT JOIN documents d ON d.id=ri.target_document_id WHERE ri.id=$id";
@@ -180,6 +244,7 @@ public sealed partial class NoteStore
         update.Parameters.AddWithValue("$id", referenceId); update.Parameters.AddWithValue("$now", UtcNow());
         update.ExecuteNonQuery();
         RebuildBlockLinks(connection, transaction, documentId, host, JsonSerializer.Deserialize<JsonElement>(content));
+        RecordHistory(connection, transaction, documentId, historyBefore, "删除引用");
         transaction.Commit();
     }
 }

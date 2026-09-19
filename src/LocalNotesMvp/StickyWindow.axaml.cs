@@ -78,7 +78,7 @@ public partial class StickyWindow : Window
                     if (saveTransaction is null || saveTransaction.DocumentId != _note.Id)
                         throw new InvalidOperationException("Save transaction document ID mismatch.");
                     var savedVersion = _store.SaveTransaction(saveTransaction);
-                    SendClientMessage(new { type = "save-ack", documentId = _note.Id, mutationId = saveTransaction.MutationId, clientVersion = savedVersion });
+                    SendClientMessage(new { type = "save-ack", documentId = _note.Id, mutationId = saveTransaction.MutationId, clientVersion = savedVersion, history = _store.GetDocumentHistory(_note.Id) });
                     break;
                 case "reload-state":
                     OnNavigationCompleted(null, null!);
@@ -131,7 +131,7 @@ public partial class StickyWindow : Window
 
     private void SendClientMessage(object message)
     {
-        var payload = JsonSerializer.Serialize(JsonSerializer.Serialize(message));
+        var payload = JsonSerializer.Serialize(JsonSerializer.Serialize(message, _json));
         _ = EditorView.ExecuteScriptAsync($"window.dispatchEvent(new MessageEvent('message', {{ data: {payload} }}));");
     }
 

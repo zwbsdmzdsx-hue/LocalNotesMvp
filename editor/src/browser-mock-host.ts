@@ -1,7 +1,9 @@
-import type { Notebook, Bookmark, WorkspaceSnapshot, SearchHit } from "./workspace-api";
+import { EditorHistory } from "./history";
+import { orderBlockTree } from "./block-tree";
+import type { Notebook, Bookmark, WorkspaceDocument, WorkspaceSnapshot, SearchHit } from "./workspace-api";
 import type { HostTransport } from "./editor-host-api";
 import { MockSaveStore } from "./mock-save-store";
-import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block } from "../../protocol/types";
+import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, MediaKind } from "../../protocol/types";
 
 const block = (blockId: string, text: string) => ({ id: blockId, parentId: null, position: "00001000", type: "paragraph" as const, content: { text, html: text }, properties: {}, revision: 1 });
 
@@ -14,6 +16,17 @@ export class BrowserMockHost implements HostTransport {
   failNextSave = false;
   lastRequest: HostRequest | null = null;
   private saves!: MockSaveStore;
+  private documentHistories = new Map<string, EditorHistory>();
+  private historySnapshot(id: string) {
+    const state = structuredClone(this.docs.get(id)!);
+    const moves = state.references.map(ref => [ref.id, [...(this.moves.get(ref.id) ?? new Map())]] as [string, Array<[string, { parentId: string | null; position: string }]>]);
+    return { state, moves };
+  }
+  private documentHistory(id: string) {
+    let history = this.documentHistories.get(id);
+    if (!history) { history = new EditorHistory(); history.record(this.historySnapshot(id), "开始编辑"); this.documentHistories.set(id, history); }
+    return history;
+  }
   private moves = new Map<string, Map<string, { parentId: string | null; position: string }>>();
 
   // ── Notebook / bookmark / document hierarchy ────────────────────────
@@ -46,6 +59,7 @@ export class BrowserMockHost implements HostTransport {
 
   private activeNotebookId = "nb-default";
   private activeBookmarkId = "bk-inbox";
+  private parentByDocument = new Map<string, string | null>();
   titleByDocument = new Map<string, string>([
     ["alpha", "Alpha"], ["beta", "Beta"], ["gamma", "Gamma"], ["delta", "Delta"],
     ["epsilon", "Epsilon"], ["zeta", "Zeta"], ["eta", "Eta"], ["theta", "Theta"]
@@ -62,13 +76,14 @@ export class BrowserMockHost implements HostTransport {
       { id: "theta",   title: "Theta",   blocks: [{ id: "t1", text: "Theta 日常" }] }
     ];
     for (const d of all) {
+      this.parentByDocument.set(d.id, null);
       const state: EditorState = {
-        note: { id: d.id, title: d.title, isSticky: false, clientVersion: 0 },
+        note: { id: d.id, title: d.title, isSticky: false, clientVersion: 0, workspaceId: d.id === "zeta" || d.id === "eta" ? "nb-research" : d.id === "theta" ? "nb-life" : "nb-default" },
         blocks: d.blocks.map(b => block(b.id, b.text)),
         documents: this.allDocuments().map(x => ({ id: x.id, title: x.title })),
         backlinks: [],
         overrideNotices: [],
-        references: []
+        references: [], documentStyles: [], notebookStyles: []
       };
       if (d.id === "alpha") state.blocks.push({ ...block("ar1", ""), type: "reference" });
       this.docs.set(d.id, state);
@@ -84,13 +99,18 @@ export class BrowserMockHost implements HostTransport {
     return [...this.titleByDocument.entries()].map(([id, title]) => ({ id, title }));
   }
   shellSnapshot(): WorkspaceSnapshot {
+    const documents: WorkspaceDocument[] = [];
+    for (const [bookmarkId, ids] of this.documentByBookmark) {
+      ids.forEach((id, position) => documents.push({ id, title: this.getDocumentTitle(id), bookmarkId, parentId: this.parentByDocument.get(id) ?? null, position }));
+    }
     return {
       notebooks: this.notebooks,
       bookmarks: this.bookmarks,
       openNotebookIds: this.openNotebookIds,
       activeNotebookId: this.activeNotebookId,
       activeBookmarkId: this.activeBookmarkId,
-      documentIds: this.documentByBookmark.get(this.activeBookmarkId) ?? []
+      documentIds: this.documentByBookmark.get(this.activeBookmarkId) ?? [],
+      documents
     };
   }
 
@@ -193,14 +213,11 @@ export class BrowserMockHost implements HostTransport {
     this.setDocumentTitle(id, title);
   }
   removeDocument(id: string) {
-    this.titleByDocument.delete(id);
-    this.docs.delete(id);
+    const oldParent = this.parentByDocument.get(id) ?? null;
+    this.titleByDocument.delete(id); this.docs.delete(id); this.parentByDocument.delete(id);
     this.history = this.history.filter(documentId => documentId !== id);
-    this.index = Math.min(this.index, this.history.length - 1);
-    for (const list of this.documentByBookmark.values()) {
-      const idx = list.indexOf(id);
-      if (idx >= 0) list.splice(idx, 1);
-    }
+    for (const [child, parent] of this.parentByDocument) if (parent === id) this.parentByDocument.set(child, oldParent);
+    for (const list of this.documentByBookmark.values()) { const idx = list.indexOf(id); if (idx >= 0) list.splice(idx, 1); }
     // Remove references to/from this document
     for (const doc of this.docs.values()) {
       doc.references = doc.references.filter(r => r.targetDocumentId !== id);
@@ -234,8 +251,8 @@ export class BrowserMockHost implements HostTransport {
     if (!this.documentByBookmark.has(bk.id)) this.documentByBookmark.set(bk.id, []);
   }
   /** Convenience for the in-browser shell to mint a new document and surface it under the active bookmark. */
-  createDocument(title: string) {
-    const id = "doc-" + Math.random().toString(36).slice(2, 8);
+  createDocument(title: string, requestedId?: string, bookmarkId = this.activeBookmarkId, parentId: string | null = null) {
+    const id = requestedId ?? ("doc-" + Math.random().toString(36).slice(2, 8));
     this.titleByDocument.set(id, title);
     const docsList = this.allDocuments();
     this.docs.set(id, {
@@ -246,10 +263,54 @@ export class BrowserMockHost implements HostTransport {
       overrideNotices: [],
       references: []
     });
-    const list = this.documentByBookmark.get(this.activeBookmarkId) ?? [];
+    this.parentByDocument.set(id, parentId);
+    const list = this.documentByBookmark.get(bookmarkId) ?? [];
     list.push(id);
-    this.documentByBookmark.set(this.activeBookmarkId, list);
+    this.documentByBookmark.set(bookmarkId, list);
     return id;
+  }
+  moveDocument(id: string, bookmarkId: string, parentId: string | null, index: number) {
+    if (!this.titleByDocument.has(id) || !this.documentByBookmark.has(bookmarkId)) return;
+    const descendants = new Set<string>(); const pending = [id];
+    while (pending.length) { const current = pending.pop()!; for (const [child, parent] of this.parentByDocument) if (parent === current) { descendants.add(child); pending.push(child); } }
+    if (parentId === id || (parentId && descendants.has(parentId))) return;
+    let depth = 1; let cursor = parentId;
+    while (cursor) { depth++; cursor = this.parentByDocument.get(cursor) ?? null; }
+    const subtreeDepth = (node: string): number => { const children = [...this.parentByDocument].filter(([, p]) => p === node).map(([child]) => child); return children.length ? 1 + Math.max(...children.map(subtreeDepth)) : 1; };
+    if (depth + subtreeDepth(id) - 1 > 3) return;
+    const subtree = new Set([id, ...descendants]);
+    const extracted: string[] = [];
+    // Preserve the existing preorder of the moved subtree while removing every
+    // descendant from its old bookmark as well.
+    for (const [owner, list] of this.documentByBookmark.entries()) {
+      const kept: string[] = [];
+      for (const item of list) (subtree.has(item) ? extracted : kept).push(item);
+      this.documentByBookmark.set(owner, kept);
+    }
+    this.parentByDocument.set(id, parentId);
+    const target = this.documentByBookmark.get(bookmarkId)!;
+    const siblings = this.documentByBookmark.get(bookmarkId)!
+      .filter(candidate => (this.parentByDocument.get(candidate) ?? null) === parentId);
+    const siblingIndex = Math.max(0, Math.min(index, siblings.length));
+    let insertAt = target.length;
+    if (siblingIndex < siblings.length) {
+      insertAt = target.indexOf(siblings[siblingIndex]);
+    } else if (siblings.length) {
+      const last = siblings[siblings.length - 1];
+      const lastIndex = target.indexOf(last);
+      insertAt = lastIndex < 0 ? target.length : lastIndex + 1;
+      while (insertAt < target.length && (this.parentByDocument.get(target[insertAt]) ?? null) !== parentId) insertAt++;
+    }
+    target.splice(Math.max(0, insertAt), 0, ...extracted);
+  }
+  moveBookmark(id: string, index: number) {
+    const at = this.bookmarks.findIndex(bookmark => bookmark.id === id); if (at < 0) return;
+    const bookmark = this.bookmarks[at];
+    const sameNotebook = this.bookmarks.filter(item => item.notebookId === bookmark.notebookId);
+    const target = sameNotebook[Math.max(0, Math.min(index, sameNotebook.length - 1))];
+    this.bookmarks.splice(at, 1);
+    const targetIndex = target ? this.bookmarks.findIndex(item => item.id === target.id) : this.bookmarks.length;
+    this.bookmarks.splice(Math.max(0, targetIndex), 0, bookmark);
   }
   subscribe(listener: (message: HostResponse | HostEvent) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private respond<K extends keyof RequestMap>(request: HostRequest<K>, payload: unknown, ok = true, error?: string) {
@@ -259,6 +320,9 @@ export class BrowserMockHost implements HostTransport {
   private state(documentId = this.current) {
     this.refreshReferenceSnapshots();
     const result = structuredClone(this.docs.get(documentId)!);
+    result.blocks = orderBlockTree(result.blocks);
+    result.references.forEach(reference => reference.blocks = orderBlockTree(reference.blocks));
+    result.history = this.documentHistory(documentId).model(documentId);
     result.backlinks = this.computeBacklinks(documentId);
     result.overrideNotices = this.computeOverrideNotices(documentId);
     return result;
@@ -386,7 +450,7 @@ export class BrowserMockHost implements HostTransport {
           const move = this.moves.get(reference.id)?.get(block.id);
           if (move) Object.assign(block, move);
         }
-        reference.blocks.sort((a, b) => a.position.localeCompare(b.position));
+        reference.blocks = orderBlockTree(reference.blocks);
       }
     }
   }
@@ -429,9 +493,26 @@ export class BrowserMockHost implements HostTransport {
             if (this.failNextSave) { this.failNextSave = false; this.respond(request, undefined, false, "Mock 保存失败"); break; }
             const payload = request.payload as Extract<RequestMap["saveDocument"], { documentId: string }>;
             if (request.sourceDocumentId !== payload.documentId) throw new Error("保存文档与请求归属不一致");
+            const history = this.documentHistory(payload.documentId);
             const version = this.saves.save(payload);
+            history.record(this.historySnapshot(payload.documentId), "编辑正文", payload.historyGroup);
             this.setDocumentTitle(payload.documentId, this.docs.get(payload.documentId)!.note.title);
-            this.respond(request, { documentId: payload.documentId, mutationId: payload.mutationId, clientVersion: version });
+            this.respond(request, { documentId: payload.documentId, mutationId: payload.mutationId, clientVersion: version, history: history.model(payload.documentId) });
+            break;
+          }
+          case "storeMedia": {
+            const payload = request.payload as RequestMap["storeMedia"];
+            const kind: MediaKind | null = payload.mimeType.startsWith("image/") ? "image" : payload.mimeType.startsWith("video/") ? "video" : payload.mimeType.startsWith("audio/") ? "audio" : null;
+            if (!kind) throw new Error("仅支持图片、视频和音频文件");
+            const media = {
+              id: `media-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`,
+              kind,
+              name: payload.name || "media",
+              mimeType: payload.mimeType,
+              size: payload.size,
+              url: `data:${payload.mimeType};base64,${payload.data}`
+            };
+            this.respond(request, { media });
             break;
           }
           case "openDocument": {
@@ -447,19 +528,42 @@ export class BrowserMockHost implements HostTransport {
           case "navigateBack": if (this.index > 0) this.index--; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "navigateForward": if (this.index + 1 < this.history.length) this.index++; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "executeCommand": {
-            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; content?: BlockContent; properties?: BlockProperties };
+            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; content?: BlockContent; properties?: BlockProperties; style?: StyleSheet; styleId?: string };
             const current = this.docs.get(request.sourceDocumentId ?? this.current)!;
-            const supported = new Set(["create-reference", "set-reference-mode", "save-override", "reset-override", "reset-reference", "save-instance-block", "move-reference-block", "delete-instance-block", "hide-reference-block", "remove-reference", "restore-snapshot"]);
-            if (!current || !supported.has(payload.operation ?? "")) throw new Error("未知操作或文档不存在");
-            if (payload.operation === "restore-snapshot") {
-              const snapshot = (payload as { state?: EditorState }).state;
-              if (!snapshot || snapshot.note?.id !== current.note.id) throw new Error("历史版本归属不一致");
-              current.note.title = snapshot.note.title;
-              current.blocks = structuredClone(snapshot.blocks);
-              current.references = structuredClone(snapshot.references);
+            if (!current) throw new Error("文档不存在");
+            if (payload.operation === "save-style") {
+              const style = structuredClone(payload as unknown as StyleSheet); const list = style.scope === "notebook" ? (current.notebookStyles ??= []) : (current.documentStyles ??= []);
+              const index = list.findIndex(item => item.id === style.id); if (index >= 0) list[index] = style; else list.push(style);
+              this.docs.forEach((doc) => { if (style.scope === "notebook" && doc.note.workspaceId === current.note.workspaceId) doc.notebookStyles = structuredClone(current.notebookStyles); });
+              this.respond(request, { state: this.state(current.note.id) });
+              break;
+            } else if (payload.operation === "delete-style" && payload.styleId) {
+              current.documentStyles = (current.documentStyles ?? []).filter(item => item.id !== payload.styleId);
+              current.notebookStyles = (current.notebookStyles ?? []).filter(item => item.id !== payload.styleId);
               this.respond(request, { state: this.state(current.note.id) });
               break;
             }
+            const history = this.documentHistory(current.note.id);
+            if (payload.operation?.startsWith("history-")) {
+              const move = payload as { operation: string; expectedVersion: number; entryId?: string };
+              if (move.expectedVersion !== current.note.clientVersion) throw new Error("文档已更新，请重新载入后再恢复历史");
+              if (this.failNextSave) { this.failNextSave = false; throw new Error("Mock 保存失败"); }
+              const snapshot = history.move(move.operation, move.entryId);
+              const version = current.note.clientVersion + 1;
+              for (const ref of current.references) this.moves.delete(ref.id);
+              for (const [id, moves] of snapshot.moves) this.moves.set(id, new Map(moves));
+              const previous = new Map(current.blocks.map(b => [b.id, b.revision]));
+              current.note.title = snapshot.state.note.title;
+              current.note.clientVersion = version;
+              current.blocks = snapshot.state.blocks;
+              current.blocks.forEach(b => b.revision = Math.max(b.revision, previous.get(b.id) ?? 0) + 1);
+              current.references = snapshot.state.references;
+              this.setDocumentTitle(current.note.id, current.note.title);
+              this.respond(request, { state: this.state(current.note.id) });
+              break;
+            }
+            const supported = new Set(["create-reference", "set-reference-mode", "save-override", "reset-override", "reset-reference", "save-instance-block", "move-reference-block", "delete-instance-block", "hide-reference-block", "remove-reference"]);
+            if (!supported.has(payload.operation ?? "")) throw new Error("未知操作");
             if (payload.operation !== "create-reference" && !current.references.some(r => r.id === payload.referenceInstanceId))
               throw new Error("引用不属于当前文档");
             if (payload.operation === "set-reference-mode" && !["inline", "collapsed", "link", "sidebar"].includes(payload.mode ?? ""))
@@ -544,6 +648,7 @@ export class BrowserMockHost implements HostTransport {
               current.references = current.references.filter(r => r.id !== reference.id);
               current.blocks = current.blocks.filter(b => b.id !== hostBlockId);
             }
+            history.record(this.historySnapshot(current.note.id), "更新引用", (payload as { historyGroup?: string }).historyGroup);
             this.respond(request, { state: this.state(current.note.id) });
             break;
           }

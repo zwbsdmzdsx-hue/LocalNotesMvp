@@ -36,6 +36,8 @@ export class MockSaveStore {
       block.revision = old ? old.revision + Number(changed) : 1;
     }
     state.blocks = blocks;
+    const liveBlockIds = new Set(blocks.map(block => block.id));
+    state.references = state.references.filter(reference => liveBlockIds.has(reference.hostBlockId));
     state.note.title = mutation.title?.trim() || "未命名笔记";
     const version = ++state.note.clientVersion;
     const receipts = this.receipts.get(mutation.documentId) ?? new Map<string, number>();

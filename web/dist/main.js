@@ -16,7 +16,51 @@ let activeEditable = null;
 let activeBlock = null;
 let linkMenuItems = [];
 let linkMenuIndex = 0;
+let editGroup = newId();
+let editTarget = null;
+let editTime = 0;
+let historyTail = Promise.resolve();
+let historyBusy = false;
+let commandTail = Promise.resolve();
+let commandFailure = null;
+const commandWaiters = new Map();
+const referenceCommands = new Set(["create-reference", "set-reference-mode", "remove-reference", "reset-reference", "save-override", "save-instance-block", "move-reference-block", "delete-instance-block", "hide-reference-block", "reset-override"]);
+function sendCommand(payload, owner) {
+    const requestId = newId();
+    return new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => { commandWaiters.delete(requestId); reject(new Error("操作超时，请重新载入确认结果")); }, 10000);
+        commandWaiters.set(requestId, { documentId: owner, resolve: next => { clearTimeout(timer); resolve(next); }, reject: error => { clearTimeout(timer); reject(error); } });
+        bridgePost({ type: "editor-command", requestId, ...payload }, owner);
+    });
+}
 function post(message, sourceDocumentId = state?.note.id) {
+    const payload = message;
+    if (referenceCommands.has(payload.type) && sourceDocumentId) {
+        commandTail = commandTail.then(async () => {
+            const { type, ...args } = payload;
+            const next = await sendCommand({ operation: type, ...args }, sourceDocumentId);
+            commandFailure = null;
+            if (state?.note.id === sourceDocumentId) {
+                if (type === "save-override" || type === "save-instance-block" && document.querySelector(`[data-id="${CSS.escape(args.block.id)}"]`)) {
+                    state.references = next.references;
+                    state.history = next.history;
+                    publishHistory();
+                }
+                else
+                    render(next);
+            }
+            saveStatus.textContent = "已保存到本地数据库";
+        }).catch(error => { commandFailure = error.message; window.localNotesError?.(error.message); });
+        return;
+    }
+    // Reference commands already return their authoritative state.
+    if (payload.type === "reload-state") {
+        void commandTail.then(() => bridgePost(message, sourceDocumentId));
+        return;
+    }
+    bridgePost(message, sourceDocumentId);
+}
+function bridgePost(message, sourceDocumentId = state?.note.id) {
     const serialized = JSON.stringify({ sourceDocumentId, ...message });
     const bridge = window.chrome?.webview;
     const legacy = window.external;
@@ -43,7 +87,8 @@ function pumpSaveQueue() {
         mutationId: mutation.mutationId,
         clientVersion: mutation.clientVersion,
         title: mutation.title,
-        blocks: mutation.blocks
+        blocks: mutation.blocks,
+        historyGroup: mutation.historyGroup
     }, mutation.documentId);
 }
 function finishSaveDrain() {
@@ -67,6 +112,7 @@ function enqueueDocumentSave() {
     const mutation = {
         documentId,
         mutationId: newId(),
+        historyGroup: editGroup,
         clientVersion,
         title: titleInput.value.trim() || "未命名笔记",
         blocks: readOwnBlocks()
@@ -83,6 +129,10 @@ function handleSaveAck(message) {
         return;
     if (state?.note.id === message.documentId)
         state.note.clientVersion = message.clientVersion;
+    if (state?.note.id === message.documentId && message.history) {
+        state.history = message.history;
+        publishHistory();
+    }
     saveFailure = null;
     inFlightMutation = null;
     saveStatus.textContent = "已保存到本地数据库";
@@ -101,7 +151,7 @@ function handleSaveNack(message) {
     window.localNotesError?.(error);
     const requestId = flushRequestId;
     flushRequestId = undefined;
-    saveDrainWaiters.splice(0);
+    saveDrainWaiters.splice(0).forEach(resolve => resolve());
     if (requestId)
         post({ type: "editor-flush-failed", requestId, error });
 }
@@ -203,7 +253,12 @@ function blockDepth(block, all) {
 function render(next) {
     document.querySelector(".block-menu")?.remove();
     hideInlineLinkSuggestions();
+    if (state?.note.id !== next.note.id) {
+        editGroup = newId();
+        commandFailure = null;
+    }
     state = next;
+    publishHistory();
     mutationVersion = Math.max(mutationVersion, next.note.clientVersion ?? 0);
     titleInput.value = next.note.title;
     blockSurface.innerHTML = "";
@@ -323,10 +378,13 @@ function editableContent(editable, fallback = { text: "", html: "" }) {
     });
     return { ...fallback, text, html: sanitizeHtml(editable.innerHTML), links };
 }
-function scheduleDocumentSave(_delay = 0) {
+function scheduleDocumentSave(structural) {
+    if (structural !== undefined)
+        editGroup = newId();
     enqueueDocumentSave();
 }
 function saveDocument() {
+    editGroup = newId();
     enqueueDocumentSave();
 }
 function renderReference(reference) {
@@ -403,8 +461,8 @@ function scheduleInstanceBlock(row, source) {
     const referenceInstanceId = row.dataset.referenceInstanceId;
     const block = blockFromReferenceRow(row, source);
     saveStatus.textContent = "正在保存引用专属块...";
-    post({ type: "save-instance-block", referenceInstanceId, block }, documentId);
-    saveStatus.textContent = "引用专属块已保存";
+    post({ type: "save-instance-block", referenceInstanceId, block, historyGroup: editGroup }, documentId);
+    saveStatus.textContent = "正在保存引用专属块...";
 }
 function addInstanceBlock(reference, parentId, afterRow) {
     const documentId = state?.note.id;
@@ -414,8 +472,7 @@ function addInstanceBlock(reference, parentId, afterRow) {
     block.position = String((rows.length + 1) * 1000).padStart(8, "0");
     runAfterSaveDrain(() => {
         post({ type: "save-instance-block", referenceInstanceId: reference.id, block }, documentId);
-        saveStatus.textContent = "已新增引用专属块";
-        window.setTimeout(() => post({ type: "reload-state" }, documentId), 50);
+        saveStatus.textContent = "正在新增引用专属块...";
     });
 }
 function scheduleOverride(row, source, originalProperties) {
@@ -426,8 +483,8 @@ function scheduleOverride(row, source, originalProperties) {
     const content = editableContent(editable, source.content);
     const properties = { ...originalProperties, background: editable.style.backgroundColor || undefined, textColor: editable.style.color || undefined };
     saveStatus.textContent = "正在保存局部覆写...";
-    post({ type: "save-override", referenceInstanceId, targetBlockId, content, properties }, documentId);
-    saveStatus.textContent = "局部覆写已保存";
+    post({ type: "save-override", referenceInstanceId, targetBlockId, content, properties, historyGroup: editGroup }, documentId);
+    saveStatus.textContent = "正在保存局部覆写...";
 }
 function renderRelations() {
     if (!state)
@@ -731,7 +788,7 @@ function indent(direction) {
     }
     recalculateReferenceDepths(card);
     persistReferenceStructure(referenceRow);
-    saveStatus.textContent = "引用结构已保存";
+    saveStatus.textContent = "正在保存引用结构...";
 }
 function recalculateDepths() {
     const rows = [...blockSurface.querySelectorAll("[data-own-block]")];
@@ -774,7 +831,7 @@ function move(delta) {
         row.dataset.position = nextPosition;
         persistReferenceStructure(row);
     });
-    saveStatus.textContent = "引用顺序已保存";
+    saveStatus.textContent = "正在保存引用顺序...";
 }
 function escapeText(value) {
     const span = document.createElement("span");
@@ -786,18 +843,20 @@ window.localNotesSaved = (documentId) => {
     if (state?.note.id === documentId)
         saveStatus.textContent = "已保存到本地数据库";
 };
+async function drainEdits() {
+    if (saveFailure)
+        throw new Error(saveFailure);
+    await new Promise(resolve => { saveDrainWaiters.push(resolve); pumpSaveQueue(); });
+    await commandTail;
+    if (saveFailure || commandFailure)
+        throw new Error(saveFailure || commandFailure);
+}
 window.localNotesFlush = (requestId) => {
-    flushRequestId = requestId;
-    if (saveFailure) {
-        flushRequestId = undefined;
-        post({ type: "editor-flush-failed", requestId, error: saveFailure });
-        return;
-    }
-    runAfterSaveDrain(() => {
-        const id = flushRequestId;
-        flushRequestId = undefined;
-        post({ type: "editor-flush-complete", requestId: id });
-    });
+    void (async () => {
+        await historyTail;
+        await drainEdits();
+        post({ type: "editor-flush-complete", requestId });
+    })().catch(error => post({ type: "editor-flush-failed", requestId, error: error.message }));
 };
 window.localNotesRunAcceptanceEdit = (marker) => {
     window.setTimeout(() => {
@@ -817,6 +876,16 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("message", (event) => {
     const message = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+    if (message.type === "command-ack" || message.type === "command-nack") {
+        const waiter = commandWaiters.get(message.requestId);
+        if (waiter && waiter.documentId === message.documentId) {
+            commandWaiters.delete(message.requestId);
+            if (message.type === "command-ack")
+                waiter.resolve(message.state);
+            else
+                waiter.reject(new Error(message.error || "操作失败"));
+        }
+    }
     if (message.type === "load-state")
         render(message.state);
     if (message.type === "focus-block" && typeof message.blockId === "string")
@@ -859,11 +928,34 @@ document.addEventListener("click", (event) => {
         showOwnBlockMenu(grip, block);
 }, true);
 document.addEventListener("input", (event) => {
+    const input = event;
+    if (event.target !== editTarget || Date.now() - editTime > 900 || input.inputType && !["insertText", "deleteContentBackward", "deleteContentForward", "insertCompositionText", "insertFromComposition"].includes(input.inputType))
+        editGroup = newId();
+    editTarget = event.target;
+    editTime = Date.now();
     const editable = event.target?.closest(".block-text[contenteditable='true']");
     if (editable)
         updateInlineLinkSuggestions(editable);
 }, true);
+document.addEventListener("beforeinput", event => {
+    const target = event.target;
+    if (!event.isComposing && (target === titleInput ? titleInput.selectionStart !== titleInput.selectionEnd : !getSelection()?.isCollapsed))
+        editGroup = newId();
+}, true);
+document.addEventListener("pointerdown", () => { editGroup = newId(); }, true);
+document.addEventListener("compositionstart", () => { editGroup = newId(); }, true);
 document.addEventListener("keydown", (event) => {
+    if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key))
+        editGroup = newId();
+    const target = event.target;
+    if ((target.matches("input, textarea") && target !== titleInput) || target.closest("#history-panel"))
+        return;
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.isComposing && ["z", "y"].includes(event.key.toLowerCase())) {
+        event.preventDefault();
+        event.stopPropagation();
+        void runHistory(event.key.toLowerCase() === "y" || event.shiftKey ? "history-redo" : "history-undo");
+        return;
+    }
     if (event.altKey && !event.ctrlKey && !event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
         event.preventDefault();
         event.stopPropagation();
@@ -877,3 +969,115 @@ document.addEventListener("keydown", (event) => {
 }, true);
 titleInput.addEventListener("input", () => scheduleDocumentSave());
 document.querySelectorAll(".icon-tools button").forEach((button) => button.addEventListener("mousedown", (event) => event.preventDefault()));
+function runHistory(operation, entryId) {
+    const owner = state?.note.id;
+    historyTail = historyTail.then(async () => {
+        if (!owner || state?.note.id !== owner)
+            return;
+        await drainEdits();
+        if (operation === "history-undo" && !state.history?.canUndo || operation === "history-redo" && !state.history?.canRedo)
+            return;
+        historyBusy = true;
+        const focused = document.activeElement;
+        const titleSelection = focused === titleInput ? [titleInput.selectionStart, titleInput.selectionEnd] : null;
+        const selection = getSelection();
+        const offsets = focused?.classList.contains("block-text") && selection?.rangeCount ? (() => {
+            const range = selection.getRangeAt(0);
+            const prefix = range.cloneRange();
+            prefix.selectNodeContents(focused);
+            prefix.setEnd(range.startContainer, range.startOffset);
+            return [prefix.toString().length, prefix.toString().length + range.toString().length];
+        })() : null;
+        const blockId = focused?.closest("[data-own-block]")?.dataset.id;
+        document.querySelectorAll(".editor, .toolbar, .relations, .sidebar-right").forEach(el => el.inert = true);
+        publishHistory();
+        try {
+            const next = await sendCommand({ operation, entryId, expectedVersion: state.note.clientVersion }, owner);
+            render(next);
+            mutationVersion = next.note.clientVersion;
+            editGroup = newId();
+        }
+        finally {
+            historyBusy = false;
+            document.querySelectorAll(".editor, .toolbar, .relations, .sidebar-right").forEach(el => el.inert = false);
+            if (titleSelection) {
+                titleInput.focus();
+                titleInput.setSelectionRange(titleSelection[0], titleSelection[1]);
+            }
+            else if (blockId) {
+                const editable = document.querySelector(`[data-id="${CSS.escape(blockId)}"] .block-text`);
+                if (editable) {
+                    editable.focus();
+                    const range = document.createRange();
+                    range.selectNodeContents(editable);
+                    range.collapse(false);
+                    const point = (offset) => {
+                        const walker = document.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
+                        let node = walker.nextNode();
+                        while (node) {
+                            const length = node.textContent?.length ?? 0;
+                            if (offset <= length)
+                                return [node, offset];
+                            offset -= length;
+                            node = walker.nextNode();
+                        }
+                        return [editable, editable.childNodes.length];
+                    };
+                    if (offsets) {
+                        range.setStart(...point(offsets[0]));
+                        range.setEnd(...point(offsets[1]));
+                    }
+                    const selection = getSelection();
+                    selection?.removeAllRanges();
+                    selection?.addRange(range);
+                }
+            }
+            publishHistory();
+        }
+    }).catch(error => window.localNotesError?.(error.message));
+    return historyTail;
+}
+let selectedHistoryId = "";
+function publishHistory() {
+    const model = state?.history;
+    document.querySelector("#undo").disabled = historyBusy || !model?.canUndo;
+    document.querySelector("#redo").disabled = historyBusy || !model?.canRedo;
+    const panel = document.querySelector("#history-panel");
+    panel.replaceChildren();
+    const heading = document.createElement("h2");
+    heading.textContent = "历史记录";
+    panel.append(heading);
+    const intro = document.createElement("p");
+    intro.className = "history-intro";
+    intro.textContent = "最近 80 个版本 · 保存在本地数据库";
+    panel.append(intro);
+    if (!model?.entries.length) {
+        const empty = document.createElement("p");
+        empty.textContent = "编辑后自动记录版本";
+        panel.append(empty);
+        return;
+    }
+    for (const entry of [...model.entries].reverse()) {
+        const button = document.createElement("button");
+        button.className = "history-entry" + (entry.id === model.currentId ? " current" : "");
+        button.textContent = `${entry.label} · ${new Date(entry.timestamp).toLocaleString()}${entry.id === model.currentId ? " · 当前" : ""}`;
+        button.onclick = () => { selectedHistoryId = entry.id; publishHistory(); };
+        panel.append(button);
+    }
+    const selected = model.entries.find(e => e.id === selectedHistoryId) ?? model.entries.find(e => e.id === model.currentId);
+    const preview = document.createElement("section");
+    preview.className = "history-preview";
+    const title = document.createElement("strong");
+    title.textContent = selected.title;
+    const text = document.createElement("pre");
+    text.textContent = selected.preview || "（空白正文）";
+    const restore = document.createElement("button");
+    restore.textContent = "恢复此版本";
+    restore.disabled = historyBusy || selected.id === model.currentId;
+    restore.onclick = () => void runHistory("history-restore", selected.id);
+    preview.append(title, text, restore);
+    panel.append(preview);
+}
+document.querySelector("#undo").addEventListener("click", () => void runHistory("history-undo"));
+document.querySelector("#redo").addEventListener("click", () => void runHistory("history-redo"));
+document.querySelector("#history").addEventListener("click", () => { const panel = document.querySelector("#history-panel"); panel.hidden = !panel.hidden; publishHistory(); });

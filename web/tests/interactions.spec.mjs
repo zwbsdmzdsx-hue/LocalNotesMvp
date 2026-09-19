@@ -72,7 +72,7 @@ test('six-dot menu opens after repeated document renders and creates reference',
     await page.locator('#title').click(); await expect(page.getByRole('menu')).toHaveCount(0);
   }
   await page.locator('.grip').first().click(); await page.getByRole('menu').getByText('嵌入为实时引用').click();
-  const message = await page.evaluate(() => window.testMessages.find(m => m.type === 'create-reference'));
+  const message = await page.evaluate(() => window.testMessages.find(m => m.type === 'editor-command' && m.operation === 'create-reference'));
   expect(message).toMatchObject({ sourceDocumentId: 'host', targetDocumentId: 'host', targetBlockId: 'b1' });
 });
 test('mouse-selected link survives a render and opens by ID', async ({ page }) => {

@@ -21,6 +21,9 @@ export function createBrowserWorkspace(store: BrowserMockHost, session: {
       case "renameDocument": store.renameDocument(command.id, command.name); break;
       case "createNotebook": store.notebooksPush(command.notebook); store.openNotebook(command.notebook.id); break;
       case "createBookmark": store.bookmarksPush(command.bookmark); break;
+      case "createDocument": store.createDocument(command.document.title, command.document.id, command.bookmarkId, command.parentId ?? null); break;
+      case "moveDocument": store.moveDocument(command.id, command.bookmarkId, command.parentId, command.index); break;
+      case "moveBookmark": store.moveBookmark(command.id, command.index); break;
       case "recolorBookmark": store.recolorBookmark(command.id, command.color); break;
     }
   }

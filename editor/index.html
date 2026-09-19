@@ -55,6 +55,9 @@
           <button id="add-paragraph" title="添加段落">段落</button>
           <button id="add-heading" title="添加标题">标题</button>
           <button id="add-todo" title="添加待办">待办</button>
+          <button id="add-columns" title="插入分列布局">分列</button>
+          <button id="add-media" title="插入图片、视频或音频">媒体</button>
+          <input id="media-file-input" type="file" accept="image/*,video/*,audio/*" multiple hidden>
         </div>
         <div class="tool-group icon-tools">
           <button id="bold" title="加粗"><strong>B</strong></button>
@@ -66,9 +69,23 @@
           <button id="indent" title="缩进为子级">→</button>
           <button id="move-up" title="向上移动">↑</button>
           <button id="move-down" title="向下移动">↓</button>
+          <span class="align-tool">
+            <button id="align" title="块对齐" aria-label="块对齐" aria-haspopup="menu" aria-expanded="false">亖</button>
+            <span id="align-menu" class="align-menu" role="menu" hidden>
+              <button type="button" data-align="left" role="menuitem">左对齐</button>
+              <button type="button" data-align="center" role="menuitem">居中</button>
+              <button type="button" data-align="right" role="menuitem">右对齐</button>
+            </span>
+          </span>
           <button id="undo" title="撤销 (Ctrl/Cmd+Z)" disabled>↶</button>
           <button id="redo" title="重做 (Ctrl/Cmd+Y)" disabled>↷</button>
           <button id="history" title="打开历史记录">历史</button>
+          <button id="notebook-styles" title="管理笔记本 CSS">CSS</button>
+        </div>
+        <div class="editor-mode-switch" role="group" aria-label="编辑模式">
+          <button type="button" data-editor-mode="rich" aria-pressed="true">编辑</button>
+          <button type="button" data-editor-mode="source" aria-pressed="false">源码</button>
+          <button type="button" data-editor-mode="preview" aria-pressed="false">预览</button>
         </div>
         <button id="open-sticky" title="打开便签">📝 便签</button>
         <button id="navigate-back" title="后退">←</button>
@@ -94,6 +111,7 @@
         <button class="sidebar-tab" data-pane-btn="backlinks" title="反向链接" aria-label="反向链接">🔗</button>
         <button class="sidebar-tab active" data-pane-btn="overrides" title="外部覆写" aria-label="外部覆写">✎</button>
         <button class="sidebar-tab" data-pane-btn="history" title="历史记录" aria-label="历史记录">🕘</button>
+        <button class="sidebar-tab" data-pane-btn="styles" title="CSS 管理" aria-label="CSS 管理">🎨</button>
       </div>
       <div class="sidebar-body" id="sidebar-right-body">
         <!-- sections moved here from .relations by shell.ts -->

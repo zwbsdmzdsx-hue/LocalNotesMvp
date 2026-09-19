@@ -37,3 +37,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Desktop restart contract failed' }
 在 `web/` 运行 `npm run test:editor`。测试默认独占 4273，使用当前仓库 Vite 服务；可设置进程级 `EDITOR_TEST_PORT` 更改端口。不会复用 4173 开发页。新增 `workspace-contract.spec.mjs` 从真实菜单验证重命名、失败阻止切换、删除后导航及继续保存。
 
 架构仍有边界：新侧栏的原生工作区适配未实现，新版 `editor` 尚未替代 EXE 的 `web/dist`；完整引用契约、持久化失败草稿和大编辑器核心的进一步拆分仍待后续工作。
+
+## 历史记录验证
+
+`Storage.Contracts` 额外验证输入合并、撤销/重做分支、恢复可撤销、幂等不重复记录、版本过期与归属拒绝、引用实例恢复不覆盖源、重开历史及 80 条保留上限。新版 `history.spec.mjs` 通过实际键盘/按钮验证快捷键、只读预览、恢复、失败重试、快速队列及稳定块 ID，并生成历史面板截图。
+
+上述 `Desktop.Contracts write/read` 现在还在主窗口与便签真实 WebView 执行历史操作，验证恢复 ACK/NACK、排空等待、分支预览与恢复；read 阶段在第二个 EXE 进程中再次执行撤销/重做。原生契约通过脚本派发键盘和输入事件，不等于真实操作系统输入法验收。

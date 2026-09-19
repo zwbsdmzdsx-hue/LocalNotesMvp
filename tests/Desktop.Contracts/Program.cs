@@ -49,6 +49,9 @@ internal static class Program
 
     private static async Task RunAsync(Window main, string database, bool readOnly)
     {
+        var mainView = main.FindControl<WebView>("EditorView")!;
+        await UntilAsync(() => EvaluateAsync(mainView, "!!document.querySelector('[data-own-block] .block-text')"), "Main editor did not load");
+        if (!readOnly) await ExerciseHistoryAsync(mainView, "main-history-current");
         var store = new NoteStore(database); store.Load();
         var note = readOnly ? store.Notes.Single(n => n.IsSticky) : store.Create(true);
         var sticky = new StickyWindow(store, note);
@@ -61,6 +64,7 @@ internal static class Program
         {
             if (!await EvaluateAsync(view, $"document.querySelector('[data-own-block] .block-text').textContent === {JsonSerializer.Serialize(Marker)}"))
                 throw new Exception("Second EXE process did not restore the saved sticky text");
+            await CheckRestartHistoryAsync(view);
             sticky.Close();
             await closed.Task.WaitAsync(TimeSpan.FromSeconds(12));
             Console.WriteLine("PASS second EXE process restored sticky content");
@@ -102,6 +106,7 @@ internal static class Program
             retry.dispatchEvent(new Event('input', { bubbles: true }));
             """);
         await UntilAsync(() => EvaluateAsync(view, "document.querySelector('#status').textContent.includes('已保存')"), "Retry did not receive save ACK");
+        await ExerciseHistoryAsync(view, Marker);
         sticky.Close();
         await closed.Task.WaitAsync(TimeSpan.FromSeconds(12));
         var state = JsonSerializer.SerializeToElement(store.GetEditorState(note.Id));
@@ -109,4 +114,66 @@ internal static class Program
             throw new Exception("Sticky ACK did not correspond to persisted text");
         Console.WriteLine("PASS real sticky WebView: pending close, NACK, retained draft, retry, ACK, close and SQLite read");
     }
+    private static async Task SetTextAsync(WebView view, string text)
+    {
+        await view.ExecuteScriptAsync($$"""
+            (() => { const edit = document.querySelector('[data-own-block] .block-text');
+              edit.focus(); edit.textContent = {{JsonSerializer.Serialize(text)}};
+              edit.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste' })); })();
+            """);
+        try { await UntilAsync(() => EvaluateAsync(view, "document.querySelector('#status').textContent.includes('已保存')"), "History edit did not save"); }
+        catch { Console.Error.WriteLine(await view.ExecuteScriptAsync("JSON.stringify({ status: document.querySelector('#status').textContent, text: document.querySelector('[data-own-block] .block-text').textContent })")); throw; }
+    }
+    private static async Task HasTextAsync(WebView view, string text) => await UntilAsync(() => EvaluateAsync(view,
+        $"document.querySelector('[data-own-block] .block-text').textContent === {JsonSerializer.Serialize(text)}"), "History text mismatch: " + text);
+    private static async Task ShortcutAsync(WebView view, string key) => await view.ExecuteScriptAsync(
+        $"(document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', {{ key: {JsonSerializer.Serialize(key)}, ctrlKey: true, bubbles: true }}));");
+    private static async Task ExerciseHistoryAsync(WebView view, string finalText)
+    {
+        await SetTextAsync(view, "history-first");
+        await SetTextAsync(view, "history-second");
+        await ShortcutAsync(view, "z"); await HasTextAsync(view, "history-first");
+        await ShortcutAsync(view, "y"); await HasTextAsync(view, "history-second");
+        await ShortcutAsync(view, "z"); await HasTextAsync(view, "history-first");
+        await SetTextAsync(view, finalText);
+        if (!await EvaluateAsync(view, "document.querySelector('#redo').disabled")) throw new Exception("Redo branch was not cleared");
+        await view.ExecuteScriptAsync("document.querySelector('#history').click(); document.querySelectorAll('#history-panel .history-entry')[1].click();");
+        await HasTextAsync(view, finalText);
+        if (!await EvaluateAsync(view, "document.querySelector('#history-panel pre').textContent.includes('history-second')")) throw new Exception("Archived branch missing from history preview");
+        await view.ExecuteScriptAsync("document.querySelector('#history-panel .history-preview button').click();");
+        await HasTextAsync(view, "history-second");
+        await ShortcutAsync(view, "z"); await HasTextAsync(view, finalText);
+        // Hold history ACK, request native flush, then reject: the current text is retained.
+        await view.ExecuteScriptAsync("""
+            window.historySend = window.chrome.webview.postMessage.bind(window.chrome.webview);
+            window.chrome.webview.postMessage = raw => {
+              const msg = JSON.parse(raw);
+              if (msg.type === 'editor-command' && msg.operation.startsWith('history-')) window.heldHistory = msg;
+              else { if (msg.type.startsWith('editor-flush-')) window.historyFlushReply = msg; window.historySend(raw); }
+            };
+            document.querySelector('#undo').click();
+            """);
+        await UntilAsync(() => EvaluateAsync(view, "!!window.heldHistory"), "History request not sent");
+        await view.ExecuteScriptAsync("window.localNotesFlush('history-drain');");
+        await Task.Delay(100);
+        if (await EvaluateAsync(view, "!!window.historyFlushReply")) throw new Exception("Flush did not wait for history ACK");
+        await view.ExecuteScriptAsync("""
+            window.dispatchEvent(new MessageEvent('message', { data: { type: 'command-nack', requestId: window.heldHistory.requestId, documentId: window.heldHistory.sourceDocumentId, error: 'history rejected' } }));
+            """);
+        await UntilAsync(() => EvaluateAsync(view, "document.querySelector('#status').textContent.includes('history rejected')"), "History NACK missing");
+        await HasTextAsync(view, finalText);
+        await view.ExecuteScriptAsync("window.chrome.webview.postMessage = window.historySend;");
+        await ShortcutAsync(view, "z"); await HasTextAsync(view, "history-first");
+        await ShortcutAsync(view, "y"); await HasTextAsync(view, finalText);
+        Console.WriteLine("PASS real WebView history: keyboard undo/redo, branches, preview, restore, delayed ACK and NACK retry");
+    }
+    private static async Task CheckRestartHistoryAsync(WebView view)
+    {
+        await view.ExecuteScriptAsync("document.querySelector('#history').click();");
+        if (!await EvaluateAsync(view, "document.querySelectorAll('#history-panel .history-entry').length >= 4")) throw new Exception("History missing after process restart");
+        await ShortcutAsync(view, "z"); await HasTextAsync(view, "history-first");
+        await ShortcutAsync(view, "y"); await HasTextAsync(view, Marker);
+        Console.WriteLine("PASS second EXE process restored history and performed undo/redo");
+    }
+
 }

@@ -77,3 +77,20 @@ mark { background: #fff2a8; color: inherit; }
   .editor { border-right: 0; padding: 24px 20px 70px; }
   .relations { border-top: 1px solid #eaecf0; padding: 20px; }
 }
+
+/* Version list and read-only preview. */
+button:disabled { cursor: default; opacity: .4; }
+.history-intro { color: #667085; font-size: 12px; line-height: 1.6; margin: 0 0 12px; }
+.history-entry { display: block; width: 100%; border: 0; border-left: 2px solid transparent; background: transparent; color: #475467; text-align: left; padding: 9px 8px; font-size: 12px; line-height: 1.6; }
+.history-entry:hover { background: #f2f4f7; }
+.history-entry.current { border-left-color: #98a2b3; background: #f2f4f7; }
+.history-preview { margin-top: 16px; padding-top: 14px; border-top: 1px solid #e4e7ec; font-size: 13px; }
+.history-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.7; max-height: 280px; overflow: auto; }
+.history-preview button { border: 1px solid #d0d5dd; background: #fff; color: #344054; border-radius: 5px; padding: 6px 10px; }
+[inert] { opacity: .8; }
+
+.toolbar { flex-wrap: wrap; flex-shrink: 0; }
+.toolbar .tool-group { flex-shrink: 0; }
+.toolbar button { white-space: nowrap; }
+
+.toolbar #history { width: auto; }

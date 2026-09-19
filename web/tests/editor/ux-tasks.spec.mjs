@@ -59,6 +59,7 @@ test("left sidebar tabs at top: docs/search/outline", async ({ page }) => {
   await expect(page.locator('.panel[data-left-panel="outline"]')).toBeVisible();
 });
 
+
 test("right-click document shows context menu", async ({ page }) => {
   await page.goto("/");
   const docItem = page.locator('.doc-item').first();

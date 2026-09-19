@@ -1,5 +1,7 @@
-import type { WorkspaceApi, WorkspaceCommand } from "./workspace-api";
+import type { WorkspaceApi, WorkspaceCommand, WorkspaceDocument } from "./workspace-api";
 import type { HistoryModel } from "./history";
+import type { Block } from "../../protocol/types";
+import { markdownFromContent } from "./markdown";
 
 const STORAGE_KEY = "lnm-shell-layout-v1";
 
@@ -63,6 +65,27 @@ function uid(): string {
   return Math.random().toString(36).slice(2, 8);
 }
 
+function descendantCount(documentId: string, documents: WorkspaceDocument[]) {
+  const children = new Map<string, WorkspaceDocument[]>();
+  for (const document of documents) {
+    if (!document.parentId) continue;
+    const list = children.get(document.parentId) ?? [];
+    list.push(document);
+    children.set(document.parentId, list);
+  }
+  const pending = [...(children.get(documentId) ?? [])];
+  const visited = new Set<string>();
+  let count = 0;
+  while (pending.length) {
+    const child = pending.pop()!;
+    if (visited.has(child.id)) continue;
+    visited.add(child.id);
+    count++;
+    pending.push(...(children.get(child.id) ?? []));
+  }
+  return count;
+}
+
 const BOOKMARK_COLORS = [
   "#3B82F6", "#16A34A", "#7C3AED", "#EA580C", "#0891B2",
   "#DB2777", "#CA8A04", "#DC2626", "#0D9488", "#7C2D12"
@@ -98,7 +121,8 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       { tab: "reference-sidebar", label: "实时引用", slot: "reference-sidebar" },
       { tab: "backlinks", label: "反向链接", slot: "backlinks" },
       { tab: "overrides", label: "外部覆写", slot: "override-notices" },
-      { tab: "history", label: "历史记录", slot: "history" }
+      { tab: "history", label: "历史记录", slot: "history" },
+      { tab: "styles", label: "CSS 管理", slot: "styles" }
     ];
     for (const s of sections) {
       const sec = document.createElement("section");
@@ -106,7 +130,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       sec.dataset.panel = s.tab;
       sec.className = "relations-section";
       const inner = document.createElement("div");
-      inner.id = s.tab;
+      inner.id = s.tab === "history" ? "history-list" : s.tab;
       inner.className = "relations-slot";
       inner.dataset.slot = s.slot;
       sec.innerHTML = `<div class="panel-head"><span>${s.label}</span></div>`;
@@ -279,10 +303,72 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     const snap = workspace.snapshot();
     docPanel.innerHTML = "";
     const myBookmarks = snap.bookmarks.filter((b) => b.notebookId === snap.activeNotebookId);
-    for (const bk of myBookmarks) {
+    const renderDocument = (docId: string, depth: number, container: HTMLElement) => {
+      const doc = snap.documents.find(item => item.id === docId);
+      if (!doc || depth > 2) return;
+      const node = document.createElement("div");
+      node.className = "doc-node";
+      node.dataset.documentId = doc.id;
+      const btn = document.createElement("button");
+      btn.className = "list-item doc-item";
+      btn.draggable = true;
+      btn.style.setProperty("--doc-depth", String(depth));
+      const count = descendantCount(doc.id, snap.documents);
+      btn.innerHTML = `<span class="list-icon">&#128196;</span><span class="list-label">${escapeHtml(doc.title)}</span>${count ? `<span class="doc-count">${count}</span>` : ""}`;
+      btn.onclick = () => cb.onOpenDocument(doc.id);
+      btn.oncontextmenu = (e) => { e.preventDefault(); showDocumentMenu(btn, doc.id, doc.title); };
+      btn.addEventListener("dragstart", event => {
+        event.stopPropagation();
+        event.dataTransfer?.setData("text/x-document-id", doc.id);
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+        node.classList.add("is-dragging");
+      });
+      btn.addEventListener("dragend", () => node.classList.remove("is-dragging"));
+      node.appendChild(btn);
+      const children = snap.documents.filter(item => item.bookmarkId === doc.bookmarkId && item.parentId === doc.id).sort((a, b) => a.position - b.position);
+      if (children.length) {
+        const childList = document.createElement("div"); childList.className = "doc-children";
+        children.forEach(child => renderDocument(child.id, depth + 1, childList));
+        node.appendChild(childList);
+      }
+      node.addEventListener("dragover", event => {
+        if (!event.dataTransfer?.types.includes("text/x-document-id")) return;
+        event.stopPropagation();
+        event.preventDefault();
+        node.classList.remove("drop-child", "drop-before", "drop-after");
+        // Use the document row itself. The node's box also contains all descendants,
+        // which made the upper/lower hit zones move as the tree grew.
+        const rect = btn.getBoundingClientRect();
+        const ratio = (event.clientY - rect.top) / Math.max(1, rect.height);
+        node.classList.add(ratio < 0.28 ? "drop-before" : ratio > 0.72 ? "drop-after" : "drop-child");
+      });
+      node.addEventListener("dragleave", event => {
+        event.stopPropagation();
+        node.classList.remove("drop-child", "drop-before", "drop-after");
+      });
+      node.addEventListener("drop", event => {
+        event.stopPropagation();
+        event.preventDefault(); node.classList.remove("drop-child", "drop-before", "drop-after");
+        const dragged = event.dataTransfer?.getData("text/x-document-id");
+        if (!dragged || dragged === doc.id) return;
+        const rect = btn.getBoundingClientRect();
+        const ratio = (event.clientY - rect.top) / Math.max(1, rect.height);
+        const parentId = ratio < 0.28 || ratio > 0.72 ? doc.parentId : doc.id;
+        const siblings = snap.documents.filter(item => item.bookmarkId === doc.bookmarkId && item.parentId === parentId && item.id !== dragged).sort((a, b) => a.position - b.position);
+        const targetIndex = parentId === doc.id
+          ? siblings.length
+          : Math.max(0, siblings.findIndex(item => item.id === doc.id) + (ratio > 0.72 ? 1 : 0));
+        if (!snap.documents.some(item => item.id === dragged)) return;
+        execute({ type: "moveDocument", id: dragged, bookmarkId: doc.bookmarkId, parentId, index: targetIndex });
+      });
+      container.appendChild(node);
+    };
+    for (const [bookmarkIndex, bk] of myBookmarks.entries()) {
       const isActive = bk.id === snap.activeBookmarkId;
       const strip = document.createElement("div");
       strip.className = "bk-strip" + (isActive ? " active" : "");
+      strip.draggable = true;
+      strip.dataset.bookmarkId = bk.id;
       const accent = document.createElement("span");
       accent.className = "bk-strip-accent";
       accent.style.background = bk.color;
@@ -291,6 +377,10 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       label.textContent = bk.name;
       strip.appendChild(accent);
       strip.appendChild(label);
+      const addDoc = document.createElement("button");
+      addDoc.type = "button"; addDoc.className = "bookmark-add-document"; addDoc.title = "添加文档"; addDoc.setAttribute("aria-label", `在${bk.name}中添加文档`); addDoc.textContent = "+";
+      addDoc.onclick = (event) => { event.stopPropagation(); createDocument(bk.id); };
+      strip.appendChild(addDoc);
       strip.onclick = () => {
         execute({ type: "selectBookmark", id: bk.id });
       };
@@ -298,24 +388,24 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
         e.preventDefault();
         showBookmarkMenu(strip, bk.id, bk.name, bk.color);
       };
+      strip.addEventListener("dragstart", event => { event.dataTransfer?.setData("text/x-bookmark-id", bk.id); if (event.dataTransfer) event.dataTransfer.effectAllowed = "move"; strip.classList.add("is-dragging"); });
+      strip.addEventListener("dragend", () => strip.classList.remove("is-dragging"));
+      strip.addEventListener("dragover", event => { if (event.dataTransfer?.types.includes("text/x-bookmark-id") || event.dataTransfer?.types.includes("text/x-document-id")) { event.preventDefault(); strip.classList.add("drop-target"); } });
+      strip.addEventListener("dragleave", () => strip.classList.remove("drop-target"));
+      strip.addEventListener("drop", event => {
+        event.preventDefault(); strip.classList.remove("drop-target");
+        const draggedBookmark = event.dataTransfer?.getData("text/x-bookmark-id");
+        if (draggedBookmark) { if (draggedBookmark === bk.id) return; const target = myBookmarks.findIndex(item => item.id === bk.id); execute({ type: "moveBookmark", id: draggedBookmark, index: target >= bookmarkIndex ? target + 1 : target }); return; }
+        const draggedDocument = event.dataTransfer?.getData("text/x-document-id");
+        if (draggedDocument) execute({ type: "moveDocument", id: draggedDocument, bookmarkId: bk.id, parentId: null, index: snap.documents.filter(item => item.bookmarkId === bk.id && !item.parentId).length });
+      });
       docPanel.appendChild(strip);
       if (isActive) {
         const docList = document.createElement("div");
-        docList.className = "doc-list";
-        const docs = snap.documentIds;
-        for (const docId of docs) {
-          const btn = document.createElement("button");
-          btn.className = "list-item doc-item";
-          const title = workspace.documentTitle(docId);
-          btn.innerHTML = `<span class="list-icon">&#128196;</span><span class="list-label">${escapeHtml(title)}</span>`;
-          btn.onclick = () => cb.onOpenDocument(docId);
-          btn.oncontextmenu = (e) => {
-            e.preventDefault();
-            showDocumentMenu(btn, docId, title);
-          };
-          docList.appendChild(btn);
-        }
-        if (docs.length === 0) {
+        docList.className = "doc-list doc-tree";
+        const roots = snap.documents.filter(item => item.bookmarkId === bk.id && !item.parentId).sort((a, b) => a.position - b.position);
+        roots.forEach(doc => renderDocument(doc.id, 0, docList));
+        if (roots.length === 0) {
           docList.innerHTML = `<div class="empty" style="padding:8px 12px">暂无文档</div>`;
         }
         docPanel.appendChild(docList);
@@ -340,20 +430,24 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     if (!list) return;
     list.innerHTML = "";
     const blocks = workspace.outline();
-    const headings = blocks.filter(
-      (b: { type: string; content: { text: string } }) =>
-        b.type === "heading" || (b.type === "paragraph" && b.content.text.length < 40)
-    );
+    const headings = blocks.flatMap((b: Block) => {
+      const source = markdownFromContent(b.content);
+      const match = source.match(/^\s*(#{1,6})(?:[ \u3000]+|$)(.*)$/m);
+      if (!match) return [];
+      return [{ block: b, level: match[1].length, text: match[2].trim() || b.content.text.trim() || "未命名" }];
+    });
     if (headings.length === 0) {
       list.innerHTML = `<div class="empty">没有可显示的标题</div>`;
       return;
     }
     for (const h of headings) {
       const btn = document.createElement("button");
-      btn.className = "list-item outline-item" + (h.id === highlightId ? " active" : "");
-      btn.textContent = h.content.text || "未命名";
+      btn.className = "list-item outline-item" + (h.block.id === highlightId ? " active" : "");
+      btn.dataset.level = String(h.level);
+      btn.style.paddingLeft = `${10 + (h.level - 1) * 14}px`;
+      btn.textContent = h.text;
       btn.onclick = () => {
-        cb.onFocusBlock(h.id);
+        cb.onFocusBlock(h.block.id);
       };
       list.appendChild(btn);
     }
@@ -428,43 +522,27 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
   }
 
   let historyModel: HistoryModel = { documentId: "", entries: [], currentId: "", canUndo: false, canRedo: false };
+  let selectedHistoryId = "";
   function updateHistory(model: HistoryModel) {
     historyModel = model;
     const panel = document.querySelector<HTMLElement>("[data-slot=history]");
     if (!panel) return;
     panel.replaceChildren();
-    if (!model.entries.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty";
-      empty.textContent = "还没有历史记录";
-      panel.append(empty);
-      return;
+    const intro = document.createElement("p"); intro.className = "history-intro";
+    intro.textContent = "最近 80 个版本 · 点击预览，恢复后可撤销"; panel.append(intro);
+    if (!model.entries.length) { const empty = document.createElement("p"); empty.textContent = "编辑后自动记录版本"; panel.append(empty); return; }
+    for (const entry of [...model.entries].reverse()) {
+      const button = document.createElement("button"); button.className = "history-entry" + (entry.id === model.currentId ? " current" : "");
+      button.textContent = `${entry.label} · ${new Date(entry.timestamp).toLocaleString()}${entry.id === model.currentId ? " · 当前" : ""}`;
+      button.onclick = () => { selectedHistoryId = entry.id; updateHistory(historyModel); }; panel.append(button);
     }
-    const intro = document.createElement("div");
-    intro.className = "history-intro";
-    intro.textContent = "自动保存最近 80 个版本";
-    panel.append(intro);
-    [...model.entries].reverse().forEach(entry => {
-      const item = document.createElement("div");
-      item.className = "history-item" + (entry.id === model.currentId ? " current" : "");
-      const main = document.createElement("button");
-      main.type = "button";
-      main.className = "history-entry";
-      main.title = entry.id === model.currentId ? "当前版本" : "恢复到此版本";
-      const time = new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      main.innerHTML = `<strong>${escapeHtml(entry.label)}</strong><span>${time}${entry.id === model.currentId ? " · 当前" : ""}</span>`;
-      main.onclick = () => { if (entry.id !== historyModel.currentId) cb.onRestoreHistory(entry.id); };
-      item.append(main);
-      if (entry.id !== model.currentId) {
-        const restore = document.createElement("button");
-        restore.type = "button";
-        restore.className = "history-restore";
-        restore.textContent = "恢复";
-        restore.onclick = () => cb.onRestoreHistory(entry.id);
-        item.append(restore);
-      }
-      panel.append(item);
-    });
+    const selected = model.entries.find(e => e.id === selectedHistoryId) ?? model.entries.find(e => e.id === model.currentId)!;
+    const preview = document.createElement("section"); preview.className = "history-preview";
+    const title = document.createElement("strong"); title.textContent = selected.title;
+    const content = document.createElement("pre"); content.textContent = selected.preview || "（空白正文）";
+    const restore = document.createElement("button"); restore.textContent = "恢复此版本"; restore.disabled = selected.id === model.currentId;
+    restore.onclick = () => cb.onRestoreHistory(selected.id);
+    preview.append(title, content, restore); panel.append(preview);
   }
 
   // ── Render all ─────────────────────────────────────────────────────
@@ -688,6 +766,12 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     const id = "bk-" + uid();
     const color = BOOKMARK_COLORS[Math.floor(Math.random() * BOOKMARK_COLORS.length)];
     execute({ type: "createBookmark", bookmark: { id, notebookId: snap.activeNotebookId, name: name.trim(), color } });
+  }
+  function createDocument(bookmarkId: string) {
+    const title = prompt("文档名称：", "未命名文档");
+    if (!title || !title.trim()) return;
+    const id = "doc-" + uid();
+    execute({ type: "createDocument", document: { id, title: title.trim() }, bookmarkId, parentId: null });
   }
 
   // ── Init ───────────────────────────────────────────────────────────

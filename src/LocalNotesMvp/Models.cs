@@ -13,6 +13,17 @@ public sealed class Note
     public override string ToString() => Title;
 }
 
+public sealed class StyleSheetRecord
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Title { get; set; } = "未命名样式";
+    public string Description { get; set; } = "";
+    public string Css { get; set; } = "";
+    public bool Enabled { get; set; } = true;
+    public string Position { get; set; } = "00001000";
+    public string Scope { get; set; } = "document";
+}
+
 public sealed class Workspace
 {
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
@@ -64,13 +75,33 @@ public sealed class SaveTransactionRequest
 {
     public string DocumentId { get; set; } = "";
     public string MutationId { get; set; } = "";
+    public string? HistoryGroup { get; set; }
     public long ClientVersion { get; set; }
     public string Title { get; set; } = "未命名笔记";
     public List<BlockRecord> Blocks { get; set; } = [];
 }
 
+public sealed class StoreMediaRequest
+{
+    public string Name { get; set; } = "media";
+    public string MimeType { get; set; } = "application/octet-stream";
+    public long Size { get; set; }
+    public string Data { get; set; } = "";
+}
+
+public sealed class MediaAssetRecord
+{
+    public string Id { get; set; } = "";
+    public string Kind { get; set; } = "image";
+    public string Name { get; set; } = "media";
+    public string MimeType { get; set; } = "application/octet-stream";
+    public long Size { get; set; }
+    public string Url { get; set; } = "";
+}
+
 public sealed class SaveOverrideRequest
 {
+    public string? HistoryGroup { get; set; }
     public string ReferenceInstanceId { get; set; } = "";
     public string TargetBlockId { get; set; } = "";
     public JsonElement Content { get; set; }
@@ -85,6 +116,7 @@ public sealed class SetReferenceModeRequest
 
 public sealed class SaveInstanceBlockRequest
 {
+    public string? HistoryGroup { get; set; }
     public string ReferenceInstanceId { get; set; } = "";
     public BlockRecord Block { get; set; } = new();
 }

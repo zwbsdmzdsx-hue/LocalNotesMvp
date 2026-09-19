@@ -36,6 +36,7 @@ public sealed class HostSaveDocumentPayload
 {
     public string DocumentId { get; set; } = "";
     public string MutationId { get; set; } = "";
+    public string? HistoryGroup { get; set; }
     public long ClientVersion { get; set; }
     public string Title { get; set; } = "未命名笔记";
     public List<BlockRecord> Blocks { get; set; } = [];
@@ -45,4 +46,12 @@ public sealed class OpenDocumentPayload
 {
     public string DocumentId { get; set; } = "";
     public string? BlockId { get; set; }
+}
+
+public sealed class StoreMediaPayload
+{
+    public string Name { get; set; } = "media";
+    public string MimeType { get; set; } = "application/octet-stream";
+    public long Size { get; set; }
+    public string Data { get; set; } = "";
 }

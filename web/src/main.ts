@@ -1,3 +1,5 @@
+type HistoryEntry = { id: string; timestamp: number; label: string; kind: string; title: string; preview: string };
+type HistoryModel = { documentId: string; entries: HistoryEntry[]; currentId: string; canUndo: boolean; canRedo: boolean };
 type BlockType = "paragraph" | "heading" | "todo" | "reference";
 type LinkToken = { targetDocumentId?: string; targetBlockId?: string; targetText: string; alias?: string; start: number; end: number };
 type BlockContent = { text: string; html: string; checked?: boolean; targetDocumentId?: string; links?: LinkToken[] };
@@ -9,9 +11,9 @@ type OverrideNotice = { referenceInstanceId: string; targetBlockId: string; sour
 type ReferenceOverride = { targetBlockId: string; patch: { content: BlockContent; properties: BlockProperties }; baseRevision: number };
 type ReferenceMode = "inline" | "collapsed" | "sidebar";
 type ReferenceInstance = { id: string; hostBlockId: string; targetDocumentId: string; targetTitle: string; mode: ReferenceMode; broken?: boolean; blocks: Block[]; overrides: ReferenceOverride[]; hiddenBlockIds: string[] };
-type EditorState = { note: Note; blocks: Block[]; documents: Array<{ id: string; title: string }>; backlinks: Backlink[]; overrideNotices: OverrideNotice[]; references: ReferenceInstance[] };
+type EditorState = { history?: HistoryModel; note: Note; blocks: Block[]; documents: Array<{ id: string; title: string }>; backlinks: Backlink[]; overrideNotices: OverrideNotice[]; references: ReferenceInstance[] };
 type SaveDocumentPayload = { title: string; blocks: Block[] };
-type SaveMutation = SaveDocumentPayload & { documentId: string; mutationId: string; clientVersion: number };
+type SaveMutation = SaveDocumentPayload & { documentId: string; mutationId: string; historyGroup?: string; clientVersion: number };
 
 const titleInput = document.querySelector<HTMLInputElement>("#title")!;
 const blockSurface = document.querySelector<HTMLDivElement>("#blocks")!;
@@ -31,7 +33,43 @@ let activeBlock: HTMLElement | null = null;
 let linkMenuItems: Array<{ id: string; blockId?: string; title: string; meta: string; label: string }> = [];
 let linkMenuIndex = 0;
 
+let editGroup = newId();
+let editTarget: EventTarget | null = null;
+let editTime = 0;
+let historyTail: Promise<void> = Promise.resolve();
+let historyBusy = false;
+let commandTail: Promise<void> = Promise.resolve();
+let commandFailure: string | null = null;
+const commandWaiters = new Map<string, { documentId: string; resolve(state: EditorState): void; reject(error: Error): void }>();
+const referenceCommands = new Set(["create-reference", "set-reference-mode", "remove-reference", "reset-reference", "save-override", "save-instance-block", "move-reference-block", "delete-instance-block", "hide-reference-block", "reset-override"]);
+function sendCommand(payload: object, owner: string): Promise<EditorState> {
+  const requestId = newId();
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => { commandWaiters.delete(requestId); reject(new Error("操作超时，请重新载入确认结果")); }, 10000);
+    commandWaiters.set(requestId, { documentId: owner, resolve: next => { clearTimeout(timer); resolve(next); }, reject: error => { clearTimeout(timer); reject(error); } });
+    bridgePost({ type: "editor-command", requestId, ...payload }, owner);
+  });
+}
 function post(message: object, sourceDocumentId = state?.note.id) {
+  const payload = message as { type: string; [key: string]: unknown };
+  if (referenceCommands.has(payload.type) && sourceDocumentId) {
+    commandTail = commandTail.then(async () => {
+      const { type, ...args } = payload;
+      const next = await sendCommand({ operation: type, ...args }, sourceDocumentId);
+      commandFailure = null;
+      if (state?.note.id === sourceDocumentId) {
+        if (type === "save-override" || type === "save-instance-block" && document.querySelector(`[data-id="${CSS.escape((args.block as Block).id)}"]`)) { state.references = next.references; state.history = next.history; publishHistory(); }
+        else render(next);
+      }
+      saveStatus.textContent = "已保存到本地数据库";
+    }).catch(error => { commandFailure = error.message; window.localNotesError?.(error.message); });
+    return;
+  }
+  // Reference commands already return their authoritative state.
+  if (payload.type === "reload-state") { void commandTail.then(() => bridgePost(message, sourceDocumentId)); return; }
+  bridgePost(message, sourceDocumentId);
+}
+function bridgePost(message: object, sourceDocumentId = state?.note.id) {
   const serialized = JSON.stringify({ sourceDocumentId, ...message });
   const bridge = window.chrome?.webview;
   const legacy = window.external as unknown as { postMessage?(value: string): void; sendMessage?(value: string): void } | undefined;
@@ -55,7 +93,8 @@ function pumpSaveQueue() {
     mutationId: mutation.mutationId,
     clientVersion: mutation.clientVersion,
     title: mutation.title,
-    blocks: mutation.blocks
+    blocks: mutation.blocks,
+    historyGroup: mutation.historyGroup
   }, mutation.documentId);
 }
 
@@ -79,6 +118,7 @@ function enqueueDocumentSave() {
   const mutation: SaveMutation = {
     documentId,
     mutationId: newId(),
+    historyGroup: editGroup,
     clientVersion,
     title: titleInput.value.trim() || "未命名笔记",
     blocks: readOwnBlocks()
@@ -89,10 +129,11 @@ function enqueueDocumentSave() {
   pumpSaveQueue();
 }
 
-function handleSaveAck(message: { mutationId: string; documentId: string; clientVersion: number }) {
+function handleSaveAck(message: { mutationId: string; documentId: string; clientVersion: number; history?: HistoryModel }) {
   if (!inFlightMutation || inFlightMutation.mutationId !== message.mutationId) return;
   if (inFlightMutation.documentId !== message.documentId) return;
   if (state?.note.id === message.documentId) state.note.clientVersion = message.clientVersion;
+  if (state?.note.id === message.documentId && message.history) { state.history = message.history; publishHistory(); }
   saveFailure = null;
   inFlightMutation = null;
   saveStatus.textContent = "已保存到本地数据库";
@@ -111,7 +152,7 @@ function handleSaveNack(message: { mutationId: string; error: string }) {
   window.localNotesError?.(error);
   const requestId = flushRequestId;
   flushRequestId = undefined;
-  saveDrainWaiters.splice(0);
+  saveDrainWaiters.splice(0).forEach(resolve => resolve());
   if (requestId) post({ type: "editor-flush-failed", requestId, error });
 }
 
@@ -207,7 +248,9 @@ function blockDepth(block: Block, all: Block[]) {
 function render(next: EditorState) {
   document.querySelector(".block-menu")?.remove();
   hideInlineLinkSuggestions();
+  if (state?.note.id !== next.note.id) { editGroup = newId(); commandFailure = null; }
   state = next;
+  publishHistory();
   mutationVersion = Math.max(mutationVersion, next.note.clientVersion ?? 0);
   titleInput.value = next.note.title;
   blockSurface.innerHTML = "";
@@ -328,11 +371,13 @@ function editableContent(editable: HTMLElement, fallback: BlockContent = { text:
   return { ...fallback, text, html: sanitizeHtml(editable.innerHTML), links };
 }
 
-function scheduleDocumentSave(_delay = 0) {
+function scheduleDocumentSave(structural?: number) {
+  if (structural !== undefined) editGroup = newId();
   enqueueDocumentSave();
 }
 
 function saveDocument() {
+  editGroup = newId();
   enqueueDocumentSave();
 }
 
@@ -410,8 +455,8 @@ function scheduleInstanceBlock(row: HTMLElement, source: Block) {
   const referenceInstanceId = row.dataset.referenceInstanceId!;
   const block = blockFromReferenceRow(row, source);
   saveStatus.textContent = "正在保存引用专属块...";
-  post({ type: "save-instance-block", referenceInstanceId, block }, documentId);
-  saveStatus.textContent = "引用专属块已保存";
+  post({ type: "save-instance-block", referenceInstanceId, block, historyGroup: editGroup }, documentId);
+  saveStatus.textContent = "正在保存引用专属块...";
 }
 
 function addInstanceBlock(reference: ReferenceInstance, parentId: string | null, afterRow?: HTMLElement) {
@@ -422,8 +467,8 @@ function addInstanceBlock(reference: ReferenceInstance, parentId: string | null,
   block.position = String((rows.length + 1) * 1000).padStart(8, "0");
   runAfterSaveDrain(() => {
     post({ type: "save-instance-block", referenceInstanceId: reference.id, block }, documentId);
-    saveStatus.textContent = "已新增引用专属块";
-    window.setTimeout(() => post({ type: "reload-state" }, documentId), 50);
+    saveStatus.textContent = "正在新增引用专属块...";
+
   });
 }
 
@@ -435,8 +480,8 @@ function scheduleOverride(row: HTMLElement, source: Block, originalProperties: B
   const content = editableContent(editable, source.content);
   const properties = { ...originalProperties, background: editable.style.backgroundColor || undefined, textColor: editable.style.color || undefined };
   saveStatus.textContent = "正在保存局部覆写...";
-  post({ type: "save-override", referenceInstanceId, targetBlockId, content, properties }, documentId);
-  saveStatus.textContent = "局部覆写已保存";
+  post({ type: "save-override", referenceInstanceId, targetBlockId, content, properties, historyGroup: editGroup }, documentId);
+  saveStatus.textContent = "正在保存局部覆写...";
 }
 
 function renderRelations() {
@@ -715,7 +760,7 @@ function indent(direction: "in" | "out") {
   }
   recalculateReferenceDepths(card);
   persistReferenceStructure(referenceRow);
-  saveStatus.textContent = "引用结构已保存";
+  saveStatus.textContent = "正在保存引用结构...";
 }
 
 function recalculateDepths() {
@@ -755,7 +800,7 @@ function move(delta: -1 | 1) {
     row.dataset.position = nextPosition;
     persistReferenceStructure(row);
   });
-  saveStatus.textContent = "引用顺序已保存";
+  saveStatus.textContent = "正在保存引用顺序...";
 }
 
 function escapeText(value: string) {
@@ -768,18 +813,18 @@ window.localNotesError = (message: string) => saveStatus.textContent = `保存�
 window.localNotesSaved = (documentId: string) => {
   if (state?.note.id === documentId) saveStatus.textContent = "已保存到本地数据库";
 };
+async function drainEdits() {
+  if (saveFailure) throw new Error(saveFailure);
+  await new Promise<void>(resolve => { saveDrainWaiters.push(resolve); pumpSaveQueue(); });
+  await commandTail;
+  if (saveFailure || commandFailure) throw new Error(saveFailure || commandFailure!);
+}
 window.localNotesFlush = (requestId?: string) => {
-  flushRequestId = requestId;
-  if (saveFailure) {
-    flushRequestId = undefined;
-    post({ type: "editor-flush-failed", requestId, error: saveFailure });
-    return;
-  }
-  runAfterSaveDrain(() => {
-    const id = flushRequestId;
-    flushRequestId = undefined;
-    post({ type: "editor-flush-complete", requestId: id });
-  });
+  void (async () => {
+    await historyTail;
+    await drainEdits();
+    post({ type: "editor-flush-complete", requestId });
+  })().catch(error => post({ type: "editor-flush-failed", requestId, error: error.message }));
 };
 window.localNotesRunAcceptanceEdit = (marker: string) => {
   window.setTimeout(() => {
@@ -797,6 +842,14 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("message", (event: MessageEvent<string>) => {
   const message = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+  if (message.type === "command-ack" || message.type === "command-nack") {
+    const waiter = commandWaiters.get(message.requestId);
+    if (waiter && waiter.documentId === message.documentId) {
+      commandWaiters.delete(message.requestId);
+      if (message.type === "command-ack") waiter.resolve(message.state);
+      else waiter.reject(new Error(message.error || "操作失败"));
+    }
+  }
   if (message.type === "load-state") render(message.state as EditorState);
   if (message.type === "focus-block" && typeof message.blockId === "string") focusBlock(message.blockId);
   if (message.type === "save-ack") handleSaveAck(message);
@@ -832,10 +885,26 @@ document.addEventListener("click", (event) => {
   else if (block) showOwnBlockMenu(grip, block);
 }, true);
 document.addEventListener("input", (event) => {
+  const input = event as InputEvent;
+  if (event.target !== editTarget || Date.now() - editTime > 900 || input.inputType && !["insertText", "deleteContentBackward", "deleteContentForward", "insertCompositionText", "insertFromComposition"].includes(input.inputType)) editGroup = newId();
+  editTarget = event.target; editTime = Date.now();
   const editable = (event.target as HTMLElement | null)?.closest<HTMLElement>(".block-text[contenteditable='true']");
   if (editable) updateInlineLinkSuggestions(editable);
 }, true);
+document.addEventListener("beforeinput", event => {
+  const target = event.target as HTMLElement;
+  if (!(event as InputEvent).isComposing && (target === titleInput ? titleInput.selectionStart !== titleInput.selectionEnd : !getSelection()?.isCollapsed)) editGroup = newId();
+}, true);
+document.addEventListener("pointerdown", () => { editGroup = newId(); }, true);
+document.addEventListener("compositionstart", () => { editGroup = newId(); }, true);
 document.addEventListener("keydown", (event) => {
+  if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) editGroup = newId();
+  const target = event.target as HTMLElement;
+  if ((target.matches("input, textarea") && target !== titleInput) || target.closest("#history-panel")) return;
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.isComposing && ["z", "y"].includes(event.key.toLowerCase())) {
+    event.preventDefault(); event.stopPropagation();
+    void runHistory(event.key.toLowerCase() === "y" || event.shiftKey ? "history-redo" : "history-undo"); return;
+  }
   if (event.altKey && !event.ctrlKey && !event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
     event.preventDefault();
     event.stopPropagation();
@@ -847,3 +916,72 @@ document.addEventListener("keydown", (event) => {
 }, true);
 titleInput.addEventListener("input", () => scheduleDocumentSave());
 document.querySelectorAll<HTMLButtonElement>(".icon-tools button").forEach((button) => button.addEventListener("mousedown", (event) => event.preventDefault()));
+
+function runHistory(operation: string, entryId?: string) {
+  const owner = state?.note.id;
+  historyTail = historyTail.then(async () => {
+    if (!owner || state?.note.id !== owner) return;
+    await drainEdits();
+    if (operation === "history-undo" && !state.history?.canUndo || operation === "history-redo" && !state.history?.canRedo) return;
+    historyBusy = true;
+    const focused = document.activeElement as HTMLElement | null;
+    const titleSelection = focused === titleInput ? [titleInput.selectionStart, titleInput.selectionEnd] : null;
+    const selection = getSelection();
+    const offsets = focused?.classList.contains("block-text") && selection?.rangeCount ? (() => {
+      const range = selection.getRangeAt(0); const prefix = range.cloneRange(); prefix.selectNodeContents(focused); prefix.setEnd(range.startContainer, range.startOffset);
+      return [prefix.toString().length, prefix.toString().length + range.toString().length];
+    })() : null;
+    const blockId = focused?.closest<HTMLElement>("[data-own-block]")?.dataset.id;
+    document.querySelectorAll<HTMLElement>(".editor, .toolbar, .relations, .sidebar-right").forEach(el => el.inert = true);
+    publishHistory();
+    try {
+      const next = await sendCommand({ operation, entryId, expectedVersion: state.note.clientVersion }, owner);
+      render(next); mutationVersion = next.note.clientVersion; editGroup = newId();
+    } finally {
+      historyBusy = false;
+      document.querySelectorAll<HTMLElement>(".editor, .toolbar, .relations, .sidebar-right").forEach(el => el.inert = false);
+      if (titleSelection) { titleInput.focus(); titleInput.setSelectionRange(titleSelection[0], titleSelection[1]); }
+      else if (blockId) {
+        const editable = document.querySelector<HTMLElement>(`[data-id="${CSS.escape(blockId)}"] .block-text`);
+        if (editable) {
+          editable.focus(); const range = document.createRange(); range.selectNodeContents(editable); range.collapse(false);
+          const point = (offset: number): [Node, number] => {
+            const walker = document.createTreeWalker(editable, NodeFilter.SHOW_TEXT); let node = walker.nextNode();
+            while (node) { const length = node.textContent?.length ?? 0; if (offset <= length) return [node, offset]; offset -= length; node = walker.nextNode(); }
+            return [editable, editable.childNodes.length];
+          };
+          if (offsets) { range.setStart(...point(offsets[0])); range.setEnd(...point(offsets[1])); }
+          const selection = getSelection(); selection?.removeAllRanges(); selection?.addRange(range);
+        }
+      }
+      publishHistory();
+    }
+  }).catch(error => window.localNotesError?.(error.message));
+  return historyTail;
+}
+let selectedHistoryId = "";
+function publishHistory() {
+  const model = state?.history;
+  document.querySelector<HTMLButtonElement>("#undo")!.disabled = historyBusy || !model?.canUndo;
+  document.querySelector<HTMLButtonElement>("#redo")!.disabled = historyBusy || !model?.canRedo;
+  const panel = document.querySelector<HTMLElement>("#history-panel")!;
+  panel.replaceChildren();
+  const heading = document.createElement("h2"); heading.textContent = "历史记录"; panel.append(heading);
+  const intro = document.createElement("p"); intro.className = "history-intro"; intro.textContent = "最近 80 个版本 · 保存在本地数据库"; panel.append(intro);
+  if (!model?.entries.length) { const empty = document.createElement("p"); empty.textContent = "编辑后自动记录版本"; panel.append(empty); return; }
+  for (const entry of [...model.entries].reverse()) {
+    const button = document.createElement("button"); button.className = "history-entry" + (entry.id === model.currentId ? " current" : "");
+    button.textContent = `${entry.label} · ${new Date(entry.timestamp).toLocaleString()}${entry.id === model.currentId ? " · 当前" : ""}`;
+    button.onclick = () => { selectedHistoryId = entry.id; publishHistory(); }; panel.append(button);
+  }
+  const selected = model.entries.find(e => e.id === selectedHistoryId) ?? model.entries.find(e => e.id === model.currentId)!;
+  const preview = document.createElement("section"); preview.className = "history-preview";
+  const title = document.createElement("strong"); title.textContent = selected.title;
+  const text = document.createElement("pre"); text.textContent = selected.preview || "（空白正文）";
+  const restore = document.createElement("button"); restore.textContent = "恢复此版本"; restore.disabled = historyBusy || selected.id === model.currentId;
+  restore.onclick = () => void runHistory("history-restore", selected.id);
+  preview.append(title, text, restore); panel.append(preview);
+}
+document.querySelector("#undo")!.addEventListener("click", () => void runHistory("history-undo"));
+document.querySelector("#redo")!.addEventListener("click", () => void runHistory("history-redo"));
+document.querySelector("#history")!.addEventListener("click", () => { const panel = document.querySelector<HTMLElement>("#history-panel")!; panel.hidden = !panel.hidden; publishHistory(); });

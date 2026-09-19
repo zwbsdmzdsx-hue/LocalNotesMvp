@@ -39,6 +39,7 @@ export class EditorHostApi {
   emit(event: HostEvent) { this.transport.send(event); }
   async loadDocument(documentId: string): Promise<EditorState> { return (await this.request("loadDocument", { documentId }, documentId)).state; }
   saveDocument(payload: SaveMutation) { return this.request("saveDocument", payload, payload.documentId); }
+  storeMedia(payload: RequestMap["storeMedia"]) { return this.request("storeMedia", payload); }
   openDocument(documentId: string, blockId?: string) { return this.request("openDocument", { documentId, blockId }); }
   navigateBack() { return this.request("navigateBack", {}); }
   navigateForward() { return this.request("navigateForward", {}); }
