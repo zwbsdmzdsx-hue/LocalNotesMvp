@@ -12,12 +12,15 @@ public sealed partial class NoteStore
         ["reference_instances"] = "host_document_id=$doc AND deleted_at IS NULL",
         ["block_overrides"] = "reference_instance_id IN (SELECT id FROM reference_instances WHERE host_document_id=$doc AND deleted_at IS NULL) AND status='active'",
         ["instance_tree_operations"] = "reference_instance_id IN (SELECT id FROM reference_instances WHERE host_document_id=$doc AND deleted_at IS NULL) AND status='active'",
-        ["links"] = "source_document_id=$doc"
+        ["links"] = "source_document_id=$doc",
+        ["views"] = "document_id=$doc"
     };
     private sealed class HistorySnapshot
     {
         public string Title { get; set; } = "";
         public Dictionary<string, List<Dictionary<string, JsonElement>>> Tables { get; set; } = new();
+        public string? DatabaseId { get; set; }
+        public Dictionary<string, List<Dictionary<string, JsonElement>>> DatabaseTables { get; set; } = new();
     }
     private sealed class HistoryVersion
     {
@@ -35,7 +38,7 @@ public sealed partial class NoteStore
         public int Cursor { get; set; } = -1;
     }
 
-    private HistorySnapshot CaptureHistory(SqliteConnection connection, SqliteTransaction transaction, string documentId)
+    private HistorySnapshot CaptureHistory(SqliteConnection connection, SqliteTransaction transaction, string documentId, string? databaseId = null)
     {
         using var title = connection.CreateCommand(); title.Transaction = transaction;
         title.CommandText = "SELECT title FROM documents WHERE id=$doc AND deleted_at IS NULL";
@@ -56,12 +59,40 @@ public sealed partial class NoteStore
             }
             snapshot.Tables[table] = rows;
         }
+        snapshot.DatabaseId = databaseId;
+        if (databaseId is not null)
+        {
+            var scopes = new Dictionary<string, string>
+            {
+                ["data_sources"] = "id=$database AND deleted_at IS NULL",
+                ["data_fields"] = "database_id=$database AND deleted_at IS NULL",
+                ["data_records"] = "database_id=$database AND deleted_at IS NULL",
+                ["data_values"] = "record_id IN (SELECT id FROM data_records WHERE database_id=$database AND deleted_at IS NULL) AND field_id IN (SELECT id FROM data_fields WHERE database_id=$database AND deleted_at IS NULL)"
+            };
+            foreach (var (table, scope) in scopes)
+            {
+                using var query = connection.CreateCommand(); query.Transaction = transaction;
+                query.CommandText = $"SELECT * FROM {table} WHERE {scope} ORDER BY " + (table == "data_values" ? "record_id,field_id" : "id");
+                query.Parameters.AddWithValue("$database", databaseId);
+                using var reader = query.ExecuteReader(); var rows = new List<Dictionary<string, JsonElement>>();
+                while (reader.Read())
+                {
+                    var row = new Dictionary<string, JsonElement>();
+                    for (var i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = JsonSerializer.SerializeToElement(reader.IsDBNull(i) ? null : reader.GetValue(i));
+                    rows.Add(row);
+                }
+                snapshot.DatabaseTables[table] = rows;
+            }
+        }
         return snapshot;
     }
 
     private static string HistorySignature(HistorySnapshot snapshot) => JsonSerializer.Serialize(new
     {
-        snapshot.Title,
+        snapshot.Title, snapshot.DatabaseId,
+        databaseTables = snapshot.DatabaseTables.Select(pair => new {
+            pair.Key, rows = pair.Value.Select(row => row.Where(field => field.Key is not ("created_at" or "updated_at" or "deleted_at")))
+        }),
         tables = snapshot.Tables.Where(pair => pair.Key != "links").Select(pair => new {
             pair.Key, rows = pair.Value.Select(row => row.Where(field => field.Key is not ("revision" or "created_at" or "updated_at" or "deleted_at" or "resolved_at")))
         })
@@ -98,7 +129,7 @@ public sealed partial class NoteStore
     private void RecordHistory(SqliteConnection connection, SqliteTransaction transaction, string documentId,
         HistorySnapshot before, string label, string? group = null)
     {
-        var after = CaptureHistory(connection, transaction, documentId);
+        var after = CaptureHistory(connection, transaction, documentId, before.DatabaseId);
         if (HistorySignature(before) == HistorySignature(after)) return;
         var log = ReadHistory(connection, transaction, documentId);
         var current = log.Cursor >= 0 ? log.Entries.Find(e => e.Id == log.Stack[log.Cursor]) : null;
@@ -153,7 +184,7 @@ public sealed partial class NoteStore
         else entry = target >= 0 && target < log.Stack.Count ? log.Entries.Find(e => e.Id == log.Stack[target]) : null;
         if (entry is null) throw new InvalidOperationException("没有可恢复的历史版本。");
         var current = log.Cursor >= 0 ? log.Entries.Find(e => e.Id == log.Stack[log.Cursor]) : null;
-        if (current is null || HistorySignature(current.Snapshot) != HistorySignature(CaptureHistory(connection, transaction, documentId)))
+        if (current is null || HistorySignature(current.Snapshot) != HistorySignature(CaptureHistory(connection, transaction, documentId, current.Snapshot.DatabaseId)))
             throw new InvalidOperationException("文档已在其他位置更新，请重新编辑后再撤销。");
         RestoreHistoryRows(connection, transaction, documentId, entry.Snapshot, currentVersion + 1);
         if (operation == "history-restore") AppendHistory(log, new() { Label = "恢复历史版本", Kind = "restore", Snapshot = CaptureHistory(connection, transaction, documentId) });
@@ -166,7 +197,7 @@ public sealed partial class NoteStore
     {
         // Retain IDs and tombstones; only revive rows owned by this document. Defer parent FKs until all blocks are restored.
         using var clear = connection.CreateCommand(); clear.Transaction = transaction;
-        clear.CommandText = "PRAGMA defer_foreign_keys=ON; UPDATE blocks SET deleted_at=$now WHERE document_id=$doc; UPDATE reference_instances SET deleted_at=$now WHERE host_document_id=$doc; DELETE FROM block_overrides WHERE reference_instance_id IN (SELECT id FROM reference_instances WHERE host_document_id=$doc); DELETE FROM instance_tree_operations WHERE reference_instance_id IN (SELECT id FROM reference_instances WHERE host_document_id=$doc); DELETE FROM links WHERE source_document_id=$doc; UPDATE documents SET title=$title,client_version=$version,updated_at=$now WHERE id=$doc";
+        clear.CommandText = "PRAGMA defer_foreign_keys=ON; UPDATE blocks SET deleted_at=$now WHERE document_id=$doc; UPDATE reference_instances SET deleted_at=$now WHERE host_document_id=$doc; DELETE FROM block_overrides WHERE reference_instance_id IN (SELECT id FROM reference_instances WHERE host_document_id=$doc); DELETE FROM instance_tree_operations WHERE reference_instance_id IN (SELECT id FROM reference_instances WHERE host_document_id=$doc); DELETE FROM links WHERE source_document_id=$doc; DELETE FROM views WHERE document_id=$doc; UPDATE documents SET title=$title,client_version=$version,updated_at=$now WHERE id=$doc";
         clear.Parameters.AddWithValue("$doc", documentId); clear.Parameters.AddWithValue("$now", UtcNow());
         clear.Parameters.AddWithValue("$title", snapshot.Title); clear.Parameters.AddWithValue("$version", version); clear.ExecuteNonQuery();
         foreach (var table in HistoryScopes.Keys)
@@ -185,6 +216,27 @@ public sealed partial class NoteStore
                 insert.Parameters.AddWithValue("$p" + i, data);
             }
             insert.ExecuteNonQuery();
+        }
+        if (snapshot.DatabaseId is not null)
+        {
+            using var clearDatabase = connection.CreateCommand(); clearDatabase.Transaction = transaction;
+            clearDatabase.CommandText = "UPDATE data_sources SET deleted_at=$now WHERE id=$id; UPDATE data_fields SET deleted_at=$now WHERE database_id=$id; UPDATE data_records SET deleted_at=$now WHERE database_id=$id; DELETE FROM data_values WHERE record_id IN (SELECT id FROM data_records WHERE database_id=$id)";
+            clearDatabase.Parameters.AddWithValue("$id", snapshot.DatabaseId); clearDatabase.Parameters.AddWithValue("$now", UtcNow()); clearDatabase.ExecuteNonQuery();
+            foreach (var table in new[] { "data_sources", "data_fields", "data_records", "data_values" })
+            foreach (var row in snapshot.DatabaseTables.GetValueOrDefault(table) ?? [])
+            {
+                using var insert = connection.CreateCommand(); insert.Transaction = transaction;
+                var columns = row.Keys.ToArray();
+                var conflict = table == "data_values" ? "record_id,field_id" : "id";
+                var updates = columns.Where(column => !conflict.Split(',').Contains(column) && column != "created_at").Select(column => $"{column}=excluded.{column}").ToArray();
+                insert.CommandText = $"INSERT INTO {table}({string.Join(',', columns)}) VALUES({string.Join(',', columns.Select((_, index) => "$d" + index))}) ON CONFLICT({conflict}) DO UPDATE SET {string.Join(',', updates)}";
+                for (var i = 0; i < columns.Length; i++)
+                {
+                    var value = row[columns[i]]; object data = value.ValueKind == JsonValueKind.Null ? DBNull.Value : value.ValueKind == JsonValueKind.Number ? value.GetInt64() : value.GetString()!;
+                    if (columns[i] == "updated_at") data = UtcNow(); insert.Parameters.AddWithValue("$d" + i, data);
+                }
+                insert.ExecuteNonQuery();
+            }
         }
     }
 }

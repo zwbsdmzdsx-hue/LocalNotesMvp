@@ -36,3 +36,39 @@ test("keeps media blocks as previews across source and preview modes", async ({ 
   await expect(page.locator('[data-own-block][data-type="media"] img')).toHaveCount(1);
   await expect.poll(() => page.evaluate(() => window.mockHost.state("alpha").blocks.some(block => block.type === "media" && block.content.media.name === "mode.png"))).toBe(true);
 });
+
+test("pasted images and dropped files use the same media block renderer", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["pasted-image"], "pasted.png", { type: "image/png" }));
+    const target = document.querySelector('[data-id="a1"] .block-text');
+    target.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, clipboardData: transfer }));
+  });
+  await expect(page.locator('[data-own-block][data-type="media"]')).toHaveCount(1);
+  await expect(page.locator('.media-preview[data-media-kind="image"] img')).toHaveAttribute("alt", "pasted.png");
+  await expect.poll(() => page.evaluate(() => window.mockHost.state("alpha").blocks.find(block => block.type === "media")?.content.media.kind)).toBe("image");
+});
+
+test("media supports PDF preview, caption, alignment, and image resizing", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("#media-file-input").setInputFiles({ name: "manual.pdf", mimeType: "application/pdf", buffer: Buffer.from("pdf") });
+  await expect(page.locator('.media-preview[data-media-kind="pdf"] iframe')).toHaveAttribute("title", "manual.pdf");
+
+  await page.locator("#media-file-input").setInputFiles({ name: "resizable.png", mimeType: "image/png", buffer: Buffer.from("image") });
+  const media = page.locator('.media-preview[data-media-kind="image"]').last();
+  await media.locator(".media-name").fill("封面图");
+  await media.click();
+  await page.locator("#align").click();
+  await page.locator('#align-menu [data-align="center"]').click();
+  const handle = media.locator(".media-resize-handle");
+  const box = await handle.boundingBox();
+  if (!box) throw new Error("media resize handle is not visible");
+  await handle.dispatchEvent("pointerdown", { clientX: box.x, clientY: box.y, pointerId: 2, bubbles: true });
+  await page.mouse.move(box.x - 50, box.y, { steps: 2 });
+  await page.mouse.up();
+  await expect.poll(() => page.evaluate(() => {
+    const block = window.mockHost.state("alpha").blocks.find(item => item.content.media?.name === "resizable.png");
+    return { caption: block?.content.caption, align: block?.properties.textAlign, width: block?.properties.mediaWidth };
+  })).toEqual({ caption: "封面图", align: "center", width: expect.any(Number) });
+});

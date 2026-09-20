@@ -41,7 +41,8 @@ public sealed partial class NoteStore : INoteRepository
             var value when value.StartsWith("image/", StringComparison.Ordinal) => "image",
             var value when value.StartsWith("video/", StringComparison.Ordinal) => "video",
             var value when value.StartsWith("audio/", StringComparison.Ordinal) => "audio",
-            _ => throw new InvalidOperationException("仅支持图片、视频和音频文件。")
+            "application/pdf" => "pdf",
+            _ => "file"
         };
         if (string.IsNullOrWhiteSpace(request.Data)) throw new InvalidOperationException("媒体内容不能为空。");
         byte[] bytes;
@@ -60,7 +61,8 @@ public sealed partial class NoteStore : INoteRepository
             "image/jpeg" => ".jpg", "image/png" => ".png", "image/gif" => ".gif", "image/webp" => ".webp", "image/svg+xml" => ".svg",
             "video/mp4" => ".mp4", "video/webm" => ".webm", "video/ogg" => ".ogv",
             "audio/mpeg" => ".mp3", "audio/ogg" => ".oga", "audio/wav" => ".wav", "audio/webm" => ".weba",
-            _ => kind == "image" ? ".img" : kind == "video" ? ".vid" : ".aud"
+            "application/pdf" => ".pdf",
+            _ => SafeMediaExtension(request.Name)
         };
         var path = Path.Combine(mediaDirectory, id + extension);
         File.WriteAllBytes(path, bytes);
@@ -73,6 +75,12 @@ public sealed partial class NoteStore : INoteRepository
             Size = bytes.LongLength,
             Url = new Uri(path).AbsoluteUri
         };
+    }
+
+    private static string SafeMediaExtension(string name)
+    {
+        var extension = Path.GetExtension(Path.GetFileName(name)).ToLowerInvariant();
+        return Regex.IsMatch(extension, @"^\.[a-z0-9]{1,10}$", RegexOptions.CultureInvariant) ? extension : ".bin";
     }
 
     public IReadOnlyList<Workspace> GetWorkspaces()
@@ -261,7 +269,7 @@ public sealed partial class NoteStore : INoteRepository
     {
         using var connection = OpenConnection();
         var counts = new Dictionary<string, long>();
-        foreach (var table in new[] { "workspaces", "bookmarks", "document_bookmarks", "documents", "blocks", "links", "reference_instances", "block_overrides", "instance_tree_operations", "views", "placements", "edges" })
+        foreach (var table in new[] { "workspaces", "bookmarks", "document_bookmarks", "documents", "blocks", "links", "reference_instances", "block_overrides", "instance_tree_operations", "data_values", "data_records", "data_fields", "data_sources", "views", "placements", "edges" })
         {
             using var command = connection.CreateCommand();
             command.CommandText = $"SELECT COUNT(*) FROM {table}";
@@ -274,6 +282,7 @@ public sealed partial class NoteStore : INoteRepository
     {
         var note = Find(documentId) ?? throw new InvalidOperationException("Document not found.");
         using var connection = OpenConnection();
+        var databases = ReadDatabases(connection, note.WorkspaceId, documentId);
         return new
         {
             note = new { note.Id, note.Title, note.IsSticky, note.ClientVersion, workspaceId = note.WorkspaceId },
@@ -282,9 +291,13 @@ public sealed partial class NoteStore : INoteRepository
             backlinks = ReadBacklinks(connection, documentId),
             overrideNotices = ReadOverrideNotices(connection, documentId),
             references = ReadReferenceInstances(connection, documentId),
+            databases = databases.Sources,
+            databaseRecords = databases.Records,
+            databaseViews = databases.Views,
             history = GetDocumentHistory(documentId),
+            systemStyles = ReadStyles(connection, "system", "system"),
             documentStyles = ReadStyles(connection, "document", documentId),
-            notebookStyles = note.WorkspaceId is null ? Array.Empty<StyleSheetRecord>() : ReadStyles(connection, "workspace", note.WorkspaceId)
+            notebookStyles = note.WorkspaceId is null ? Array.Empty<StyleSheetRecord>() : ReadStyles(connection, "workspace", note.WorkspaceId).ToArray()
         };
     }
 
@@ -789,6 +802,28 @@ public sealed partial class NoteStore : INoteRepository
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
             );
             CREATE INDEX IF NOT EXISTS ix_styles_scope ON styles(scope_type, scope_id, position);
+            CREATE TABLE IF NOT EXISTS data_sources (
+                id TEXT PRIMARY KEY, notebook_id TEXT, title TEXT NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, deleted_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_data_sources_notebook ON data_sources(notebook_id, deleted_at);
+            CREATE TABLE IF NOT EXISTS data_fields (
+                id TEXT PRIMARY KEY, database_id TEXT NOT NULL, field_key TEXT NOT NULL, title TEXT NOT NULL,
+                type TEXT NOT NULL, formula TEXT, relation_database_id TEXT, relation_scope TEXT,
+                rollup TEXT, rollup_field_key TEXT, position TEXT NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, deleted_at TEXT, UNIQUE(database_id, field_key)
+            );
+            CREATE INDEX IF NOT EXISTS ix_data_fields_database ON data_fields(database_id, position);
+            CREATE TABLE IF NOT EXISTS data_records (
+                id TEXT PRIMARY KEY, database_id TEXT NOT NULL, position TEXT NOT NULL,
+                source_document_id TEXT, source_block_id TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, deleted_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_data_records_database ON data_records(database_id, position, deleted_at);
+            CREATE TABLE IF NOT EXISTS data_values (
+                record_id TEXT NOT NULL, field_id TEXT NOT NULL, value_json TEXT NOT NULL DEFAULT 'null',
+                updated_at TEXT NOT NULL, PRIMARY KEY(record_id, field_id)
+            );
             CREATE TABLE IF NOT EXISTS blocks (
                 id TEXT PRIMARY KEY, document_id TEXT NOT NULL, parent_id TEXT, position TEXT NOT NULL,
                 type TEXT NOT NULL, content_json TEXT NOT NULL DEFAULT '{}', properties_json TEXT NOT NULL DEFAULT '{}',

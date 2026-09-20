@@ -255,7 +255,9 @@ public partial class MainWindow : Window
                 try
                 {
                     var result = _store.ExecuteEditorCommand(owner, doc.RootElement);
-                    SendClientMessage(new { type = "command-ack", requestId, documentId = owner, state = result });
+                    if (result is EditorCommandResult command)
+                        SendClientMessage(new { type = "command-ack", requestId, documentId = owner, state = command.State, result = command.Result, content = command.Content, mimeType = command.MimeType, fileName = command.FileName });
+                    else SendClientMessage(new { type = "command-ack", requestId, documentId = owner, state = result });
                 }
                 catch (Exception error) { SendClientMessage(new { type = "command-nack", requestId, documentId = owner, error = error.Message }); }
                 return;

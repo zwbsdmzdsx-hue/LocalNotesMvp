@@ -87,7 +87,8 @@ flowchart LR
 | 组织 | `bookmarks` | 工作区、名称、颜色、顺序 |
 | 组织 | `document_bookmarks` | 文档和书签的关联 |
 | 内容 | `documents` | 稳定 ID、标题、便签标志、工作区、文档保存版本、软删除 |
-| 内容 | `blocks` | 文档、`parent_id`、`position`、类型、`content_json`、`properties_json`、块修订号、作用域 |
+| 内容 | `blocks` | 文档、`parent_id`、`position`、类型、`content_json`、`properties_json`、块修订号、作用域；智能表块使用 `type=database_table` 和 `properties.databaseId` |
+| 数据 | `data_sources/data_fields/data_records/data_values` | 笔记本级智能数据库、字段、记录和值；普通 GFM 表格仍属于 Markdown 内容 |
 | 关系 | `links` | 源文档/块、目标文档/块、原始文本、别名与偏移；反向链接是查询结果 |
 | 实例 | `reference_instances` | 引用出现位置、源文档/块、显示模式、更新/冲突策略；`host_block_id` 唯一 |
 | 覆写 | `block_overrides` | 当前实例对源块内容/样式的补丁、基础修订号和基础内容 |
@@ -134,11 +135,15 @@ flowchart LR
 
 新版 4173 侧栏的书签支持拖拽重排，书签右侧悬浮“+”可创建文档；文档可拖到其他文档下形成最多三层的树，并显示全部后代数量。该层级与排序目前属于浏览器 Mock 的内存工作区快照，未扩展桌面 SQLite/原生工作区协议；刷新浏览器页面会按 fixture 重置。
 
-正文分列使用块布局而不是 Markdown/HTML 视觉容器：布局块在 `properties.layout=columns` 中记录列数与间距，列内普通块继续使用现有 `parentId`，并以 `properties.column` 保存零基列号。工具栏可创建两列布局；列头可拖拽换序，块可拖入列或通过列内“+”创建子块；布局的还原按钮会移除布局容器并保留所有子块。该信息属于现有块 `properties` JSON，不需要 SQLite 表迁移，历史快照会同时还原布局、列归属和子级关系。Markdown/HTML/CSS 仍可用于列内内容和样式，不能取代列结构。
+正文分列使用普通块共享列组，而不是单独的布局容器：同一行的根块在 `properties.columnGroup` 中保存相同组 ID，以 `properties.column` 保存零基列号，并用 `properties.columnWidths` 保存相对列宽；所有列块保持 `parentId=null`，同一列可按普通 `position` 排列多行。工具栏创建两列；拖到块左右边缘会在原位置新增列，拖到上下区域会在对应列或普通正文流中插入，拖出列组会恢复普通块，列间分隔线悬浮后可拖拽调宽，恢复按钮会移除列组属性并保留块。旧的 `properties.layout=columns` 容器快照在加载时迁移，不再写回；该信息仍属于现有块 `properties` JSON，不需要 SQLite 表迁移，历史快照会还原列归属与宽度。Markdown/HTML/CSS 仍可用于列内内容和样式，不能取代列结构。
+
+新版右栏提供块注释管理。正文块有有效注释时在右侧显示计数气泡，点击后可在小窗查看、新增、编辑和删除；右栏按块汇总并可定位正文。注释保存在 canonical 块的 `properties.comments` 中，删除采用带 `deletedAt` 的软删除，每条注释同时保留新增、编辑、删除时间线。每次注释操作走普通 `saveDocument` 快照，因此共享现有串行保存、SQLite 持久化、撤销/重做和版本历史；引用投影不提供写回源块的注释操作。
 
 新版编辑器还提供两级 CSS 样式资源管理：文档级样式位于右侧 CSS 管理标签，笔记本级样式通过顶部工具栏进入。样式以 SQLite `styles` 表持久化，编辑器状态分别返回 `documentStyles` 与 `notebookStyles`；启用样式会经过危险规则清理并限定注入到正文区域，正文 HTML/Markdown 中的 class 可直接复用这些样式。
 
-新版编辑器支持 `media` 块。图片、视频、音频可通过工具栏文件选择器或拖放插入；`storeMedia` 宿主请求将 base64 内容复制到数据库旁的 `media` 目录并返回持久 `file:///` 地址，地址随普通 `saveDocument` 块快照保存。浏览器 Mock 使用内存 data URL。三种媒体共用同一只读预览组件，源码/预览模式不会把媒体块降级为文本。
+新版编辑器的数据库面板管理笔记本级字段和公式，并提供受限 DQL 查询、分组排序、查询结果刷新以及 Markdown/CSV 导出。表内可以新增/删除行列，列头菜单以小图标区分文本、数值、网页链接、多媒体、公式、规则、关系和汇总字段。公式与规则在编辑模式先显示结果，点击单元格才进入表达式源码；预览模式只显示结果。`database_table` 块保存数据库绑定，`data_view` 块只保存 DQL 声明；声明源码可往返编辑，解析失败不会覆盖已保存的字段定义。数据库记录和字段修改进入文档历史快照，撤销/重做会恢复对应结构化数据。
+
+新版编辑器支持统一的 `media` 块。图片、视频、音频、PDF 和普通文件可通过工具栏文件选择器、拖放或剪贴板插入；所有入口都调用 `storeMedia`，将内容复制到数据库旁的 `media` 目录并返回持久 `file:///` 地址，地址随普通 `saveDocument` 块快照保存。浏览器 Mock 使用内存 data URL。媒体共用统一预览组件，支持可编辑 caption、块对齐和图片拖拽尺寸调整；PDF 使用内嵌阅读器，普通文件提供下载链接，源码/预览模式不会把媒体块降级为文本。
 
 链接绑定稳定文档/块 ID，显示标题不承担身份。重命名不能改变目标。同名文档的路径信息由仓储目录提供；新版联想当前仍主要筛选文档标题与当前文档块，完整跨工作区/跨文档块搜索尚未完成。
 

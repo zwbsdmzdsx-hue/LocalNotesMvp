@@ -121,8 +121,10 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       { tab: "reference-sidebar", label: "实时引用", slot: "reference-sidebar" },
       { tab: "backlinks", label: "反向链接", slot: "backlinks" },
       { tab: "overrides", label: "外部覆写", slot: "override-notices" },
+      { tab: "comments", label: "注释管理", slot: "comments" },
       { tab: "history", label: "历史记录", slot: "history" },
-      { tab: "styles", label: "CSS 管理", slot: "styles" }
+      { tab: "styles", label: "CSS 管理", slot: "styles" },
+      { tab: "databases", label: "数据库与查询", slot: "databases" }
     ];
     for (const s of sections) {
       const sec = document.createElement("section");
@@ -303,6 +305,33 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     const snap = workspace.snapshot();
     docPanel.innerHTML = "";
     const myBookmarks = snap.bookmarks.filter((b) => b.notebookId === snap.activeNotebookId);
+    const documentDropZone = (container: HTMLElement, bookmarkId: string, parentId: string | null, index: number) => {
+      const zone = document.createElement("div");
+      zone.className = "doc-drop-zone";
+      zone.dataset.parentId = parentId ?? "";
+      zone.dataset.index = String(index);
+      zone.setAttribute("aria-label", parentId ? "放入子文档列表" : "放入顶级文档列表");
+      zone.addEventListener("dragover", event => {
+        if (!event.dataTransfer?.types.includes("text/x-document-id")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        zone.classList.add("active");
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      });
+      zone.addEventListener("dragleave", event => {
+        event.stopPropagation();
+        if (!(event.relatedTarget instanceof Node && zone.contains(event.relatedTarget))) zone.classList.remove("active");
+      });
+      zone.addEventListener("drop", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        zone.classList.remove("active");
+        const dragged = event.dataTransfer?.getData("text/x-document-id");
+        if (!dragged || dragged === parentId) return;
+        execute({ type: "moveDocument", id: dragged, bookmarkId, parentId, index });
+      });
+      container.appendChild(zone);
+    };
     const renderDocument = (docId: string, depth: number, container: HTMLElement) => {
       const doc = snap.documents.find(item => item.id === docId);
       if (!doc || depth > 2) return;
@@ -328,12 +357,15 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       const children = snap.documents.filter(item => item.bookmarkId === doc.bookmarkId && item.parentId === doc.id).sort((a, b) => a.position - b.position);
       if (children.length) {
         const childList = document.createElement("div"); childList.className = "doc-children";
-        children.forEach(child => renderDocument(child.id, depth + 1, childList));
+        children.forEach((child, index) => {
+          documentDropZone(childList, doc.bookmarkId, doc.id, index);
+          renderDocument(child.id, depth + 1, childList);
+        });
+        documentDropZone(childList, doc.bookmarkId, doc.id, children.length);
         node.appendChild(childList);
       }
-      node.addEventListener("dragover", event => {
+      btn.addEventListener("dragover", event => {
         if (!event.dataTransfer?.types.includes("text/x-document-id")) return;
-        event.stopPropagation();
         event.preventDefault();
         node.classList.remove("drop-child", "drop-before", "drop-after");
         // Use the document row itself. The node's box also contains all descendants,
@@ -342,12 +374,10 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
         const ratio = (event.clientY - rect.top) / Math.max(1, rect.height);
         node.classList.add(ratio < 0.28 ? "drop-before" : ratio > 0.72 ? "drop-after" : "drop-child");
       });
-      node.addEventListener("dragleave", event => {
-        event.stopPropagation();
+      btn.addEventListener("dragleave", event => {
         node.classList.remove("drop-child", "drop-before", "drop-after");
       });
-      node.addEventListener("drop", event => {
-        event.stopPropagation();
+      btn.addEventListener("drop", event => {
         event.preventDefault(); node.classList.remove("drop-child", "drop-before", "drop-after");
         const dragged = event.dataTransfer?.getData("text/x-document-id");
         if (!dragged || dragged === doc.id) return;
@@ -404,9 +434,17 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
         const docList = document.createElement("div");
         docList.className = "doc-list doc-tree";
         const roots = snap.documents.filter(item => item.bookmarkId === bk.id && !item.parentId).sort((a, b) => a.position - b.position);
-        roots.forEach(doc => renderDocument(doc.id, 0, docList));
+        roots.forEach((doc, index) => {
+          documentDropZone(docList, bk.id, null, index);
+          renderDocument(doc.id, 0, docList);
+        });
+        documentDropZone(docList, bk.id, null, roots.length);
         if (roots.length === 0) {
-          docList.innerHTML = `<div class="empty" style="padding:8px 12px">暂无文档</div>`;
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.style.padding = "8px 12px";
+          empty.textContent = "暂无文档";
+          docList.insertBefore(empty, docList.firstChild);
         }
         docPanel.appendChild(docList);
       }

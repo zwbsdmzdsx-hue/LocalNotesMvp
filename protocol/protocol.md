@@ -45,9 +45,13 @@ the legacy desktop host does not yet broadcast external change notifications.
 Reference mutations are carried by `executeCommand` with an operation such as
 `create-reference`, `save-override`, or `set-reference-mode`.
 
-CSS 样式资源也通过 `executeCommand` 保存：`save-style` 携带 `id/title/description/css/enabled/position/scope`，其中 `scope` 为 `document` 或 `notebook`；`delete-style` 携带 `styleId`。`loadDocument` 和命令 ACK 的 `state` 会返回 `documentStyles` 与 `notebookStyles`。
+CSS 样式资源也通过 `executeCommand` 保存：`save-style` 携带 `id/title/description/css/enabled/position/scope`，其中 `scope` 为 `system`、`document` 或 `notebook`；`delete-style` 携带 `styleId`。`loadDocument` 和命令 ACK 的 `state` 会返回 `systemStyles`、`documentStyles` 与 `notebookStyles`。
 
-媒体上传使用 `storeMedia` 请求。payload 为 `{ name, mimeType, size, data }`，其中 `data` 是不带 data URL 前缀的 base64 内容；宿主返回 `{ media: { id, kind, name, mimeType, size, url } }`。宿主将内容复制到应用数据库旁的 `media` 目录并返回持久 `file:///` 地址。浏览器 Mock 返回内存 data URL。正文媒体块使用 `type: "media"`，并在 `content.media` 保存该资源对象，随 `saveDocument` 快照持久化。
+数据表能力通过 `executeCommand` 保存：`create-database`、`save-database-schema`、`upsert-database-record`、`delete-database-record`、`execute-dql`、`export-database-markdown` 和 `export-database-csv`。数据库字段和记录属于笔记本作用域，`loadDocument` 的 state 可返回 `databases` 和 `databaseRecords`。普通 Markdown GFM 表格仍保存在块的 Markdown 内容中；智能表块使用 `type: "database_table"` 与 `properties.databaseId`，查询块使用 `type: "data_view"` 与 `properties.dataQuery`。公式使用受限属性名表达式，禁止动态脚本；DQL 只允许 `TABLE/FROM/WHERE/SORT/GROUP BY/LIMIT`，默认查询当前笔记本，跨笔记本必须显式指定。查询/导出 ACK 除 `state` 外可返回 `result` 或文本 `content/mimeType/fileName`。
+
+数据库字段类型包含 `text`、`number`、`url`、`media`、`formula`、`rule`、`document_relation`、`record_relation` 和 `rollup`。`media` 值复用 `MediaAsset` JSON；上传仍先走 `storeMedia`，再由 `upsert-database-record` 保存。公式和规则字段在编辑模式显示运算结果，用户点击单元格时才编辑字段表达式；源码模式显示声明里的 `formula`，预览模式只显示结果。
+
+媒体上传使用 `storeMedia` 请求。payload 为 `{ name, mimeType, size, data }`，其中 `data` 是不带 data URL 前缀的 base64 内容；宿主返回 `{ media: { id, kind, name, mimeType, size, url } }`。宿主将内容复制到应用数据库旁的 `media` 目录并返回持久 `file:///` 地址。浏览器 Mock 返回内存 data URL。正文媒体块使用 `type: "media"`，并在 `content.media` 保存该资源对象，随 `saveDocument` 快照持久化。`kind` 支持 `image`、`video`、`audio`、`pdf` 和普通 `file`；`content.caption` 保存用户编辑的说明文字，`properties.textAlign` 保存媒体对齐方式，`properties.mediaWidth` 保存图片预览宽度百分比。文件选择、拖放和剪贴板图片都必须先调用 `storeMedia`，再创建同一种媒体块；PDF 使用统一预览组件的内嵌阅读器，普通文件提供下载链接。
 
 `saveDocument` is a serialized transaction. Its payload includes the document
 ID, mutation ID, client version, title, and block snapshot. The response always
@@ -72,14 +76,35 @@ content without `markdown` is valid and is converted from its existing safe HTML
 when the new editor first enters source mode. This is a JSON payload extension
 and requires no SQLite schema migration.
 
+`EditorState.documents[]` 是跨笔记本双链目录。每项返回稳定文档 `id`、
+`title`、`notebookId`、`notebookName`、可读 `path` 与只读 `blocks` 快照。
+编辑器用它实现 `[[笔记本/文档/块内容` 三级联想；选择结果仍以稳定文档/块
+ID 写入链接和引用。目录块只用于筛选与预览，不作为当前文档保存快照，也不
+允许借联想直接写回目标文档。块候选从渲染后的纯文本建立，Markdown 标记和
+CSS 规则不进入候选标题或匹配文本。
+
 正文 multi-column layouts reuse the block tree and require no new protocol
-operation. A layout block stores `properties.layout: "columns"`,
-`properties.columnCount`, and optional `properties.columnGap`; blocks owned by
-the layout keep their normal `parentId` and store a zero-based
-`properties.column`. The editor can reorder columns, add child blocks, move
-existing blocks into a column, and restore the layout to ordinary sibling
-blocks. Markdown/HTML remains content inside each block and is not used as the
-structural source of the column tree.
+operation. Each ordinary root block in a column group stores the same opaque
+`properties.columnGroup` identifier and a zero-based `properties.column` index;
+all such blocks keep `parentId: null`. The group members' optional
+`properties.columnWidths` array stores the relative width for each column. A
+column can contain multiple ordinary blocks, ordered by their normal
+`position`; there is no persisted layout/container block and no synthetic
+column child. The editor can move blocks between columns, insert a new column
+by dropping at a column edge, drag blocks out to the ordinary document flow,
+adjust divider widths, and restore the group to ordinary sibling blocks.
+Markdown/HTML remains content inside each block and is not used as the
+structural source of the column tree. Older snapshots containing a
+`properties.layout: "columns"` container are migrated when loaded and are not
+written back in that form.
+
+块注释不新增独立写协议，而是保存在所属 canonical 块的
+`properties.comments[]` 中。每条注释包含稳定 `id`、正文、创建/更新时间、
+可选 `deletedAt` 和 `history[]`；历史动作固定为 `created/edited/deleted`。
+删除使用软删除，正文气泡只统计未删除注释，右栏可以查看完整时间线。注释
+随 `saveDocument` 块快照经过相同的 mutation、版本、事务和 ACK 流程，因此
+新增、编辑和删除均进入现有文档撤销、重做与 SQLite 历史，不允许只在前端
+另存一份状态。引用投影中的源块注释只读，不能借预览写回源文档。
 
 ## Reference presentation and placement
 

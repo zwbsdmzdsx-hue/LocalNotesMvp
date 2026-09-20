@@ -66,7 +66,9 @@ public partial class StickyWindow : Window
                 {
                     if (doc.RootElement.GetProperty("sourceDocumentId").GetString() != _note.Id) throw new InvalidOperationException("Document mismatch.");
                     var result = _store.ExecuteEditorCommand(_note.Id, doc.RootElement);
-                    SendClientMessage(new { type = "command-ack", requestId, documentId = _note.Id, state = result });
+                    if (result is EditorCommandResult command)
+                        SendClientMessage(new { type = "command-ack", requestId, documentId = _note.Id, state = command.State, result = command.Result, content = command.Content, mimeType = command.MimeType, fileName = command.FileName });
+                    else SendClientMessage(new { type = "command-ack", requestId, documentId = _note.Id, state = result });
                 }
                 catch (Exception error) { SendClientMessage(new { type = "command-nack", requestId, documentId = _note.Id, error = error.Message }); }
                 return;

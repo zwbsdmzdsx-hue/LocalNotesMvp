@@ -3,7 +3,8 @@ import { orderBlockTree } from "./block-tree";
 import type { Notebook, Bookmark, WorkspaceDocument, WorkspaceSnapshot, SearchHit } from "./workspace-api";
 import type { HostTransport } from "./editor-host-api";
 import { MockSaveStore } from "./mock-save-store";
-import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, MediaKind } from "../../protocol/types";
+import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, StyleScope, MediaKind, DatabaseSource, DatabaseField, DatabaseRecord } from "../../protocol/types";
+import { parseDql, executeDql } from "./database-query";
 
 const block = (blockId: string, text: string) => ({ id: blockId, parentId: null, position: "00001000", type: "paragraph" as const, content: { text, html: text }, properties: {}, revision: 1 });
 
@@ -16,7 +17,10 @@ export class BrowserMockHost implements HostTransport {
   failNextSave = false;
   lastRequest: HostRequest | null = null;
   private saves!: MockSaveStore;
+  private globalSystemStyles: StyleSheet[] = [];
   private documentHistories = new Map<string, EditorHistory>();
+  private databases = new Map<string, { source: DatabaseSource; records: DatabaseRecord[] }>();
+  private databaseMutations = new Set<string>();
   private historySnapshot(id: string) {
     const state = structuredClone(this.docs.get(id)!);
     const moves = state.references.map(ref => [ref.id, [...(this.moves.get(ref.id) ?? new Map())]] as [string, Array<[string, { parentId: string | null; position: string }]>]);
@@ -77,17 +81,25 @@ export class BrowserMockHost implements HostTransport {
     ];
     for (const d of all) {
       this.parentByDocument.set(d.id, null);
-      const state: EditorState = {
+       const state: EditorState = {
         note: { id: d.id, title: d.title, isSticky: false, clientVersion: 0, workspaceId: d.id === "zeta" || d.id === "eta" ? "nb-research" : d.id === "theta" ? "nb-life" : "nb-default" },
         blocks: d.blocks.map(b => block(b.id, b.text)),
-        documents: this.allDocuments().map(x => ({ id: x.id, title: x.title })),
+        documents: [],
         backlinks: [],
         overrideNotices: [],
-        references: [], documentStyles: [], notebookStyles: []
+        references: [], databases: [], databaseRecords: {}, systemStyles: [], documentStyles: [], notebookStyles: []
       };
       if (d.id === "alpha") state.blocks.push({ ...block("ar1", ""), type: "reference" });
       this.docs.set(d.id, state);
     }
+    this.docs.get("zeta")!.blocks.push({
+      ...block("z2", "目标标题 可搜索正文"),
+      content: {
+        text: "# 目标标题 .secret { color: red; } **可搜索正文**",
+        html: "<h1>目标标题</h1><style>.secret { color: red; }</style><strong>可搜索正文</strong>",
+        markdown: "# 目标标题\n\n<style>.secret { color: red; }</style>\n\n**可搜索正文**"
+      }
+    });
     const alpha = this.docs.get("alpha")!;
     alpha.references = [{
       id: "ref1", hostBlockId: "ar1", targetDocumentId: "beta", targetBlockId: "b1", targetTitle: "Beta",
@@ -97,6 +109,27 @@ export class BrowserMockHost implements HostTransport {
   }
   private allDocuments() {
     return [...this.titleByDocument.entries()].map(([id, title]) => ({ id, title }));
+  }
+  private documentLocation(id: string) {
+    for (const [bookmarkId, ids] of this.documentByBookmark) {
+      if (!ids.includes(id)) continue;
+      const bookmark = this.bookmarks.find(item => item.id === bookmarkId);
+      const notebook = bookmark ? this.notebooks.find(item => item.id === bookmark.notebookId) : undefined;
+      return { bookmark, notebook };
+    }
+    return {};
+  }
+  private linkCatalog() {
+    return this.allDocuments().map(({ id, title }) => {
+      const { bookmark, notebook } = this.documentLocation(id);
+      return {
+        id, title,
+        path: [notebook?.name, bookmark?.name].filter(Boolean).join(" / "),
+        notebookId: notebook?.id,
+        notebookName: notebook?.name,
+        blocks: structuredClone(this.docs.get(id)?.blocks ?? [])
+      };
+    });
   }
   shellSnapshot(): WorkspaceSnapshot {
     const documents: WorkspaceDocument[] = [];
@@ -254,14 +287,18 @@ export class BrowserMockHost implements HostTransport {
   createDocument(title: string, requestedId?: string, bookmarkId = this.activeBookmarkId, parentId: string | null = null) {
     const id = requestedId ?? ("doc-" + Math.random().toString(36).slice(2, 8));
     this.titleByDocument.set(id, title);
-    const docsList = this.allDocuments();
+    const bookmark = this.bookmarks.find(item => item.id === bookmarkId);
     this.docs.set(id, {
-      note: { id, title, isSticky: false, clientVersion: 0 },
+      note: { id, title, isSticky: false, clientVersion: 0, workspaceId: bookmark?.notebookId },
       blocks: [],
-      documents: docsList,
+      documents: [],
       backlinks: [],
       overrideNotices: [],
-      references: []
+       references: [],
+       databases: [], databaseRecords: {},
+       systemStyles: structuredClone(this.globalSystemStyles),
+      documentStyles: [],
+      notebookStyles: []
     });
     this.parentByDocument.set(id, parentId);
     const list = this.documentByBookmark.get(bookmarkId) ?? [];
@@ -302,6 +339,13 @@ export class BrowserMockHost implements HostTransport {
       while (insertAt < target.length && (this.parentByDocument.get(target[insertAt]) ?? null) !== parentId) insertAt++;
     }
     target.splice(Math.max(0, insertAt), 0, ...extracted);
+    const notebookId = this.bookmarks.find(item => item.id === bookmarkId)?.notebookId;
+    if (notebookId) {
+      subtree.forEach(documentId => {
+        const document = this.docs.get(documentId);
+        if (document) document.note.workspaceId = notebookId;
+      });
+    }
   }
   moveBookmark(id: string, index: number) {
     const at = this.bookmarks.findIndex(bookmark => bookmark.id === id); if (at < 0) return;
@@ -320,11 +364,16 @@ export class BrowserMockHost implements HostTransport {
   private state(documentId = this.current) {
     this.refreshReferenceSnapshots();
     const result = structuredClone(this.docs.get(documentId)!);
+    result.documents = this.linkCatalog();
     result.blocks = orderBlockTree(result.blocks);
     result.references.forEach(reference => reference.blocks = orderBlockTree(reference.blocks));
     result.history = this.documentHistory(documentId).model(documentId);
     result.backlinks = this.computeBacklinks(documentId);
     result.overrideNotices = this.computeOverrideNotices(documentId);
+    const workspaceId = result.note.workspaceId;
+    const visible = [...this.databases.values()].filter(item => !item.source.notebookId || item.source.notebookId === workspaceId);
+    result.databases = visible.map(item => structuredClone(item.source));
+    result.databaseRecords = Object.fromEntries(visible.map(item => [item.source.id, structuredClone(item.records)]));
     return result;
   }
   private computeBacklinks(targetDocumentId: string): Backlink[] {
@@ -502,8 +551,7 @@ export class BrowserMockHost implements HostTransport {
           }
           case "storeMedia": {
             const payload = request.payload as RequestMap["storeMedia"];
-            const kind: MediaKind | null = payload.mimeType.startsWith("image/") ? "image" : payload.mimeType.startsWith("video/") ? "video" : payload.mimeType.startsWith("audio/") ? "audio" : null;
-            if (!kind) throw new Error("仅支持图片、视频和音频文件");
+            const kind: MediaKind = payload.mimeType.startsWith("image/") ? "image" : payload.mimeType.startsWith("video/") ? "video" : payload.mimeType.startsWith("audio/") ? "audio" : payload.mimeType === "application/pdf" ? "pdf" : "file";
             const media = {
               id: `media-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`,
               kind,
@@ -528,18 +576,91 @@ export class BrowserMockHost implements HostTransport {
           case "navigateBack": if (this.index > 0) this.index--; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "navigateForward": if (this.index + 1 < this.history.length) this.index++; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "executeCommand": {
-            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; content?: BlockContent; properties?: BlockProperties; style?: StyleSheet; styleId?: string };
+            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; content?: BlockContent; properties?: BlockProperties; style?: StyleSheet; styleId?: string; scope?: StyleScope; databaseId?: string; database?: DatabaseSource; fields?: DatabaseField[]; record?: DatabaseRecord; query?: string };
             const current = this.docs.get(request.sourceDocumentId ?? this.current)!;
             if (!current) throw new Error("文档不存在");
+            const databaseWrites = new Set(["create-database", "save-database-schema", "upsert-database-record", "delete-database-record"]);
+            const mutationId = typeof (payload as Record<string, unknown>).mutationId === "string" ? String((payload as Record<string, unknown>).mutationId) : "";
+            const requestedVersion = Number((payload as Record<string, unknown>).clientVersion);
+            const mutationKey = `${current.note.id}:${mutationId}`;
+            if (databaseWrites.has(payload.operation ?? "")) {
+              if (!mutationId || !Number.isInteger(requestedVersion)) throw new Error("数据库写入缺少 mutationId 或 clientVersion");
+              if (this.databaseMutations.has(mutationKey)) { this.respond(request, { state: this.state(current.note.id) }); break; }
+              if (requestedVersion <= current.note.clientVersion) throw new Error("数据库写入版本已过期，请重新载入");
+            }
+            const finishDatabaseMutation = () => { current.note.clientVersion += 1; this.databaseMutations.add(mutationKey); };
+            if (payload.operation === "create-database") {
+              const id = payload.database?.id ?? `db-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
+              const source: DatabaseSource = { id, notebookId: current.note.workspaceId, title: payload.database?.title ?? "新数据库", fields: structuredClone(payload.fields ?? []), recordCount: 0 };
+              source.fields = source.fields.map((field, index) => ({ ...field, id: field.id || `field-${id}-${index}`, databaseId: id, position: field.position || String((index + 1) * 1000).padStart(8, "0") }));
+              this.databases.set(id, { source, records: [] });
+              (current.databaseViews ??= []).push({ id: `view-${id}`, databaseId: id, name: source.title, type: "table", settings: { fieldKeys: source.fields.map(field => field.key) } });
+              finishDatabaseMutation();
+              this.respond(request, { state: this.state(current.note.id) });
+              break;
+            }
+            if (payload.operation === "save-database-schema" && payload.databaseId) {
+              const item = this.databases.get(payload.databaseId); if (!item) throw new Error("数据库不存在");
+              item.source = { ...item.source, title: payload.database?.title ?? item.source.title, fields: structuredClone(payload.fields ?? item.source.fields) };
+              item.source.fields = item.source.fields.map((field, index) => ({ ...field, databaseId: item.source.id, position: field.position || String((index + 1) * 1000).padStart(8, "0") }));
+              finishDatabaseMutation();
+              this.respond(request, { state: this.state(current.note.id) });
+              break;
+            }
+            if (payload.operation === "upsert-database-record" && payload.databaseId && payload.record) {
+              const item = this.databases.get(payload.databaseId); if (!item) throw new Error("数据库不存在");
+              const next = structuredClone(payload.record); const index = item.records.findIndex(record => record.id === next.id);
+              if (index >= 0) item.records[index] = next; else item.records.push(next);
+              item.source.recordCount = item.records.length;
+              finishDatabaseMutation();
+              this.respond(request, { state: this.state(current.note.id) });
+              break;
+            }
+            if (payload.operation === "delete-database-record" && payload.databaseId && payload.record?.id) {
+              const item = this.databases.get(payload.databaseId); if (!item) throw new Error("数据库不存在");
+              item.records = item.records.filter(record => record.id !== payload.record!.id); item.source.recordCount = item.records.length;
+              finishDatabaseMutation();
+              this.respond(request, { state: this.state(current.note.id) });
+              break;
+            }
+            if (payload.operation === "execute-dql" && payload.databaseId) {
+              const item = this.databases.get(payload.databaseId); if (!item) throw new Error("数据库不存在");
+              const parsed = parseDql(payload.query ?? "FROM current"); if ("code" in parsed) throw new Error(parsed.message);
+              const result = executeDql(parsed, item.source, item.records, { sources: [...this.databases.values()].map(value => value.source), records: Object.fromEntries([...this.databases.entries()].map(([id, value]) => [id, value.records])) });
+              this.respond(request, { state: this.state(current.note.id), result });
+              break;
+            }
+            if ((payload.operation === "export-database-markdown" || payload.operation === "export-database-csv") && payload.databaseId) {
+              const item = this.databases.get(payload.databaseId); if (!item) throw new Error("数据库不存在");
+              const csv = payload.operation === "export-database-csv";
+              const computed = executeDql({ from: "current" }, item.source, item.records);
+              const escape = (value: unknown) => csv ? `"${String(value ?? "").replace(/"/g, '""')}"` : String(value ?? "").replace(/\|/g, "\\|").replace(/[\r\n]/g, " ");
+              const content = csv
+                ? [computed.columns.map(column => escape(column.title)).join(","), ...computed.rows.filter(row => !row.grouped).map(row => computed.columns.map(column => escape(row.values[column.key])).join(","))].join("\n")
+                : [`| ${computed.columns.map(column => escape(column.title)).join(" | ")} |`, `| ${computed.columns.map(() => "---").join(" | ")} |`, ...computed.rows.filter(row => !row.grouped).map(row => `| ${computed.columns.map(column => escape(row.values[column.key])).join(" | ")} |`)].join("\n");
+              this.respond(request, { state: this.state(current.note.id), content, mimeType: csv ? "text/csv" : "text/markdown", fileName: `${item.source.title}.${csv ? "csv" : "md"}` });
+              break;
+            }
             if (payload.operation === "save-style") {
-              const style = structuredClone(payload as unknown as StyleSheet); const list = style.scope === "notebook" ? (current.notebookStyles ??= []) : (current.documentStyles ??= []);
+              const style = structuredClone(payload as unknown as StyleSheet); const list = style.scope === "system" ? (current.systemStyles ??= []) : style.scope === "notebook" ? (current.notebookStyles ??= []) : (current.documentStyles ??= []);
               const index = list.findIndex(item => item.id === style.id); if (index >= 0) list[index] = style; else list.push(style);
-              this.docs.forEach((doc) => { if (style.scope === "notebook" && doc.note.workspaceId === current.note.workspaceId) doc.notebookStyles = structuredClone(current.notebookStyles); });
+              this.docs.forEach((doc) => {
+                if (style.scope === "system") {
+                  this.globalSystemStyles = structuredClone(current.systemStyles ?? []);
+                  doc.systemStyles = structuredClone(this.globalSystemStyles);
+                }
+                else if (style.scope === "notebook" && doc.note.workspaceId === current.note.workspaceId) doc.notebookStyles = structuredClone(current.notebookStyles);
+              });
               this.respond(request, { state: this.state(current.note.id) });
               break;
             } else if (payload.operation === "delete-style" && payload.styleId) {
-              current.documentStyles = (current.documentStyles ?? []).filter(item => item.id !== payload.styleId);
-              current.notebookStyles = (current.notebookStyles ?? []).filter(item => item.id !== payload.styleId);
+              const scope = payload.scope as StyleScope | undefined;
+              if (scope === "system") {
+                this.globalSystemStyles = this.globalSystemStyles.filter(item => item.id !== payload.styleId);
+                this.docs.forEach(doc => { doc.systemStyles = structuredClone(this.globalSystemStyles); });
+              }
+              else if (scope === "notebook") this.docs.forEach(doc => { if (doc.note.workspaceId === current.note.workspaceId) doc.notebookStyles = (doc.notebookStyles ?? []).filter(item => item.id !== payload.styleId); });
+              else current.documentStyles = (current.documentStyles ?? []).filter(item => item.id !== payload.styleId);
               this.respond(request, { state: this.state(current.note.id) });
               break;
             }

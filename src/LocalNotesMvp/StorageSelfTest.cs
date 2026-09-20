@@ -176,6 +176,39 @@ internal static class StorageSelfTest
             persistedBlocks[1].GetProperty("parentId").GetString() != ownerId ||
             embeddedState.RootElement.GetProperty("references")[0].GetProperty("mode").GetString() != "collapsed")
             throw new InvalidOperationException("Embedded reference placement or disclosure state was lost after SQLite reopen.");
+
+        var databaseId = "self-test-database";
+        var fieldId = "self-test-field";
+        var databaseVersion = finalStore.Find(source.Id)!.ClientVersion + 1;
+        var databaseMessage = JsonSerializer.SerializeToElement(new
+        {
+            operation = "create-database", databaseId, mutationId = "self-test-database-create", clientVersion = databaseVersion,
+            database = new { id = databaseId, title = "自测表" },
+            fields = new[] { new { id = fieldId, databaseId, key = "name", title = "名称", type = "text", position = "00001000" } }
+        });
+        finalStore.ExecuteEditorCommand(source.Id, databaseMessage);
+        var recordMessage = JsonSerializer.SerializeToElement(new
+        {
+            operation = "upsert-database-record", databaseId, mutationId = "self-test-database-record", clientVersion = finalStore.Find(source.Id)!.ClientVersion + 1,
+            record = new { id = "self-test-record", databaseId, position = "00001000", values = new Dictionary<string, object?> { ["name"] = "第一条" } }
+        });
+        finalStore.ExecuteEditorCommand(source.Id, recordMessage);
+        var recordVersion = finalStore.Find(source.Id)!.ClientVersion;
+        finalStore.ExecuteEditorCommand(source.Id, recordMessage);
+        if (finalStore.Find(source.Id)!.ClientVersion != recordVersion) throw new InvalidOperationException("Duplicate database mutation was not idempotent.");
+        using var databaseState = JsonDocument.Parse(JsonSerializer.Serialize(finalStore.GetEditorState(source.Id)));
+        if (databaseState.RootElement.GetProperty("databaseRecords").GetProperty(databaseId).GetArrayLength() != 1)
+            throw new InvalidOperationException("Database record did not persist.");
+        var versionBeforeUndo = finalStore.Find(source.Id)!.ClientVersion;
+        finalStore.ExecuteEditorCommand(source.Id, JsonSerializer.SerializeToElement(new { operation = "history-undo", expectedVersion = versionBeforeUndo }));
+        using var undoneState = JsonDocument.Parse(JsonSerializer.Serialize(finalStore.GetEditorState(source.Id)));
+        if (undoneState.RootElement.GetProperty("databaseRecords").GetProperty(databaseId).GetArrayLength() != 0)
+            throw new InvalidOperationException("Database record undo did not restore the previous snapshot.");
+        var versionBeforeRedo = finalStore.Find(source.Id)!.ClientVersion;
+        finalStore.ExecuteEditorCommand(source.Id, JsonSerializer.SerializeToElement(new { operation = "history-redo", expectedVersion = versionBeforeRedo }));
+        using var redoneState = JsonDocument.Parse(JsonSerializer.Serialize(finalStore.GetEditorState(source.Id)));
+        if (redoneState.RootElement.GetProperty("databaseRecords").GetProperty(databaseId).GetArrayLength() != 1)
+            throw new InvalidOperationException("Database record redo did not restore the record.");
         return JsonSerializer.Serialize(new { passed = true, counts });
     }
 

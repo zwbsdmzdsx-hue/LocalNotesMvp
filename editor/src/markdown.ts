@@ -130,3 +130,30 @@ export function markdownFromHtml(html: string) {
   referenceIds.forEach((id, index) => source = source.split(`LNMREFERENCETOKEN${index}END`).join(`![[#^${id}]]`));
   return source;
 }
+
+/**
+ * Build the text used by block search/link suggestions. Markdown markers and
+ * CSS rules are presentation source, so they must never become searchable
+ * block labels.
+ */
+export function plainTextFromContent(content: BlockContent) {
+  const source = content.markdown !== undefined
+    ? renderMarkdown(content.markdown)
+    : (content.html || content.text || "");
+  const template = document.createElement("template");
+  template.innerHTML = DOMPurify.sanitize(source, {
+    ADD_TAGS: ["style"],
+    FORBID_TAGS: ["script", "iframe", "object", "embed", "form"]
+  });
+  template.content.querySelectorAll("style, script").forEach(node => node.remove());
+  template.content.querySelectorAll("pre").forEach(pre => {
+    const code = pre.querySelector("code");
+    const value = code?.textContent ?? pre.textContent ?? "";
+    if (/\b(?:color|background|font|display|position|margin|padding|border|width|height)\s*:/i.test(value) || /[.#@][\w-]+\s*\{/.test(value)) pre.remove();
+  });
+  return (template.content.textContent ?? "")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/(?:^|\s)(?:[.#][A-Za-z_][\w-]*|[A-Za-z][\w-]*(?:\s+[.#]?[\w-]+)*)\s*\{[^{}]*:[^{}]*\}/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}

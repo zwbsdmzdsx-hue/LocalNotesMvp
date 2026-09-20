@@ -95,7 +95,10 @@ public sealed class EditorHostController
     private object ExecuteCommand(HostRequest request)
     {
         var documentId = GetDocumentId(request);
-        return new { state = _repository.ExecuteEditorCommand(documentId, request.Payload) };
+        var result = _repository.ExecuteEditorCommand(documentId, request.Payload);
+        return result is EditorCommandResult command
+            ? new { state = command.State, result = command.Result, content = command.Content, mimeType = command.MimeType, fileName = command.FileName }
+            : new { state = result };
     }
 
     private async Task<object?> OpenDocumentAsync(HostRequest request)

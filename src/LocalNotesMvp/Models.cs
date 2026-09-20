@@ -99,6 +99,49 @@ public sealed class MediaAssetRecord
     public string Url { get; set; } = "";
 }
 
+public sealed class DatabaseFieldRecord
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string DatabaseId { get; set; } = "";
+    public string Key { get; set; } = "field";
+    public string Title { get; set; } = "字段";
+    public string Type { get; set; } = "text";
+    public string Position { get; set; } = "00001000";
+    public string? Formula { get; set; }
+    public string? RelationDatabaseId { get; set; }
+    public string? RelationScope { get; set; }
+    public string? Rollup { get; set; }
+    public string? RollupFieldKey { get; set; }
+}
+
+public sealed class DatabaseSourceRecord
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string? NotebookId { get; set; }
+    public string Title { get; set; } = "新数据库";
+    public List<DatabaseFieldRecord> Fields { get; set; } = [];
+    public int RecordCount { get; set; }
+}
+
+public sealed class DatabaseRecordRequest
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string DatabaseId { get; set; } = "";
+    public string Position { get; set; } = "00001000";
+    public string? SourceDocumentId { get; set; }
+    public string? SourceBlockId { get; set; }
+    public Dictionary<string, JsonElement> Values { get; set; } = [];
+}
+
+public sealed class EditorCommandResult
+{
+    public object State { get; set; } = new { };
+    public object? Result { get; set; }
+    public string? Content { get; set; }
+    public string? MimeType { get; set; }
+    public string? FileName { get; set; }
+}
+
 public sealed class SaveOverrideRequest
 {
     public string? HistoryGroup { get; set; }

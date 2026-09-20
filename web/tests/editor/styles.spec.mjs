@@ -22,6 +22,19 @@ test('document CSS cards save and notebook CSS has a toolbar entry', async ({ pa
   await expect(page.locator('.style-scope-switch button.active')).toHaveText('当前笔记本');
 });
 
+test('system CSS scope is available and propagates to another document', async ({ page }) => {
+  await page.locator('[data-pane-btn="styles"]').click();
+  await page.getByRole('button', { name: '系统' }).click();
+  await expect(page.locator('.style-add')).toHaveText('+ 新建系统样式');
+  await page.locator('.style-add').click();
+  const card = page.locator('.style-card').last();
+  await card.locator('textarea').fill('.system-callout { color: rgb(11, 99, 182); }');
+  await card.getByRole('button', { name: '保存' }).click();
+  await expect.poll(async () => (await page.evaluate(() => window.mockHost.state('alpha').systemStyles)).length).toBe(1);
+  await page.locator('nav button[data-doc="beta"]').click();
+  await expect.poll(async () => (await page.evaluate(() => window.mockHost.state('beta').systemStyles)).length).toBe(1);
+});
+
 test('applies a managed CSS class to the selected rich text and preserves it after save', async ({ page }) => {
   await page.locator('[data-pane-btn="styles"]').click();
   await page.locator('.style-add').click();
