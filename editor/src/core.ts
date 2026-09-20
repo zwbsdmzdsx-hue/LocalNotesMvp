@@ -1,5 +1,5 @@
 import { sanitizeHtml, editableContent } from "./block-content";
-import type { BlockType, BlockContent, BlockProperties, Block, BlockComment, LinkToken, Note, Backlink, OverrideNotice, ReferenceOverride, ReferenceMode, ReferenceInstance, EditorState, SaveMutation, RequestMap, StyleSheet, MediaAsset, MediaKind, DatabaseField, DatabaseSource, DatabaseRecord, DatabaseValue } from "../../protocol/types";
+import type { BlockType, BlockContent, BlockProperties, Block, BlockComment, LinkToken, Note, Backlink, OverrideNotice, ReferenceOverride, ReferenceMode, ReferenceInstance, ReferenceTargetScope, EditorState, SaveMutation, RequestMap, StyleSheet, MediaAsset, MediaKind, DatabaseField, DatabaseSource, DatabaseRecord, DatabaseValue } from "../../protocol/types";
 import type { EditorHostApi } from "./editor-host-api";
 import type { HistoryModel } from "./history";
 import { orderBlockTree } from "./block-tree";
@@ -62,9 +62,9 @@ let styleSelection: { editable: HTMLElement; endEditable: HTMLElement; range: Ra
 type TextSelectionEndpoint = { node: Node; offset: number; editable: HTMLElement };
 let crossBlockSelection: { start: TextSelectionEndpoint; end: TextSelectionEndpoint; pointerId: number; active: boolean } | null = null;
 type LinkSuggestion =
-  | { kind: "notebook"; notebookId: string; title: string; meta: string }
-  | { kind: "document"; id: string; notebookId: string; notebookName: string; title: string; meta: string }
-  | { kind: "target"; id: string; blockId?: string; title: string; meta: string; label: string };
+  | { kind: "notebook"; notebookId: string; title: string; meta: string; preview?: string }
+  | { kind: "document"; id: string; notebookId: string; notebookName: string; title: string; meta: string; preview?: string }
+  | { kind: "target" | "heading"; id: string; blockId?: string; scope?: ReferenceTargetScope; title: string; meta: string; label: string; notebookName?: string; documentTitle?: string; preview?: string };
 let linkMenuItems: LinkSuggestion[] = [];
 let linkMenuIndex = 0;
 let linkMenuStage: "notebook" | "document" | "block" = "notebook";
@@ -742,6 +742,27 @@ function renderAllPanels() {
   titleInput.value = state.note.title;
 }
 
+function isEmbeddedReferenceBlock(block: Block) {
+  if (!state || block.type !== "reference" || !block.parentId) return false;
+  const parent = state.blocks.find(candidate => candidate.id === block.parentId);
+  if (!parent) return false;
+  return !!blockSurface.querySelector(`[data-reference-host-id="${CSS.escape(block.id)}"]`) ||
+    parent.content.html?.includes(`data-reference-host-id="${block.id}"`) ||
+    parent.content.markdown?.includes(`#^${block.id}`) || false;
+}
+
+function existingBlockShell(blockId: string, embedded: boolean) {
+  const shells = [...blockSurface.querySelectorAll<HTMLElement>(`[data-own-block][data-id="${CSS.escape(blockId)}"]`)]
+    .filter(shell => shell.dataset.id === blockId);
+  if (!embedded || shells.length < 2) return shells.find(shell => shell.closest("[data-reference-host-id]")) ?? shells[0];
+  // A stale root shell can survive a structural refresh while the canonical
+  // shell is already mounted in its inline anchor. Keep the mounted shell and
+  // remove every extra copy before the next drag/re-render can expose it.
+  const mounted = shells.find(shell => shell.closest("[data-reference-host-id]")) ?? shells[0];
+  shells.forEach(shell => { if (shell !== mounted) shell.remove(); });
+  return mounted;
+}
+
 /** Diff the main block surface against current state.blocks. */
 function syncBlockSurface() {
   if (!state) return;
@@ -762,7 +783,10 @@ function syncBlockSurface() {
   let prev: Element | null = null;
   for (const block of visibleBlocks) {
     const id = block.id;
-    let existing = blockSurface.querySelector<HTMLElement>(`:scope > [data-own-block][data-id="${CSS.escape(id)}"]`);
+    const embedded = isEmbeddedReferenceBlock(block);
+    let existing = embedded
+      ? existingBlockShell(id, true)
+      : blockSurface.querySelector<HTMLElement>(`:scope > [data-own-block][data-id="${CSS.escape(id)}"]`);
     if (existing && (existing.dataset.editorMode !== editorMode || block.type === "database_table" || block.type === "data_view")) {
       existing.remove();
       existing = null;
@@ -834,6 +858,9 @@ function syncBlockSurface() {
     } else {
       shell = renderOwnBlockShell(block);
     }
+    // An inline reference shell is owned by its anchor. It must not be moved
+    // back to the root flow while syncing a dragged sibling block.
+    if (embedded && shell.closest("[data-reference-host-id]")) continue;
     const nextSibling: Element | null = prev ? prev.nextElementSibling : blockSurface.firstElementChild;
     if (nextSibling !== shell) blockSurface.insertBefore(shell, nextSibling);
     prev = shell;
@@ -1592,7 +1619,7 @@ function renderLinkedHtml(html: string, alreadySanitized = false) {
   }
   textNodes.forEach((node) => {
     const value = node.nodeValue ?? "";
-    const matches = [...value.matchAll(/\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]/g)];
+    const matches = [...value.matchAll(/\[\[([^\]|#]+)(?:#\^([^\]|]+)|#([^\]|]+))?(?:\|([^\]]+))?\]\]/g)];
     if (!matches.length) return;
     const fragment = document.createDocumentFragment();
     let offset = 0;
@@ -1601,10 +1628,16 @@ function renderLinkedHtml(html: string, alreadySanitized = false) {
       const link = document.createElement("span");
       link.className = "wiki-link";
       link.contentEditable = "false";
-      link.dataset.title = match[1].trim();
-      const anchor = match[2]?.trim();
-      if (anchor?.startsWith("^")) link.dataset.targetBlockId = anchor.slice(1);
-      link.textContent = match[0];
+      const title = match[1].trim();
+      const blockId = match[2]?.trim();
+      const heading = match[3]?.trim();
+      link.dataset.title = title;
+      if (blockId) link.dataset.targetBlockId = blockId;
+      if (heading) {
+        link.dataset.targetHeading = heading;
+        link.dataset.targetScope = "heading";
+      }
+      link.textContent = (match[4] ?? (heading || title)).trim();
       fragment.append(link);
       offset = (match.index ?? 0) + match[0].length;
     });
@@ -1619,10 +1652,14 @@ function resolveWikiTargets(root: ParentNode, fallbackLinks: readonly LinkToken[
     if (link.dataset.targetId) return;
     const title = (link.dataset.targetTitle ?? link.dataset.title ?? "").trim();
     const blockId = link.dataset.targetBlockId;
+    const targetScope = link.dataset.targetScope as ReferenceTargetScope | undefined;
     const retained = fallbackLinks.find(candidate =>
       (!blockId || candidate.targetBlockId === blockId) &&
+      (!targetScope || candidate.targetScope === targetScope) &&
       (candidate.targetText === title || state?.documents.find(document => document.id === candidate.targetDocumentId)?.title === title));
-    const document = state?.documents.find(candidate => candidate.title === title);
+    const leafTitle = title.split("/").map(part => part.trim()).filter(Boolean).pop() ?? title;
+    const document = state?.documents.find(candidate =>
+      candidate.title === title || candidate.title === leafTitle || candidate.path === title || candidate.path?.endsWith(`/${title}`));
     const documentId = retained?.targetDocumentId ?? document?.id;
     if (documentId) link.dataset.targetId = documentId;
     if (!link.dataset.targetTitle) link.dataset.targetTitle = title;
@@ -1672,7 +1709,7 @@ function sourceText(editable: HTMLElement) {
   return result.replace(/\r\n?/g, "\n");
 }
 
-type LinkDestination = { documentId: string; blockId?: string; referenceId?: string; anchor: HTMLElement };
+type LinkDestination = { documentId: string; blockId?: string; targetScope?: ReferenceTargetScope; referenceId?: string; anchor: HTMLElement };
 let sidebarLink: LinkDestination | null = null;
 let sidebarSequence = 0;
 let previewSequence = 0;
@@ -1680,19 +1717,44 @@ let previewTimer: ReturnType<typeof setTimeout> | undefined;
 function linkDestination(element: EventTarget | null): LinkDestination | null {
   const anchor = (element as HTMLElement | null)?.closest<HTMLElement>(".wiki-link, .reference-title");
   if (!anchor || !state) return null;
-  const documentId = anchor.dataset.targetId ?? state.documents.find(item => item.title === anchor.dataset.title)?.id;
-  return documentId ? { documentId, blockId: anchor.dataset.targetBlockId, referenceId: anchor.dataset.referenceId, anchor } : null;
+  const rawTitle = (anchor.dataset.targetTitle ?? anchor.dataset.title ?? "").trim();
+  const leafTitle = rawTitle.split("/").map(part => part.trim()).filter(Boolean).pop() ?? rawTitle;
+  const documentId = anchor.dataset.targetId ?? state.documents.find(item =>
+    item.title === rawTitle || item.title === leafTitle || item.path === rawTitle || item.path?.endsWith(`/${rawTitle}`))?.id;
+  return documentId ? { documentId, blockId: anchor.dataset.targetBlockId, targetScope: anchor.dataset.targetScope as ReferenceTargetScope | undefined, referenceId: anchor.dataset.referenceId, anchor } : null;
 }
 function dismissPreview() {
   clearTimeout(previewTimer); previewSequence++;
   document.querySelector(".link-preview")?.remove();
+}
+function headingInfo(block: Block) {
+  const source = markdownFromContent(block.content);
+  const line = source.split(/\r?\n/).find(value => value.trim()) ?? "";
+  const match = line.match(/^\s*(#{1,6})[ \u3000]+(.+?)\s*$/);
+  return match ? { level: match[1].length, title: match[2].trim() } : null;
+}
+function headingSection(blocks: Block[], headingId: string) {
+  const ordered = orderBlockTree(blocks);
+  const start = ordered.findIndex(block => block.id === headingId);
+  if (start < 0) return [];
+  const root = headingInfo(ordered[start]);
+  if (!root) return [ordered[start]];
+  const included: Block[] = [];
+  for (let index = start; index < ordered.length; index++) {
+    const info = headingInfo(ordered[index]);
+    if (index > start && info && info.level <= root.level) break;
+    included.push(ordered[index]);
+  }
+  return included;
 }
 async function targetProjection(target: LinkDestination): Promise<ReferenceInstance> {
   const instance = state?.references.find(item => item.id === target.referenceId);
   if (instance) return instance;
   const source = await host.loadDocument(target.documentId);
   let blocks = source.blocks;
-  if (target.blockId) {
+  if (target.blockId && target.targetScope === "heading") {
+    blocks = headingSection(blocks, target.blockId);
+  } else if (target.blockId) {
     const ids = new Set([target.blockId]);
     for (let count = -1; count !== ids.size;) {
       count = ids.size;
@@ -1700,7 +1762,7 @@ async function targetProjection(target: LinkDestination): Promise<ReferenceInsta
     }
     blocks = blocks.filter(block => ids.has(block.id));
   }
-  return { id: "link-preview", hostBlockId: "", targetDocumentId: target.documentId, targetBlockId: target.blockId, targetTitle: source.note.title, mode: "link", blocks, overrides: [], hiddenBlockIds: [], broken: !!target.blockId && blocks.length === 0 };
+  return { id: "link-preview", hostBlockId: "", targetDocumentId: target.documentId, targetBlockId: target.blockId, targetScope: target.targetScope, targetTitle: source.note.title, mode: "link", blocks, overrides: [], hiddenBlockIds: [], broken: !!target.blockId && blocks.length === 0 };
 }
 function readOnlyProjection(reference: ReferenceInstance) {
   const container = document.createElement("div");
@@ -1756,7 +1818,7 @@ function renderSidebarPreview(reference: ReferenceInstance, target: LinkDestinat
       sidebarSequence++;
       const current = state?.references.find(item => item.id === target.referenceId);
       if (current) setReferenceMode(current, "inline");
-    } else createReferenceForTarget(target.documentId, target.blockId, "inline", target.anchor);
+    } else createReferenceForTarget(target.documentId, target.blockId, "inline", target.anchor, target.targetScope);
   };
   header.append(title, embed, close);
   referenceSidebarPanel.replaceChildren(header, target.referenceId ? renderReference(reference, true) : readOnlyProjection(reference));
@@ -1815,7 +1877,7 @@ document.addEventListener("contextmenu", event => {
   event.preventDefault();
   const instance = state?.references.find(item => item.id === target.referenceId);
   if (instance) showReferenceMenu(target.anchor, undefined, instance);
-  else showLinkChoiceMenu(target.anchor, { id: target.documentId, blockId: target.blockId, label: target.anchor.textContent ?? "链接" });
+  else showLinkChoiceMenu(target.anchor, { id: target.documentId, blockId: target.blockId, scope: target.targetScope, label: target.anchor.textContent ?? "链接" });
 });
 document.addEventListener("keydown", event => { if (event.key === "Escape") dismissPreview(); });
 
@@ -2287,8 +2349,16 @@ function render(next: EditorState) {
 
 function mountEmbeddedReferences() {
   if (editorMode === "source") return;
+  const mounted = new Set<string>();
   blockSurface.querySelectorAll<HTMLElement>("[data-reference-host-id]").forEach(anchor => {
-    const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(anchor.dataset.referenceHostId!)}"]`);
+    const hostId = anchor.dataset.referenceHostId;
+    if (!hostId) return;
+    // A reference host id identifies one block instance. If a stale sync left
+    // two anchors behind, keep the first and discard the duplicate marker so
+    // a later drag cannot show the same reference twice.
+    if (mounted.has(hostId)) { anchor.remove(); return; }
+    mounted.add(hostId);
+    const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(hostId)}"]`);
     if (!shell || shell.contains(anchor)) return;
     anchor.contentEditable = "false";
     anchor.className = "embedded-reference";
@@ -3430,7 +3500,7 @@ function setReferenceMode(reference: ReferenceInstance, mode: ReferenceMode) {
   postAfterFlush({ type: "setReferenceMode", referenceInstanceId: reference.id, mode });
 }
 
-function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: string, mode: ReferenceMode = "inline", anchor?: HTMLElement) {
+function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: string, mode: ReferenceMode = "inline", anchor?: HTMLElement, targetScope?: ReferenceTargetScope) {
   if (!state || !targetDocumentId) return;
   const documentId = state.note.id;
   const block = createBlock("reference");
@@ -3457,6 +3527,7 @@ function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: str
     hostBlockId: block.id,
     targetDocumentId,
     targetBlockId,
+    targetScope,
     targetTitle: state.documents.find(d => d.id === targetDocumentId)?.title ?? targetDocumentId,
     mode,
     blocks: [],
@@ -3468,7 +3539,7 @@ function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: str
   render(state);
   saveDocument();
   runAfterSaveDrain(async () => {
-    await post({ type: "createReference", hostBlockId: block.id, targetDocumentId, targetBlockId }, documentId);
+    await post({ type: "createReference", hostBlockId: block.id, targetDocumentId, targetBlockId, targetScope }, documentId);
     // applyServerState in post's ACK already synced state.references.
     // For non-inline modes, switch the newly-created reference to the requested mode.
     if (mode !== "inline") {
@@ -3518,6 +3589,13 @@ function exactOrOnly<T>(items: T[], label: string, getLabel: (item: T) => string
       : undefined);
 }
 
+function suggestionPreview(blocks: Block[]) {
+  return blocks.slice(0, 6).map(block => {
+    const source = markdownFromContent(block.content);
+    return source ? markdownHtml(source, block.content.links) : escapeText(block.content.text || "");
+  }).filter(Boolean).join("<hr>");
+}
+
 function suggestionItems(query: string): LinkSuggestion[] {
   if (!state) return [];
   const parts = query.split("/");
@@ -3535,30 +3613,60 @@ function suggestionItems(query: string): LinkSuggestion[] {
   linkMenuStage = parts.length === 2 ? "document" : "block";
   linkMenuTrail = notebook ? [notebook.name] : [parts[0].trim()].filter(Boolean);
   if (!notebook) return [];
-  const documentNeedle = normalizedSearch(parts[1]);
+  const documentPart = parts[1] ?? "";
+  const hash = documentPart.indexOf("#");
+  const documentNeedle = normalizedSearch(hash >= 0 ? documentPart.slice(0, hash) : documentPart);
+  const headingNeedle = hash >= 0 ? normalizedSearch(documentPart.slice(hash + 1)) : "";
   if (parts.length === 2) {
-    return notebook.documents
+    const documentMatches = notebook.documents
       .filter(document => !documentNeedle || normalizedSearch(document.title).includes(documentNeedle))
-      .slice(0, 12)
-      .map(document => ({
+      .slice(0, 12);
+    if (hash >= 0) {
+      const document = exactOrOnly(documentMatches, documentNeedle, item => item.title);
+      if (!document) return [];
+      linkMenuStage = "block";
+      linkMenuTrail = [notebook.name, document.title];
+      return (document.blocks ?? []).flatMap(block => {
+        const heading = headingInfo(block);
+        if (!heading || (headingNeedle && !normalizedSearch(heading.title).includes(headingNeedle))) return [];
+        const section = headingSection(document.blocks ?? [], block.id);
+        return [{ kind: "heading" as const, id: document.id, blockId: block.id, scope: "heading" as const,
+          title: heading.title, label: heading.title, notebookName: notebook.name, documentTitle: document.title,
+          meta: `${document.title} · H${heading.level} · ${section.length} 个块`, preview: suggestionPreview(section) }];
+      }).slice(0, 12);
+    }
+    return documentMatches.map(document => ({
         kind: "document", id: document.id, notebookId: notebook.id, notebookName: notebook.name,
-        title: document.title, meta: document.path || notebook.name
+        title: document.title, meta: document.path || notebook.name, preview: suggestionPreview(document.blocks ?? [])
       }));
   }
 
-  const document = exactOrOnly(notebook.documents, parts[1], item => item.title);
+  const document = exactOrOnly(notebook.documents, documentNeedle || parts[1], item => item.title);
   if (!document) return [];
   linkMenuTrail = [notebook.name, document.title];
-  const blockNeedle = normalizedSearch(parts.slice(2).join("/"));
+  const blockQuery = parts.slice(2).join("/");
+  const blockHash = blockQuery.indexOf("#");
+  const blockNeedle = normalizedSearch(blockHash >= 0 ? blockQuery.slice(blockHash + 1) : blockQuery);
   const items: LinkSuggestion[] = [];
   if (!blockNeedle || "整篇文档".includes(blockNeedle)) {
-    items.push({ kind: "target", id: document.id, title: "整篇文档", meta: `${document.title} · 文档`, label: document.title });
+    items.push({ kind: "target", id: document.id, title: "整篇文档", meta: `${document.title} · 文档`, label: document.title,
+      notebookName: notebook.name, documentTitle: document.title, preview: suggestionPreview(document.blocks ?? []) });
   }
   (document.blocks ?? []).forEach(block => {
+    const heading = headingInfo(block);
+    if (blockHash >= 0 && heading) {
+      if (!blockNeedle || normalizedSearch(heading.title).includes(blockNeedle)) {
+        const section = headingSection(document.blocks ?? [], block.id);
+        items.push({ kind: "heading", id: document.id, blockId: block.id, scope: "heading", title: heading.title, label: heading.title,
+          notebookName: notebook.name, documentTitle: document.title, meta: `${document.title} · H${heading.level} · ${section.length} 个块`, preview: suggestionPreview(section) });
+      }
+      return;
+    }
     const text = plainTextFromContent(block.content);
     if (!text || (blockNeedle && !normalizedSearch(text).includes(blockNeedle))) return;
     const label = text.slice(0, 56);
-    items.push({ kind: "target", id: document.id, blockId: block.id, title: label, meta: `${document.title} · 正文块`, label });
+    items.push({ kind: "target", id: document.id, blockId: block.id, title: label, meta: `${document.title} · 正文块`, label,
+      notebookName: notebook.name, documentTitle: document.title, preview: suggestionPreview([block]) });
   });
   return items.slice(0, 12);
 }
@@ -3597,6 +3705,12 @@ function renderInlineLinkSuggestions(editable: HTMLElement) {
     button.dataset.kind = item.kind;
     if (item.kind === "target" && item.blockId) button.dataset.blockId = item.blockId;
     button.innerHTML = `<strong>${escapeText(item.title)}</strong><span>${escapeText(item.meta)}</span>`;
+    if (item.preview) {
+      const preview = document.createElement("div");
+      preview.className = "link-suggestion-preview";
+      preview.innerHTML = item.preview;
+      button.append(preview);
+    }
     button.addEventListener("mousedown", (event) => { event.preventDefault(); insertInlineSuggestion(item); });
     linkSuggestions.append(button);
   });
@@ -3665,8 +3779,13 @@ function insertInlineSuggestion(item: LinkSuggestion) {
   if (!active || !activeEditable) return;
   const { selection, range } = active;
   range.deleteContents();
+  const targetLabel = item.kind === "heading" ? item.label : item.label;
+  const targetTitle = item.kind === "heading" ? (item.documentTitle ?? item.label) : item.label;
+  const sourceTarget = item.kind === "heading"
+    ? `${item.notebookName ? `${item.notebookName}/` : ""}${item.documentTitle ?? item.label}#${item.label}`
+    : `${item.notebookName && item.documentTitle ? `${item.notebookName}/` : ""}${item.documentTitle ?? item.label}${item.blockId ? `#^${item.blockId}` : ""}`;
   if (editorMode === "source") {
-    const source = `[[${item.label}${item.blockId ? `#^${item.blockId}` : ""}]]`;
+    const source = `[[${sourceTarget}]]`;
     const text = document.createTextNode(source);
     range.insertNode(text);
     range.setStartAfter(text);
@@ -3681,18 +3800,22 @@ function insertInlineSuggestion(item: LinkSuggestion) {
   link.contentEditable = "false";
   link.dataset.targetId = item.id;
   if (item.blockId) link.dataset.targetBlockId = item.blockId;
-  link.dataset.targetTitle = item.label;
-  link.textContent = item.label;
+  link.dataset.targetTitle = targetTitle;
+  if (item.kind === "heading") {
+    link.dataset.targetHeading = item.label;
+    link.dataset.targetScope = "heading";
+  }
+  link.textContent = targetLabel;
   range.insertNode(link);
   range.setStartAfter(link);
   range.collapse(true);
   selection.removeAllRanges(); selection.addRange(range);
   hideInlineLinkSuggestions();
   activeEditable.dispatchEvent(new Event("input", { bubbles: true }));
-  showLinkChoiceMenu(link, item);
+  showLinkChoiceMenu(link, { ...item, label: targetLabel });
 }
 
-function showLinkChoiceMenu(anchor: HTMLElement, item: { id: string; blockId?: string; label: string }) {
+function showLinkChoiceMenu(anchor: HTMLElement, item: { id: string; blockId?: string; scope?: ReferenceTargetScope; label: string }) {
   document.querySelector(".link-mode-menu")?.remove();
   const menu = document.createElement("div");
   menu.className = "link-mode-menu";
@@ -3710,7 +3833,7 @@ function showLinkChoiceMenu(anchor: HTMLElement, item: { id: string; blockId?: s
     button.textContent = choice.label;
     button.addEventListener("click", () => {
       menu.remove();
-      if (choice.mode) createReferenceForTarget(item.id, item.blockId, choice.mode, anchor);
+      if (choice.mode) createReferenceForTarget(item.id, item.blockId, choice.mode, anchor, item.scope);
     });
     menu.append(button);
   });
@@ -4262,7 +4385,7 @@ document.addEventListener("input", (event) => {
   const input = event as InputEvent;
   if (event.target !== editTarget || Date.now() - editTime > 900 || input.inputType && !["insertText", "deleteContentBackward", "deleteContentForward", "insertCompositionText", "insertFromComposition"].includes(input.inputType)) editGroup = newId();
   editTarget = event.target; editTime = Date.now();
-  const editable = (event.target as HTMLElement | null)?.closest<HTMLElement>(".block-text[contenteditable='true']");
+  const editable = (event.target as HTMLElement | null)?.closest<HTMLElement>(".block-text[contenteditable='true'], .block-text[contenteditable='plaintext-only']");
   if (editable) updateInlineLinkSuggestions(editable);
 }, true);
 document.addEventListener("beforeinput", event => {
@@ -4289,7 +4412,7 @@ document.addEventListener("keydown", (event) => {
     if (!event.repeat) post({ type: event.key === "ArrowLeft" ? "navigateBack" : "navigateForward" });
     return;
   }
-  const editable = (event.target as HTMLElement | null)?.closest<HTMLElement>(".block-text[contenteditable='true']");
+  const editable = (event.target as HTMLElement | null)?.closest<HTMLElement>(".block-text[contenteditable='true'], .block-text[contenteditable='plaintext-only']");
   if (editable && !linkSuggestions.hidden) handleInlineLinkKeys(event);
 }, true);
 titleInput.addEventListener("input", () => scheduleDocumentSave());

@@ -3,7 +3,8 @@ export type HistoryModel = { documentId: string; entries: HistoryEntry[]; curren
 export type MediaKind = "image" | "video" | "audio" | "pdf" | "file";
 export type MediaAsset = { id: string; kind: MediaKind; name: string; mimeType: string; size: number; url: string };
 export type BlockType = "paragraph" | "heading" | "todo" | "reference" | "media" | "database_table" | "data_view";
-export type LinkToken = { targetDocumentId?: string; targetBlockId?: string; targetText: string; alias?: string; start: number; end: number };
+export type ReferenceTargetScope = "block" | "heading";
+export type LinkToken = { targetDocumentId?: string; targetBlockId?: string; targetScope?: ReferenceTargetScope; targetText: string; alias?: string; start: number; end: number };
 export type BlockContent = { text: string; html: string; markdown?: string; checked?: boolean; targetDocumentId?: string; links?: LinkToken[]; media?: MediaAsset; caption?: string };
 export type BlockCommentHistory = { id: string; action: "created" | "edited" | "deleted"; content: string; timestamp: string };
 export type BlockComment = { id: string; content: string; createdAt: string; updatedAt: string; deletedAt?: string; history: BlockCommentHistory[] };
@@ -39,7 +40,7 @@ export type Backlink = { sourceDocumentId: string; sourceTitle: string; sourceBl
 export type OverrideNotice = { referenceInstanceId: string; targetBlockId: string; sourceUpdated: boolean; hostTitle: string; hostDocumentId: string; excerpt: string; kind: "content_style" | "hide" | "move" | "insert" };
 export type ReferenceOverride = { targetBlockId: string; patch: { content: BlockContent; properties: BlockProperties }; baseRevision: number };
 export type ReferenceMode = "inline" | "collapsed" | "sidebar" | "link";
-export type ReferenceInstance = { id: string; hostBlockId: string; targetDocumentId: string; targetBlockId?: string; targetTitle: string; mode: ReferenceMode; broken?: boolean; blocks: Block[]; overrides: ReferenceOverride[]; hiddenBlockIds: string[] };
+export type ReferenceInstance = { id: string; hostBlockId: string; targetDocumentId: string; targetBlockId?: string; targetScope?: ReferenceTargetScope; targetTitle: string; mode: ReferenceMode; broken?: boolean; blocks: Block[]; overrides: ReferenceOverride[]; hiddenBlockIds: string[] };
 export type LinkCatalogDocument = {
   id: string;
   title: string;
@@ -65,7 +66,7 @@ export type SaveMutation = SaveDocumentPayload & { documentId: string; mutationI
 
 export const PROTOCOL_VERSION = 1 as const;
 export type ReferenceCommandMap = {
-  createReference: { hostBlockId: string; targetDocumentId: string; targetBlockId?: string };
+  createReference: { hostBlockId: string; targetDocumentId: string; targetBlockId?: string; targetScope?: ReferenceTargetScope };
   setReferenceMode: { referenceInstanceId: string; mode: ReferenceMode };
   saveOverride: { historyGroup?: string; referenceInstanceId: string; targetBlockId: string; content: BlockContent; properties: BlockProperties };
   saveInstanceBlock: { historyGroup?: string; referenceInstanceId: string; block: Block };

@@ -15,7 +15,9 @@ turndown.addRule("wiki-link", {
   replacement: (content, node) => {
     const element = node as HTMLElement;
     const title = element.dataset.targetTitle ?? element.dataset.title ?? content;
-    const target = element.dataset.targetBlockId ? `${title}#^${element.dataset.targetBlockId}` : title;
+    const target = element.dataset.targetScope === "heading" && element.dataset.targetHeading
+      ? `${title}#${element.dataset.targetHeading}`
+      : element.dataset.targetBlockId ? `${title}#^${element.dataset.targetBlockId}` : title;
     return content && content !== title ? `[[${target}|${content}]]` : `[[${target}]]`;
   }
 });
@@ -52,12 +54,13 @@ function protectWikiSyntax(source: string) {
     .replace(/==([^=\n]+)==/g, (_match, content: string) => `<mark>${escapeAttribute(content)}</mark>`)
     .replace(/!\[\[#\^([A-Za-z0-9_-]+)\]\]/g, (_match, id: string) =>
       `<span data-reference-host-id="${escapeAttribute(id)}"></span>`)
-    .replace(/\[\[([^\]|#]+)(?:#\^([^\]|]+))?(?:\|([^\]]+))?\]\]/g,
-      (_match, rawTitle: string, rawBlockId?: string, rawAlias?: string) => {
+    .replace(/\[\[([^\]|#]+)(?:#\^([^\]|]+)|#([^\]|]+))?(?:\|([^\]]+))?\]\]/g,
+      (_match, rawTitle: string, rawBlockId?: string, rawHeading?: string, rawAlias?: string) => {
         const title = rawTitle.trim();
-        const label = (rawAlias ?? title).trim();
+        const label = (rawAlias ?? rawHeading ?? title).trim();
         const block = rawBlockId?.trim();
-        return `<span class="wiki-link" data-target-title="${escapeAttribute(title)}"${block ? ` data-target-block-id="${escapeAttribute(block)}"` : ""}>${escapeAttribute(label)}</span>`;
+        const heading = rawHeading?.trim();
+        return `<span class="wiki-link" data-target-title="${escapeAttribute(title)}"${block ? ` data-target-block-id="${escapeAttribute(block)}"` : ""}${heading ? ` data-target-heading="${escapeAttribute(heading)}" data-target-scope="heading"` : ""}>${escapeAttribute(label)}</span>`;
       });
 }
 

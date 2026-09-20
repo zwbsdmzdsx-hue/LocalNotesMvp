@@ -28,6 +28,10 @@ button { cursor: pointer; }
 .link-suggestion:hover, .link-suggestion.active { background: #f2f4f7; }
 .link-suggestion strong, .link-suggestion span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .link-suggestion span { margin-top: 2px; color: #667085; font-size: 11px; }
+.link-suggestion-preview { max-height: 54px; margin-top: 5px; overflow: hidden; color: #475467; font-size: 11px; line-height: 1.35; white-space: normal; }
+.link-suggestion-preview h1, .link-suggestion-preview h2, .link-suggestion-preview h3, .link-suggestion-preview h4, .link-suggestion-preview h5, .link-suggestion-preview h6 { margin: 0; font-size: 12px; line-height: 1.35; }
+.link-suggestion-preview p, .link-suggestion-preview ul, .link-suggestion-preview ol, .link-suggestion-preview blockquote, .link-suggestion-preview pre { margin: 2px 0; }
+.link-suggestion-preview img, .link-suggestion-preview table, .link-suggestion-preview style { display: none; }
 .link-suggestion-empty { padding: 10px; color: #667085; font-size: 12px; }
 .link-suggestion-context { padding: 7px 10px 8px; border-bottom: 1px solid #eaecf0; margin-bottom: 3px; }
 .link-suggestion-context span, .link-suggestion-context strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

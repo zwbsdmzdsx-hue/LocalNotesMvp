@@ -492,7 +492,9 @@ export class BrowserMockHost implements HostTransport {
         if (!source) { reference.blocks = []; continue; }
         reference.targetTitle = source.note.title;
         const sourceBlocks = reference.targetBlockId
-          ? this.subtree(source.blocks, reference.targetBlockId)
+          ? reference.targetScope === "heading"
+            ? this.headingSection(source.blocks, reference.targetBlockId)
+            : this.subtree(source.blocks, reference.targetBlockId)
           : source.blocks;
         reference.blocks = [...structuredClone(sourceBlocks), ...reference.blocks.filter(block => block.scopeType === "reference_instance")];
         for (const block of reference.blocks) {
@@ -516,6 +518,26 @@ export class BrowserMockHost implements HostTransport {
       }
     }
     return blocks.filter((candidate) => included.has(candidate.id));
+  }
+  private headingInfo(block: Block) {
+    const source = block.content.markdown ?? block.content.text ?? "";
+    const line = source.split(/\r?\n/).find(value => value.trim()) ?? "";
+    const match = line.match(/^\s*(#{1,6})[ \u3000]+(.+?)\s*$/);
+    return match ? { level: match[1].length, title: match[2].trim() } : null;
+  }
+  private headingSection(blocks: EditorState["blocks"], headingId: string) {
+    const ordered = orderBlockTree(blocks);
+    const start = ordered.findIndex(block => block.id === headingId);
+    if (start < 0) return [];
+    const root = this.headingInfo(ordered[start]);
+    if (!root) return [ordered[start]];
+    const result: Block[] = [];
+    for (let index = start; index < ordered.length; index++) {
+      const info = this.headingInfo(ordered[index]);
+      if (index > start && info && info.level <= root.level) break;
+      result.push(ordered[index]);
+    }
+    return result;
   }
   updateSourceBlock(documentId: string, blockId: string, text: string) {
     const source = this.docs.get(documentId);
@@ -576,7 +598,7 @@ export class BrowserMockHost implements HostTransport {
           case "navigateBack": if (this.index > 0) this.index--; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "navigateForward": if (this.index + 1 < this.history.length) this.index++; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "executeCommand": {
-            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; content?: BlockContent; properties?: BlockProperties; style?: StyleSheet; styleId?: string; scope?: StyleScope; databaseId?: string; database?: DatabaseSource; fields?: DatabaseField[]; record?: DatabaseRecord; query?: string };
+            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; targetScope?: "block" | "heading"; content?: BlockContent; properties?: BlockProperties; style?: StyleSheet; styleId?: string; scope?: StyleScope; databaseId?: string; database?: DatabaseSource; fields?: DatabaseField[]; record?: DatabaseRecord; query?: string };
             const current = this.docs.get(request.sourceDocumentId ?? this.current)!;
             if (!current) throw new Error("文档不存在");
             const databaseWrites = new Set(["create-database", "save-database-schema", "upsert-database-record", "delete-database-record"]);
@@ -700,9 +722,14 @@ export class BrowserMockHost implements HostTransport {
                 hostBlockId: payload.hostBlockId,
                 targetDocumentId: payload.targetDocumentId,
                 targetBlockId: payload.targetBlockId,
+                targetScope: payload.targetScope as "block" | "heading" | undefined,
                 targetTitle: documentInfo?.title ?? "目标文档",
                 mode: "inline",
-                blocks: structuredClone(payload.targetBlockId ? this.subtree(target.blocks, payload.targetBlockId) : target.blocks),
+                blocks: structuredClone(payload.targetBlockId
+                  ? payload.targetScope === "heading"
+                    ? this.headingSection(target.blocks, payload.targetBlockId)
+                    : this.subtree(target.blocks, payload.targetBlockId)
+                  : target.blocks),
                 overrides: [],
                 hiddenBlockIds: []
               });

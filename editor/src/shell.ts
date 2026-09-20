@@ -305,6 +305,10 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     const snap = workspace.snapshot();
     docPanel.innerHTML = "";
     const myBookmarks = snap.bookmarks.filter((b) => b.notebookId === snap.activeNotebookId);
+    const clearDocumentDropIndicators = () => {
+      docPanel.querySelectorAll<HTMLElement>(".doc-drop-zone.active, .doc-node.drop-before, .doc-node.drop-after, .doc-node.drop-child, .bk-strip.drop-target")
+        .forEach(element => element.classList.remove("active", "drop-before", "drop-after", "drop-child", "drop-target"));
+    };
     const documentDropZone = (container: HTMLElement, bookmarkId: string, parentId: string | null, index: number) => {
       const zone = document.createElement("div");
       zone.className = "doc-drop-zone";
@@ -315,6 +319,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
         if (!event.dataTransfer?.types.includes("text/x-document-id")) return;
         event.preventDefault();
         event.stopPropagation();
+        clearDocumentDropIndicators();
         zone.classList.add("active");
         if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
       });
@@ -325,7 +330,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       zone.addEventListener("drop", event => {
         event.preventDefault();
         event.stopPropagation();
-        zone.classList.remove("active");
+        clearDocumentDropIndicators();
         const dragged = event.dataTransfer?.getData("text/x-document-id");
         if (!dragged || dragged === parentId) return;
         execute({ type: "moveDocument", id: dragged, bookmarkId, parentId, index });
@@ -367,6 +372,8 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       btn.addEventListener("dragover", event => {
         if (!event.dataTransfer?.types.includes("text/x-document-id")) return;
         event.preventDefault();
+        event.stopPropagation();
+        clearDocumentDropIndicators();
         node.classList.remove("drop-child", "drop-before", "drop-after");
         // Use the document row itself. The node's box also contains all descendants,
         // which made the upper/lower hit zones move as the tree grew.
@@ -375,10 +382,11 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
         node.classList.add(ratio < 0.28 ? "drop-before" : ratio > 0.72 ? "drop-after" : "drop-child");
       });
       btn.addEventListener("dragleave", event => {
-        node.classList.remove("drop-child", "drop-before", "drop-after");
+        const related = event.relatedTarget as Node | null;
+        if (!related || !btn.contains(related)) clearDocumentDropIndicators();
       });
       btn.addEventListener("drop", event => {
-        event.preventDefault(); node.classList.remove("drop-child", "drop-before", "drop-after");
+        event.preventDefault(); event.stopPropagation(); clearDocumentDropIndicators();
         const dragged = event.dataTransfer?.getData("text/x-document-id");
         if (!dragged || dragged === doc.id) return;
         const rect = btn.getBoundingClientRect();
@@ -420,10 +428,10 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       };
       strip.addEventListener("dragstart", event => { event.dataTransfer?.setData("text/x-bookmark-id", bk.id); if (event.dataTransfer) event.dataTransfer.effectAllowed = "move"; strip.classList.add("is-dragging"); });
       strip.addEventListener("dragend", () => strip.classList.remove("is-dragging"));
-      strip.addEventListener("dragover", event => { if (event.dataTransfer?.types.includes("text/x-bookmark-id") || event.dataTransfer?.types.includes("text/x-document-id")) { event.preventDefault(); strip.classList.add("drop-target"); } });
-      strip.addEventListener("dragleave", () => strip.classList.remove("drop-target"));
+      strip.addEventListener("dragover", event => { if (event.dataTransfer?.types.includes("text/x-bookmark-id") || event.dataTransfer?.types.includes("text/x-document-id")) { event.preventDefault(); event.stopPropagation(); clearDocumentDropIndicators(); strip.classList.add("drop-target"); } });
+      strip.addEventListener("dragleave", event => { const related = event.relatedTarget as Node | null; if (!related || !strip.contains(related)) clearDocumentDropIndicators(); });
       strip.addEventListener("drop", event => {
-        event.preventDefault(); strip.classList.remove("drop-target");
+        event.preventDefault(); event.stopPropagation(); clearDocumentDropIndicators();
         const draggedBookmark = event.dataTransfer?.getData("text/x-bookmark-id");
         if (draggedBookmark) { if (draggedBookmark === bk.id) return; const target = myBookmarks.findIndex(item => item.id === bk.id); execute({ type: "moveBookmark", id: draggedBookmark, index: target >= bookmarkIndex ? target + 1 : target }); return; }
         const draggedDocument = event.dataTransfer?.getData("text/x-document-id");

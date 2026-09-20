@@ -14,7 +14,7 @@ export function sanitizeHtml(html: string) {
     else [...element.attributes].forEach((attribute) => {
       const allowedClassAttribute = attribute.name === "class" &&
         [...element.classList].every(token => /^[A-Za-z_][A-Za-z0-9_-]*$/.test(token));
-      const allowedLinkAttribute = ["data-target-id", "data-target-block-id", "data-target-title", "data-reference-host-id"].includes(attribute.name) ||
+      const allowedLinkAttribute = ["data-target-id", "data-target-block-id", "data-target-title", "data-target-heading", "data-target-scope", "data-reference-host-id"].includes(attribute.name) ||
         allowedClassAttribute;
       const allowedAnchorAttribute = element.tagName === "A" && ["href", "title"].includes(attribute.name) &&
         !/^\s*(?:javascript|data):/i.test(attribute.value);
@@ -42,7 +42,7 @@ export function editableContent(editable: HTMLElement, fallback: BlockContent = 
   clean.querySelectorAll<HTMLElement>(".wiki-link").forEach((link) => {
     const targetText = link.textContent ?? "";
     const start = text.indexOf(targetText);
-    links.push({ targetDocumentId: link.dataset.targetId, targetBlockId: link.dataset.targetBlockId, targetText, start: Math.max(0, start), end: Math.max(0, start) + targetText.length });
+    links.push({ targetDocumentId: link.dataset.targetId, targetBlockId: link.dataset.targetBlockId, targetScope: link.dataset.targetScope as "block" | "heading" | undefined, targetText, start: Math.max(0, start), end: Math.max(0, start) + targetText.length });
   });
   return { ...fallback, text, html: sanitizeHtml(clean.innerHTML), links };
 }
