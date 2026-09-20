@@ -74,7 +74,8 @@ const sidebarCollapsedIds = new Set<string>();
 // Drag & drop state
 let draggingBlockId: string | null = null;
 let draggingBlockIds: string[] = [];
-let dropIndicator: { targetId: string; position: "before" | "after" | "child" | "column-left" | "column-right" } | null = null;
+let dropIndicator: { targetId?: string; groupId?: string; position: "before" | "after" | "child" | "column-left" | "column-right" | "group-before" | "group-after" } | null = null;
+let draggingColumnGroup: string | null = null;
 let draggingColumn: { containerId: string; column: number } | null = null;
 let columnDropIndicator: { containerId: string; column: number; slot: HTMLElement } | null = null;
 let mediaResize: { blockId: string; startX: number; startWidth: number; containerWidth: number } | null = null;
@@ -2071,6 +2072,17 @@ function syncColumnGroupRow(row: HTMLElement, groupId: string, members: Block[])
     row.replaceChildren(element);
     return element;
   })();
+  let rowGrip = row.querySelector<HTMLButtonElement>(":scope > .columns-row-grip");
+  if (!rowGrip) {
+    rowGrip = document.createElement("button");
+    rowGrip.type = "button";
+    rowGrip.className = "columns-row-grip grip";
+    rowGrip.draggable = editorMode !== "preview";
+    rowGrip.textContent = "⠿";
+    rowGrip.title = "拖拽整组分列";
+    rowGrip.setAttribute("aria-label", "拖拽整组分列");
+    row.insertBefore(rowGrip, grid);
+  } else rowGrip.draggable = editorMode !== "preview";
   const ordered = [...members].sort((left, right) => left.position.localeCompare(right.position) || left.id.localeCompare(right.id));
   const signature = `${editorMode}|${ordered.map(block => `${columnIndex(block)}:${block.id}`).join("|")}`;
   grid.style.gridTemplateColumns = widths.slice(0, count).flatMap((value, index) =>
@@ -2168,16 +2180,55 @@ document.addEventListener("pointermove", updateColumnResize);
 document.addEventListener("pointerup", finishColumnResize);
 document.addEventListener("pointercancel", finishColumnResize);
 
+type RootMoveItem = { key: string; blocks: Block[] };
+function rootMoveItems(): RootMoveItem[] {
+  if (!state) return [];
+  const items: RootMoveItem[] = [];
+  const seen = new Set<string>();
+  state.blocks.filter(block => block.parentId === null).forEach(block => {
+    if (block.properties.columnGroup) {
+      const group = block.properties.columnGroup;
+      if (seen.has(`group:${group}`)) return;
+      seen.add(`group:${group}`);
+      const members = state!.blocks.filter(item => item.parentId === null && item.properties.columnGroup === group)
+        .sort((a, b) => a.position.localeCompare(b.position) || a.id.localeCompare(b.id));
+      items.push({ key: `group:${group}`, blocks: members });
+      return;
+    }
+    if (!seen.has(block.id)) {
+      seen.add(block.id);
+      items.push({ key: block.id, blocks: [block] });
+    }
+  });
+  return items.sort((left, right) => {
+    const l = left.blocks[0]?.position ?? "";
+    const r = right.blocks[0]?.position ?? "";
+    return l.localeCompare(r) || left.key.localeCompare(right.key);
+  });
+}
+
+function applyRootMoveOrder(items: RootMoveItem[]) {
+  items.forEach((item, index) => item.blocks.forEach(block => {
+    block.parentId = null;
+    block.position = String((index + 1) * 1000).padStart(8, "0");
+  }));
+}
+
 function restoreColumnGroup(groupId: string) {
   if (!state) return;
-  const members = state.blocks.filter(block => block.properties.columnGroup === groupId).sort((a, b) => a.position.localeCompare(b.position));
-  const anchor = Math.min(...members.map(block => Number(block.position)).filter(Number.isFinite), 1000);
-  members.forEach((block, index) => {
+  const members = state.blocks.filter(block => block.properties.columnGroup === groupId)
+    .sort((a, b) => columnIndex(a) - columnIndex(b) || a.position.localeCompare(b.position));
+  const items = rootMoveItems();
+  const groupIndex = items.findIndex(item => item.key === `group:${groupId}`);
+  if (groupIndex < 0) return;
+  const restored = members.map(block => {
     const { columnGroup: _group, column: _column, columnWidths: _widths, ...properties } = block.properties;
     block.properties = properties;
     block.parentId = null;
-    block.position = String(anchor + index * 1000).padStart(8, "0");
+    return { key: block.id, blocks: [block] };
   });
+  items.splice(groupIndex, 1, ...restored);
+  applyRootMoveOrder(items);
   state.blocks = orderBlockTree(state.blocks);
   renderAllPanels();
   scheduleDocumentSave(0);
@@ -2792,9 +2843,10 @@ function formatMediaSize(size: number) {
 }
 
 function handleBlockKeydown(event: KeyboardEvent) {
-  if (event.target !== event.currentTarget) return;
+  // Embedded reference blocks are nested inside their host editable. Resolve
+  // the nearest editable so a bubbled key event cannot split the outer host.
+  if ((event.target as HTMLElement | null)?.closest<HTMLElement>(".block-text") !== event.currentTarget) return;
   if (event.defaultPrevented) return;
-  if (editorMode === "source") return;
   if (event.key !== "Enter" || event.shiftKey) return;
   event.preventDefault();
   const current = (event.currentTarget as HTMLElement).closest<HTMLElement>("[data-own-block]")!;
@@ -2803,6 +2855,9 @@ function handleBlockKeydown(event: KeyboardEvent) {
   if (currentBlock?.properties.columnGroup) {
     next.properties = { columnGroup: currentBlock.properties.columnGroup, column: columnIndex(currentBlock) };
   }
+  // Keep the optimistic model in sync with the inserted DOM shell. A second
+  // Enter before the save ACK must still see this block's parent/column data.
+  state?.blocks.push(next);
   const shell = document.createElement("div");
   shell.className = "block-shell";
   shell.dataset.ownBlock = "true";
@@ -3038,7 +3093,9 @@ function renderReference(reference: ReferenceInstance, inSidebar = false) {
     if (editorMode !== "preview") {
       editable.addEventListener("focus", () => activeEditable = editable);
       editable.addEventListener("input", () => local ? scheduleInstanceBlock(row, source) : scheduleOverride(row, source, properties));
+      editable.addEventListener("keydown", event => handleReferenceRowKeydown(event, row, reference, source));
     }
+    row.dataset.referenceSource = local ? "instance" : "canonical";
     row.querySelector<HTMLButtonElement>(".add-sibling")!.disabled = editorMode === "preview";
     row.querySelector(".add-sibling")!.addEventListener("click", () => addInstanceBlock(reference, source.parentId ?? null, row));
     row.querySelector<HTMLButtonElement>(".hide")!.disabled = editorMode === "preview";
@@ -3089,6 +3146,13 @@ function blockFromReferenceRow(row: HTMLElement, fallback: Block): Block {
   };
 }
 
+function handleReferenceRowKeydown(event: KeyboardEvent, row: HTMLElement, reference: ReferenceInstance, source: Block) {
+  if ((event.target as HTMLElement | null)?.closest<HTMLElement>(".block-text") !== event.currentTarget || event.defaultPrevented) return;
+  if (event.key !== "Enter" || event.shiftKey || editorMode === "preview") return;
+  event.preventDefault();
+  addInstanceBlock(reference, source.parentId ?? null, row);
+}
+
 function scheduleInstanceBlock(row: HTMLElement, source: Block) {
   const documentId = state?.note.id;
   const referenceInstanceId = row.dataset.referenceInstanceId!;
@@ -3102,9 +3166,18 @@ function addInstanceBlock(reference: ReferenceInstance, parentId: string | null,
   const documentId = state?.note.id;
   const block = createBlock("paragraph", parentId);
   block.scopeType = "reference_instance";
-  const rows = [...(afterRow?.closest(".reference-card") ?? blockSurface).querySelectorAll<HTMLElement>(".reference-row")];
-  block.position = String((rows.length + 1) * 1000).padStart(8, "0");
-  runAfterSaveDrain(() => post({ type: "saveInstanceBlock", referenceInstanceId: reference.id, block }, documentId));
+  const afterId = afterRow?.dataset.targetBlockId;
+  const siblings = reference.blocks.filter(item => (item.parentId ?? null) === parentId);
+  const after = afterId ? siblings.find(item => item.id === afterId) : undefined;
+  const used = new Set(siblings.map(item => Number(item.position)).filter(Number.isFinite));
+  let position = after ? Number(after.position) + 1 : Math.max(0, ...used) + 1000;
+  while (used.has(position)) position += 1;
+  block.position = String(position).padStart(8, "0");
+  runAfterSaveDrain(() => void post({ type: "saveInstanceBlock", referenceInstanceId: reference.id, block }, documentId).then(() => {
+    const row = document.querySelector<HTMLElement>(`.reference-row[data-reference-instance-id="${CSS.escape(reference.id)}"][data-target-block-id="${CSS.escape(block.id)}"]`);
+    const editable = row?.querySelector<HTMLElement>(".block-text");
+    editable?.focus();
+  }));
 }
 
 /**
@@ -3667,15 +3740,31 @@ function handleInlineLinkKeys(event: KeyboardEvent) {
   }
 }
 
-function addBlock(type: BlockType) {
+function addBlock(type: BlockType, options: { focusFirst?: boolean } = {}) {
   if (editorMode === "preview") return;
   if (!state) return;
   const block = createBlock(type);
   state.blocks.push(block);
   const shell = renderOwnBlockShell(block);
   blockSurface.append(shell);
-  shell.querySelector<HTMLElement>(".block-text")?.focus();
+  if (options.focusFirst !== false) shell.querySelector<HTMLElement>(".block-text")?.focus();
   scheduleDocumentSave(0);
+}
+
+function focusFirstBodyBlock() {
+  const first = blockSurface.querySelector<HTMLElement>(":scope > [data-own-block] .block-text")
+    ?? blockSurface.querySelector<HTMLElement>("[data-own-block] .block-text");
+  if (first) {
+    first.focus();
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(first);
+    range.collapse(true);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    return;
+  }
+  addBlock("paragraph", { focusFirst: true });
 }
 
 function addDatabaseTable() {
@@ -4204,6 +4293,12 @@ document.addEventListener("keydown", (event) => {
   if (editable && !linkSuggestions.hidden) handleInlineLinkKeys(event);
 }, true);
 titleInput.addEventListener("input", () => scheduleDocumentSave());
+titleInput.addEventListener("keydown", event => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  if (editorMode === "preview") return;
+  focusFirstBodyBlock();
+});
 document.querySelectorAll<HTMLButtonElement>(".icon-tools button").forEach((button) => button.addEventListener("mousedown", (event) => event.preventDefault()));
 updateEditorModeUi();
 
@@ -4215,6 +4310,7 @@ function clearDropIndicator() {
   document.querySelectorAll(".block-shell").forEach(el => {
     el.classList.remove("drop-before", "drop-after", "drop-child", "drop-column-side", "drop-column-left", "drop-column-right");
   });
+  document.querySelectorAll(".columns-row").forEach(el => el.classList.remove("drop-before", "drop-after"));
   document.querySelectorAll(".column-divider").forEach(el => el.classList.remove("drop-target"));
   dropIndicator = null;
   columnDropIndicator = null;
@@ -4224,6 +4320,12 @@ function setDropIndicator(targetShell: HTMLElement, position: "before" | "after"
   clearDropIndicator();
   targetShell.classList.add(position === "child" ? "drop-child" : position === "before" ? "drop-before" : "drop-after");
   dropIndicator = { targetId: targetShell.dataset.id!, position };
+}
+
+function setGroupDropIndicator(row: HTMLElement, groupId: string, position: "before" | "after") {
+  clearDropIndicator();
+  row.classList.add(position === "before" ? "drop-before" : "drop-after");
+  dropIndicator = { groupId, position: position === "before" ? "group-before" : "group-after" };
 }
 
 function setColumnDropIndicator(targetShell: HTMLElement, side: "left" | "right") {
@@ -4257,6 +4359,20 @@ function isDescendant(sourceId: string, targetId: string): boolean {
 function handleDragStart(event: DragEvent) {
   const grip = (event.target as HTMLElement).closest<HTMLElement>(".grip");
   if (!grip) return;
+  const groupRow = grip.classList.contains("columns-row-grip")
+    ? grip.closest<HTMLElement>(".columns-row[data-column-group]")
+    : null;
+  if (groupRow?.dataset.columnGroup) {
+    const groupId = groupRow.dataset.columnGroup;
+    const members = state?.blocks.filter(block => block.properties.columnGroup === groupId) ?? [];
+    if (!members.length) return;
+    draggingColumnGroup = groupId;
+    draggingBlockId = members[0].id;
+    draggingBlockIds = members.map(block => block.id);
+    draggingBlockIds.forEach(id => blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(id)}"]`)?.classList.add("is-dragging"));
+    setDragPreview(event, members.map(block => blockSummaryForDrag(block)));
+    return;
+  }
   const shell = grip.closest<HTMLElement>(".block-shell[data-own-block]");
   if (!shell?.dataset.id) return;
   // Prevent dragging reference rows (they stay within their card)
@@ -4266,21 +4382,40 @@ function handleDragStart(event: DragEvent) {
     ? [...selectedBlockIds]
     : [shell.dataset.id];
   draggingBlockIds.forEach(id => blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(id)}"]`)?.classList.add("is-dragging"));
-  // Use block text as drag image label
-  const textEl = shell.querySelector<HTMLElement>(".block-text");
-  if (textEl && event.dataTransfer) {
-    event.dataTransfer.setData("text/plain", textEl.textContent ?? "");
-    event.dataTransfer.effectAllowed = "move";
-    // Custom drag image: a small ghost with the block text
-    const ghost = document.createElement("div");
-    ghost.className = "drag-ghost";
-    ghost.textContent = (textEl.textContent ?? "").slice(0, 60) || "块";
-    ghost.style.position = "absolute";
-    ghost.style.top = "-1000px";
-    document.body.append(ghost);
-    event.dataTransfer.setDragImage(ghost, 10, 14);
-    setTimeout(() => ghost.remove(), 0);
+  // Build the drag image from every selected block. The native browser ghost only
+  // captures the element that initiated drag, so a multi-selection otherwise looks
+  // like a single block even though all selected IDs will move together.
+  if (event.dataTransfer) {
+    const text = draggingBlockIds.map(id => {
+      const item = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(id)}"]`);
+      return item?.querySelector<HTMLElement>(".block-text")?.textContent?.trim() || "空白块";
+    });
+    setDragPreview(event, text);
   }
+}
+
+function blockSummaryForDrag(block: Block) {
+  return plainTextFromContent(block.content).trim() || (block.type === "media" ? block.content.media?.name : block.type === "database_table" ? "数据库表" : "空白块") || "空白块";
+}
+
+function setDragPreview(event: DragEvent, values: string[]) {
+  if (!event.dataTransfer) return;
+  event.dataTransfer.setData("text/plain", values.join("\n"));
+  event.dataTransfer.effectAllowed = "move";
+  const ghost = document.createElement("div");
+  ghost.className = "drag-ghost drag-ghost-multi";
+  values.forEach((value, index) => {
+    const item = document.createElement("div");
+    item.className = "drag-ghost-item";
+    item.dataset.index = String(index + 1);
+    item.textContent = value.length > 100 ? `${value.slice(0, 100)}…` : value;
+    ghost.append(item);
+  });
+  ghost.style.position = "absolute";
+  ghost.style.top = "-1000px";
+  document.body.append(ghost);
+  event.dataTransfer.setDragImage(ghost, 14, 14);
+  setTimeout(() => ghost.remove(), 0);
 }
 
 function handleDragOver(event: DragEvent) {
@@ -4291,6 +4426,38 @@ function handleDragOver(event: DragEvent) {
     return;
   }
   if (!draggingBlockId) return;
+  const row = (event.target as HTMLElement).closest<HTMLElement>(".columns-row[data-column-group]");
+  if (draggingColumnGroup) {
+    if (row?.dataset.columnGroup) {
+      if (row.dataset.columnGroup === draggingColumnGroup) return;
+      const rowRect = row.getBoundingClientRect();
+      setGroupDropIndicator(row, row.dataset.columnGroup, event.clientY < rowRect.top + rowRect.height / 2 ? "before" : "after");
+    } else {
+      const ordinaryShell = (event.target as HTMLElement).closest<HTMLElement>(".block-shell[data-own-block]");
+      if (!ordinaryShell || ordinaryShell.dataset.columnGroup) return;
+      const ordinaryRect = ordinaryShell.getBoundingClientRect();
+      setDropIndicator(ordinaryShell, event.clientY < ordinaryRect.top + ordinaryRect.height / 2 ? "before" : "after");
+    }
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    return;
+  }
+  if (row?.dataset.columnGroup) {
+    const rowRect = row.getBoundingClientRect();
+    const edge = Math.min(28, Math.max(14, rowRect.height * .12));
+    if (event.clientY <= rowRect.top + edge) {
+      setGroupDropIndicator(row, row.dataset.columnGroup, "before");
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      return;
+    }
+    if (event.clientY >= rowRect.bottom - edge) {
+      setGroupDropIndicator(row, row.dataset.columnGroup, "after");
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      return;
+    }
+  }
   const shell = (event.target as HTMLElement).closest<HTMLElement>(".block-shell[data-own-block]");
   const divider = (event.target as HTMLElement).closest<HTMLElement>(".column-divider");
   if (divider) {
@@ -4319,6 +4486,7 @@ function handleDragOver(event: DragEvent) {
 
   // Block being dragged cannot be dropped into its own subtree
   if (isDescendant(draggingBlockId, shell.dataset.id)) return;
+  if (draggingColumnGroup && shell.dataset.columnGroup === draggingColumnGroup) return;
 
   const rect = shell.getBoundingClientRect();
   const horizontalRect = shell.querySelector<HTMLElement>(":scope > .block-row > .block-text")?.getBoundingClientRect() ?? rect;
@@ -4405,16 +4573,56 @@ function handleDrop(event: DragEvent) {
     return;
   }
   const targetId = dropIndicator?.targetId;
+  const targetGroupId = dropIndicator?.groupId;
   const position = dropIndicator?.position;
   const draggedBlocks = state.blocks.filter(block => draggingBlockIds.includes(block.id));
   const draggedBlock = draggedBlocks.find(block => block.id === draggingBlockId) ?? draggedBlocks[0];
   const targetBlock = targetId ? state.blocks.find(block => block.id === targetId) : undefined;
   if (!draggedBlock) { clearDropIndicator(); draggingBlockId = null; return; }
   if (targetBlock && draggedBlocks.some(block => block.id === targetBlock.id)) { clearDropIndicator(); draggingBlockId = null; draggingBlockIds = []; return; }
+  if (draggingColumnGroup) {
+    const groupId = draggingColumnGroup;
+    const items = rootMoveItems();
+    const sourceIndex = items.findIndex(item => item.key === `group:${groupId}`);
+    if (sourceIndex < 0) { clearDropIndicator(); draggingColumnGroup = null; draggingBlockId = null; draggingBlockIds = []; return; }
+    let targetIndex = -1;
+    let offset = 0;
+    if ((position === "group-before" || position === "group-after") && targetGroupId) {
+      targetIndex = items.findIndex(item => item.key === `group:${targetGroupId}`);
+      offset = position === "group-after" ? 1 : 0;
+    } else if (targetBlock && !targetBlock.properties.columnGroup && (position === "before" || position === "after")) {
+      targetIndex = items.findIndex(item => item.key === targetBlock.id);
+      offset = position === "after" ? 1 : 0;
+    }
+    if (targetIndex >= 0 && targetIndex !== sourceIndex) {
+      const [moved] = items.splice(sourceIndex, 1);
+      const insertion = Math.max(0, Math.min(items.length, targetIndex - (sourceIndex < targetIndex ? 1 : 0) + offset));
+      items.splice(insertion, 0, moved);
+      applyRootMoveOrder(items);
+      state.blocks = orderBlockTree(state.blocks);
+      renderAllPanels();
+      scheduleDocumentSave(0);
+    }
+    clearDropIndicator();
+    draggingColumnGroup = null;
+    draggingBlockId = null;
+    draggingBlockIds = [];
+    return;
+  }
   const affectedGroups = new Set(draggedBlocks.map(block => block.properties.columnGroup).filter((id): id is string => Boolean(id)));
   draggedBlocks.forEach(clearBlockColumnPlacement);
   affectedGroups.forEach(normalizeColumnGroup);
-  if (!targetBlock) {
+  if ((position === "group-before" || position === "group-after") && targetGroupId) {
+    const movedIds = new Set(draggedBlocks.map(block => block.id));
+    const items = rootMoveItems().filter(item => !item.blocks.some(block => movedIds.has(block.id)));
+    const targetIndex = items.findIndex(item => item.key === `group:${targetGroupId}`);
+    if (targetIndex >= 0) {
+      const movedItems = draggedBlocks.map(block => ({ key: block.id, blocks: [block] }));
+      const insertion = targetIndex + (position === "group-after" ? 1 : 0);
+      items.splice(Math.min(items.length, insertion), 0, ...movedItems);
+      applyRootMoveOrder(items);
+    } else draggedBlocks.forEach(block => { block.position = nextPosition(null); });
+  } else if (!targetBlock) {
     draggedBlocks.forEach(block => { block.position = nextPosition(null); });
   } else if (position === "column-left" || position === "column-right") {
     let groupId = targetBlock.properties.columnGroup;
@@ -4463,6 +4671,7 @@ function handleDragEnd() {
   clearDropIndicator();
   document.querySelectorAll(".column-grip").forEach(el => el.classList.remove("is-dragging"));
   draggingColumn = null;
+  draggingColumnGroup = null;
   document.querySelectorAll(".block-shell").forEach(el => el.classList.remove("is-dragging"));
   draggingBlockId = null;
   draggingBlockIds = [];

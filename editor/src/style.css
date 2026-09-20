@@ -125,7 +125,12 @@ button.database-computed-cell:hover { background: #eef4ff; color: #1849a9; }
 .block-text:focus { background: #f8fafc; box-shadow: 0 0 0 2px #dbeafe; }
 ::highlight(cross-block-selection) { color: HighlightText; background: Highlight; }
 .block-text.heading { font-size: 23px; line-height: 1.4; font-weight: 700; }
-.columns-row { position: relative; min-width: 0; margin: 5px 0 14px; padding: 0 20px 0 32px; }
+.columns-row { position: relative; min-width: 0; margin: 5px 0 14px; padding: 0 20px 0 0; }
+.columns-row-grip { position: absolute; left: -30px; top: 3px; z-index: 5; }
+.columns-row:hover > .columns-row-grip, .columns-row-grip:focus-visible { opacity: 1; }
+.columns-row.drop-before::before, .columns-row.drop-after::after { content: ''; display: block; position: absolute; left: 0; right: 20px; height: 2px; border-radius: 1px; background: #175cd3; box-shadow: 0 0 6px #175cd360; z-index: 6; pointer-events: none; }
+.columns-row.drop-before::before { top: -3px; }
+.columns-row.drop-after::after { bottom: -3px; }
 .columns-grid { display: grid; align-items: start; gap: 0; min-width: 0; }
 .column-track { min-width: 0; padding: 0 10px; }
 .column-track:first-child { padding-left: 0; }
@@ -176,6 +181,9 @@ button.database-computed-cell:hover { background: #eef4ff; color: #1849a9; }
 
 /* Drag & drop indicators */
 .block-shell.is-dragging { opacity: 0.35; }
+.drag-ghost-multi { display: grid; gap: 3px; width: min(360px, 42vw); padding: 7px; border: 1px solid #84adff; border-radius: 7px; background: rgba(239,246,255,.94); box-shadow: 0 8px 20px rgba(16,24,40,.18); color: #175cd3; font: 13px/1.45 inherit; pointer-events: none; }
+.drag-ghost-item { position: relative; min-height: 24px; padding: 4px 8px 4px 26px; overflow: hidden; border: 1px solid #b2ccff; border-radius: 4px; background: rgba(255,255,255,.86); text-overflow: ellipsis; white-space: nowrap; }
+.drag-ghost-item::before { content: attr(data-index); position: absolute; left: 8px; top: 4px; min-width: 12px; color: #667085; font-size: 10px; text-align: center; }
 .block-shell.drop-before::before {
   content: '';
   display: block;

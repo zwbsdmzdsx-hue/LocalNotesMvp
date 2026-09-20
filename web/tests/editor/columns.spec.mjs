@@ -180,3 +180,63 @@ test('column drop zones are narrow and mark only the active side', async ({ page
   }))).toEqual({ before: 'none', after: '""' });
   await dragged.locator('.grip').dispatchEvent('dragend', { dataTransfer });
 });
+
+test('outer column grip moves the whole column row as one root block', async ({ page }) => {
+  await page.locator('#add-columns').click();
+  const row = page.locator('.columns-row');
+  const target = page.locator('#blocks > [data-own-block][data-id="a1"]');
+  const targetBox = await target.locator('.block-text').boundingBox();
+  if (!targetBox) throw new Error('target block is not visible');
+  await row.locator('.columns-row-grip').dragTo(target.locator('.block-text'), {
+    targetPosition: { x: Math.floor(targetBox.width / 2), y: 2 }
+  });
+  await saved(page);
+  const order = await page.evaluate(() => window.mockHost.state('alpha').blocks
+    .filter(block => block.parentId === null)
+    .sort((a, b) => a.position.localeCompare(b.position))
+    .map(block => ({ id: block.id, group: block.properties.columnGroup })));
+  const groupIndexes = order.map((item, index) => item.group ? index : -1).filter(index => index >= 0);
+  expect(groupIndexes).toHaveLength(2);
+  expect(groupIndexes[1] - groupIndexes[0]).toBe(1);
+  expect(groupIndexes[0]).toBe(0);
+});
+
+test('top and bottom edges of a column row show the row drop line', async ({ page }) => {
+  await page.locator('#add-columns').click();
+  const row = page.locator('.columns-row');
+  const target = page.locator('#blocks > [data-own-block][data-id="a1"]');
+  const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
+  await target.locator('.grip').dispatchEvent('dragstart', { dataTransfer });
+  const box = await row.boundingBox();
+  if (!box) throw new Error('column row is not visible');
+  await row.dispatchEvent('dragover', { dataTransfer, clientX: box.x + 20, clientY: box.y + 2 });
+  await expect(row).toHaveClass(/drop-before/);
+  await row.dispatchEvent('dragover', { dataTransfer, clientX: box.x + 20, clientY: box.y + box.height - 2 });
+  await expect(row).toHaveClass(/drop-after/);
+  await target.locator('.grip').dispatchEvent('dragend', { dataTransfer });
+});
+
+test('restoring columns orders every column top-to-bottom without gaps', async ({ page }) => {
+  await page.locator('#add-columns').click();
+  const left = page.locator('.column-track').nth(0).locator('.block-text');
+  const right = page.locator('.column-track').nth(1).locator('.block-text');
+  await left.fill('左列第一行');
+  await left.press('End');
+  await left.press('Enter');
+  await page.keyboard.type('左列第二行');
+  await right.fill('右列第一行');
+  await right.press('End');
+  await right.press('Enter');
+  await page.keyboard.type('右列第二行');
+  await saved(page);
+  const groupId = await page.evaluate(() => window.mockHost.state('alpha').blocks.find(block => block.properties.columnGroup)?.properties.columnGroup);
+  await page.locator('.columns-restore').click();
+  await saved(page);
+  const restored = await page.evaluate(group => window.mockHost.state('alpha').blocks
+    .filter(block => block.parentId === null && block.content.text.includes('列'))
+    .sort((a, b) => a.position.localeCompare(b.position))
+    .map(block => ({ text: block.content.text, position: block.position, group: block.properties.columnGroup })), groupId);
+  expect(restored.map(block => block.text)).toEqual(['左列第一行', '左列第二行', '右列第一行', '右列第二行']);
+  expect(restored.map(block => block.position)).toEqual(['00002000', '00003000', '00004000', '00005000']);
+  expect(restored.every(block => !block.group)).toBe(true);
+});

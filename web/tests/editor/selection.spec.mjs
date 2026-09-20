@@ -99,3 +99,37 @@ test('dragging one selected block moves the whole selection in order', async ({ 
     'Beta 文档中的其他块'
   ]);
 });
+
+test('dragging multiple selected blocks shows every block in the drag preview', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('#add-paragraph').click();
+  const blocks = page.locator('#blocks > [data-own-block][data-type="paragraph"]');
+  const first = blocks.nth(0);
+  const second = blocks.nth(1);
+  const firstText = await first.locator('.block-text').innerText();
+  const secondText = await second.locator('.block-text').innerText();
+  const firstBox = await first.locator('.block-text').boundingBox();
+  const secondBox = await second.locator('.block-text').boundingBox();
+  if (!firstBox || !secondBox) throw new Error('selection blocks are not visible');
+  await page.mouse.move(firstBox.x + 4, firstBox.y + firstBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(secondBox.x + 4, secondBox.y + secondBox.height / 2, { steps: 8 });
+  await page.mouse.up();
+  await expect(first).toHaveClass(/block-selected/);
+  await expect(second).toHaveClass(/block-selected/);
+
+  const result = await first.locator('.grip').evaluate((grip, values) => {
+    const dataTransfer = new DataTransfer();
+    grip.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer }));
+    const ghost = document.querySelector('.drag-ghost-multi');
+    return {
+      count: ghost?.querySelectorAll('.drag-ghost-item').length ?? 0,
+      text: ghost?.textContent ?? '',
+      expected: values
+    };
+  }, [firstText, secondText]);
+  expect(result.count).toBeGreaterThanOrEqual(2);
+  expect(result.text).toContain(firstText.trim());
+  expect(result.text).toContain(secondText.trim());
+  await first.locator('.grip').dispatchEvent('dragend', { bubbles: true });
+});
