@@ -1782,9 +1782,13 @@ function readOnlyProjection(reference: ReferenceInstance) {
     const content = override?.patch.content ?? block.content;
     const paragraph = document.createElement("div");
     paragraph.className = "preview-block";
-    paragraph.innerHTML = content.markdown !== undefined
-      ? markdownHtml(content.markdown, content.links)
-      : renderLinkedHtml(content.html || escapeText(content.text));
+    if (block.type === "database_table" || block.type === "data_view") {
+      paragraph.append(renderDatabaseTablePreview(block));
+    } else {
+      paragraph.innerHTML = content.markdown !== undefined
+        ? markdownHtml(content.markdown, content.links)
+        : renderLinkedHtml(content.html || escapeText(content.text));
+    }
     container.append(paragraph);
   });
   if (!container.childElementCount) container.textContent = reference.broken ? "引用目标不存在" : "暂无内容";
@@ -2679,6 +2683,44 @@ function renderDataView(block: Block) {
   return wrapper;
 }
 
+/** Render a database/query block as a compact, read-only snapshot for projections.
+ * References, link popovers and suggestions must never expose the source table's
+ * editing controls or mutate records while they are being inspected. */
+function renderDatabaseTablePreview(block: Block, limits: { rows?: number; columns?: number } = {}) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "database-table database-table-preview";
+  wrapper.dataset.databaseId = block.properties.databaseId ?? "";
+  const database = databaseForBlock(block);
+  if (!database) { wrapper.textContent = "数据库不存在"; return wrapper; }
+  const records = state?.databaseRecords?.[database.id] ?? [];
+  let result: ReturnType<typeof executeDql>;
+  if (block.type === "data_view") {
+    const parsed = parseDql(block.properties.dataQuery ?? "FROM current");
+    if ("code" in parsed) { wrapper.textContent = parsed.message; wrapper.classList.add("database-query-error"); return wrapper; }
+    result = executeDql(parsed, database, records, { sources: state?.databases ?? [], records: state?.databaseRecords ?? {} });
+  } else {
+    result = executeDql({ from: "current" }, database, records, { sources: state?.databases ?? [], records: state?.databaseRecords ?? {} });
+  }
+  const columns = result.columns.slice(0, limits.columns ?? 5);
+  const rows = result.rows.slice(0, limits.rows ?? 5);
+  if (!columns.length || !rows.length) {
+    const empty = document.createElement("div"); empty.className = "database-preview-empty"; empty.textContent = "暂无数据"; wrapper.append(empty); return wrapper;
+  }
+  const table = document.createElement("table");
+  const head = document.createElement("thead"); const headRow = document.createElement("tr");
+  columns.forEach(column => { const th = document.createElement("th"); th.textContent = `${databaseFieldMeta[column.type]?.icon ?? ""} ${column.title}`.trim(); headRow.append(th); });
+  head.append(headRow); table.append(head);
+  const body = document.createElement("tbody");
+  rows.forEach(resultRow => {
+    const tr = document.createElement("tr"); if (resultRow.grouped) tr.className = "database-group-row";
+    columns.forEach(column => { const td = document.createElement("td"); td.textContent = formulaDisplay(resultRow.values[column.key]); td.title = td.textContent; tr.append(td); });
+    body.append(tr);
+  });
+  table.append(body); wrapper.append(table);
+  if (result.rows.length > rows.length) { const more = document.createElement("div"); more.className = "database-preview-empty"; more.textContent = `还有 ${result.rows.length - rows.length} 行`; wrapper.append(more); }
+  return wrapper;
+}
+
 function formulaDisplay(value: unknown) {
   if (typeof value === "object" && value !== null && "code" in value) return `#ERROR ${String((value as { message?: unknown }).message ?? "计算失败")}`;
   return Array.isArray(value) ? value.join(", ") : String(value ?? "");
@@ -3140,7 +3182,20 @@ function renderReference(reference: ReferenceInstance, inSidebar = false) {
     row.innerHTML = `<div class="reference-meta"><span>${local ? "本地新增" : override ? "已覆写" : "继承"}</span><button class="add-sibling" title="在同级新增块">+</button>${local ? "" : '<button class="reset" title="恢复源内容与位置">↺</button>'}<button class="hide" title="${local ? "删除本地块" : "在此引用中隐藏"}">×</button></div><div class="block-text ${source.type === "heading" ? "heading" : ""}"></div>`;
     const editable = row.querySelector<HTMLElement>(".block-text")!;
     if (override && source.revision > override.baseRevision) row.querySelector(".reference-meta span")!.textContent = "已覆写 · 源内容已更新";
-    if (editorMode === "source") {
+    if (source.type === "database_table" || source.type === "data_view") {
+      // Database projections are intentionally read-only. Keep the source
+      // declaration available in source mode, but render a compact table in
+      // rich/preview modes just like an embedded database block.
+      if (editorMode === "source") {
+        editable.classList.add("markdown-source");
+        editable.contentEditable = "plaintext-only";
+        editable.spellcheck = false;
+        editable.textContent = source.type === "data_view" ? (source.properties.dataQuery ?? "FROM current") : databaseDeclaration(source);
+      } else {
+        editable.classList.add("markdown-preview");
+        editable.replaceChildren(renderDatabaseTablePreview({ ...source, content, properties }));
+      }
+    } else if (editorMode === "source") {
       editable.classList.add("markdown-source");
       editable.contentEditable = "plaintext-only";
       editable.spellcheck = false;
@@ -3160,13 +3215,14 @@ function renderReference(reference: ReferenceInstance, inSidebar = false) {
     }
     editable.style.backgroundColor = properties.background ?? "";
     editable.style.color = properties.textColor ?? "";
-    if (editorMode !== "preview") {
+    const projectedDatabase = source.type === "database_table" || source.type === "data_view";
+    if (editorMode !== "preview" && !projectedDatabase) {
       editable.addEventListener("focus", () => activeEditable = editable);
       editable.addEventListener("input", () => local ? scheduleInstanceBlock(row, source) : scheduleOverride(row, source, properties));
       editable.addEventListener("keydown", event => handleReferenceRowKeydown(event, row, reference, source));
     }
     row.dataset.referenceSource = local ? "instance" : "canonical";
-    row.querySelector<HTMLButtonElement>(".add-sibling")!.disabled = editorMode === "preview";
+    row.querySelector<HTMLButtonElement>(".add-sibling")!.disabled = editorMode === "preview" || projectedDatabase;
     row.querySelector(".add-sibling")!.addEventListener("click", () => addInstanceBlock(reference, source.parentId ?? null, row));
     row.querySelector<HTMLButtonElement>(".hide")!.disabled = editorMode === "preview";
     row.querySelector(".hide")!.addEventListener("click", () => {
@@ -3591,9 +3647,20 @@ function exactOrOnly<T>(items: T[], label: string, getLabel: (item: T) => string
 
 function suggestionPreview(blocks: Block[]) {
   return blocks.slice(0, 6).map(block => {
+    if (block.type === "database_table" || block.type === "data_view") return renderDatabaseTablePreview(block).outerHTML;
     const source = markdownFromContent(block.content);
     return source ? markdownHtml(source, block.content.links) : escapeText(block.content.text || "");
   }).filter(Boolean).join("<hr>");
+}
+
+function headingFilter(value: string) {
+  const hash = value.indexOf("#");
+  if (hash < 0) return null;
+  const suffix = value.slice(hash + 1);
+  const extraHashes = suffix.match(/^#{0,5}/)?.[0].length ?? 0;
+  const level = 1 + extraHashes;
+  const needle = normalizedSearch(suffix.slice(extraHashes));
+  return { hash, level, needle };
 }
 
 function suggestionItems(query: string): LinkSuggestion[] {
@@ -3614,21 +3681,21 @@ function suggestionItems(query: string): LinkSuggestion[] {
   linkMenuTrail = notebook ? [notebook.name] : [parts[0].trim()].filter(Boolean);
   if (!notebook) return [];
   const documentPart = parts[1] ?? "";
-  const hash = documentPart.indexOf("#");
-  const documentNeedle = normalizedSearch(hash >= 0 ? documentPart.slice(0, hash) : documentPart);
-  const headingNeedle = hash >= 0 ? normalizedSearch(documentPart.slice(hash + 1)) : "";
+  const documentHeading = headingFilter(documentPart);
+  const documentNeedle = normalizedSearch(documentHeading ? documentPart.slice(0, documentHeading.hash) : documentPart);
   if (parts.length === 2) {
     const documentMatches = notebook.documents
       .filter(document => !documentNeedle || normalizedSearch(document.title).includes(documentNeedle))
       .slice(0, 12);
-    if (hash >= 0) {
+    if (documentHeading) {
       const document = exactOrOnly(documentMatches, documentNeedle, item => item.title);
       if (!document) return [];
       linkMenuStage = "block";
       linkMenuTrail = [notebook.name, document.title];
       return (document.blocks ?? []).flatMap(block => {
         const heading = headingInfo(block);
-        if (!heading || (headingNeedle && !normalizedSearch(heading.title).includes(headingNeedle))) return [];
+        if (!heading || heading.level !== documentHeading.level ||
+          (documentHeading.needle && !normalizedSearch(heading.title).includes(documentHeading.needle))) return [];
         const section = headingSection(document.blocks ?? [], block.id);
         return [{ kind: "heading" as const, id: document.id, blockId: block.id, scope: "heading" as const,
           title: heading.title, label: heading.title, notebookName: notebook.name, documentTitle: document.title,
@@ -3645,17 +3712,18 @@ function suggestionItems(query: string): LinkSuggestion[] {
   if (!document) return [];
   linkMenuTrail = [notebook.name, document.title];
   const blockQuery = parts.slice(2).join("/");
-  const blockHash = blockQuery.indexOf("#");
-  const blockNeedle = normalizedSearch(blockHash >= 0 ? blockQuery.slice(blockHash + 1) : blockQuery);
+  const blockHeading = headingFilter(blockQuery);
+  const blockNeedle = normalizedSearch(blockHeading ? blockQuery.slice(blockHeading.hash + 1 + (blockQuery.slice(blockHeading.hash + 1).match(/^#{0,5}/)?.[0].length ?? 0)) : blockQuery);
   const items: LinkSuggestion[] = [];
-  if (!blockNeedle || "整篇文档".includes(blockNeedle)) {
+  if (!blockHeading && (!blockNeedle || "整篇文档".includes(blockNeedle))) {
     items.push({ kind: "target", id: document.id, title: "整篇文档", meta: `${document.title} · 文档`, label: document.title,
       notebookName: notebook.name, documentTitle: document.title, preview: suggestionPreview(document.blocks ?? []) });
   }
   (document.blocks ?? []).forEach(block => {
     const heading = headingInfo(block);
-    if (blockHash >= 0 && heading) {
-      if (!blockNeedle || normalizedSearch(heading.title).includes(blockNeedle)) {
+    if (blockHeading) {
+      if (heading && heading.level === blockHeading.level &&
+        (!blockHeading.needle || normalizedSearch(heading.title).includes(blockHeading.needle))) {
         const section = headingSection(document.blocks ?? [], block.id);
         items.push({ kind: "heading", id: document.id, blockId: block.id, scope: "heading", title: heading.title, label: heading.title,
           notebookName: notebook.name, documentTitle: document.title, meta: `${document.title} · H${heading.level} · ${section.length} 个块`, preview: suggestionPreview(section) });
@@ -3704,8 +3772,16 @@ function renderInlineLinkSuggestions(editable: HTMLElement) {
     button.className = `link-suggestion ${index === linkMenuIndex ? "active" : ""}`;
     button.dataset.kind = item.kind;
     if (item.kind === "target" && item.blockId) button.dataset.blockId = item.blockId;
-    button.innerHTML = `<strong>${escapeText(item.title)}</strong><span>${escapeText(item.meta)}</span>`;
-    if (item.preview) {
+    if (item.kind === "target" && item.blockId) {
+      button.setAttribute("aria-label", `${item.label} · ${item.meta}`);
+      const preview = document.createElement("span");
+      preview.className = "link-suggestion-block-line";
+      preview.innerHTML = item.preview || escapeText(item.label);
+      button.append(preview);
+    } else {
+      button.innerHTML = `<strong>${escapeText(item.title)}</strong><span>${escapeText(item.meta)}</span>`;
+    }
+    if (item.preview && !(item.kind === "target" && item.blockId)) {
       const preview = document.createElement("div");
       preview.className = "link-suggestion-preview";
       preview.innerHTML = item.preview;
