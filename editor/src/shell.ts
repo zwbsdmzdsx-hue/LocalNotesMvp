@@ -379,7 +379,12 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
         // which made the upper/lower hit zones move as the tree grew.
         const rect = btn.getBoundingClientRect();
         const ratio = (event.clientY - rect.top) / Math.max(1, rect.height);
-        node.classList.add(ratio < 0.28 ? "drop-before" : ratio > 0.72 ? "drop-after" : "drop-child");
+        if (ratio < 0.28 || ratio > 0.72) {
+          const adjacent = (ratio < 0.28 ? node.previousElementSibling : node.nextElementSibling) as HTMLElement | null;
+          if (adjacent?.classList.contains("doc-drop-zone")) adjacent.classList.add("active");
+        } else {
+          node.classList.add("drop-child");
+        }
       });
       btn.addEventListener("dragleave", event => {
         const related = event.relatedTarget as Node | null;

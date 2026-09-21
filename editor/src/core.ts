@@ -3717,7 +3717,7 @@ function suggestionItems(query: string): LinkSuggestion[] {
   const items: LinkSuggestion[] = [];
   if (!blockHeading && (!blockNeedle || "整篇文档".includes(blockNeedle))) {
     items.push({ kind: "target", id: document.id, title: "整篇文档", meta: `${document.title} · 文档`, label: document.title,
-      notebookName: notebook.name, documentTitle: document.title, preview: suggestionPreview(document.blocks ?? []) });
+      notebookName: notebook.name, documentTitle: document.title });
   }
   (document.blocks ?? []).forEach(block => {
     const heading = headingInfo(block);
@@ -3772,7 +3772,12 @@ function renderInlineLinkSuggestions(editable: HTMLElement) {
     button.className = `link-suggestion ${index === linkMenuIndex ? "active" : ""}`;
     button.dataset.kind = item.kind;
     if (item.kind === "target" && item.blockId) button.dataset.blockId = item.blockId;
-    if (item.kind === "target" && item.blockId) {
+    if (item.kind === "target" && !item.blockId) {
+      // The document target is an insertion shortcut, not a document preview.
+      // Keep it deliberately compact so the block-level results remain scannable.
+      button.textContent = "整篇文档";
+      button.setAttribute("aria-label", "整篇文档");
+    } else if (item.kind === "target" && item.blockId) {
       button.setAttribute("aria-label", `${item.label} · ${item.meta}`);
       const preview = document.createElement("span");
       preview.className = "link-suggestion-block-line";
