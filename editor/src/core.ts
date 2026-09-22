@@ -1731,7 +1731,9 @@ function headingInfo(block: Block) {
   const source = markdownFromContent(block.content);
   const line = source.split(/\r?\n/).find(value => value.trim()) ?? "";
   const match = line.match(/^\s*(#{1,6})[ \u3000]+(.+?)\s*$/);
-  return match ? { level: match[1].length, title: match[2].trim() } : null;
+  if (match) return { level: match[1].length, title: match[2].trim() };
+  const title = plainTextFromContent(block.content).trim();
+  return block.type === "heading" && title ? { level: 1, title } : null;
 }
 function headingSection(blocks: Block[], headingId: string) {
   const ordered = orderBlockTree(blocks);
@@ -2247,6 +2249,30 @@ document.addEventListener("pointerup", finishColumnResize);
 document.addEventListener("pointercancel", finishColumnResize);
 
 type RootMoveItem = { key: string; blocks: Block[] };
+function columnBlocksInVisualOrder(blocks: Block[]) {
+  const columns = [...new Set(blocks.map(columnIndex))].sort((a, b) => a - b);
+  return columns.flatMap(column => blocks.filter(block => columnIndex(block) === column)
+    .sort((a, b) => a.position.localeCompare(b.position) || a.id.localeCompare(b.id)));
+}
+
+function positionRootMoveItems(items: RootMoveItem[]) {
+  items.forEach((item, index) => {
+    const base = (index + 1) * 1000;
+    if (!item.key.startsWith("group:")) {
+      item.blocks.forEach(block => { block.parentId = null; block.position = String(base).padStart(8, "0"); });
+      return;
+    }
+    const rowByColumn = new Map<number, number>();
+    columnBlocksInVisualOrder(item.blocks).forEach(block => {
+      const column = columnIndex(block);
+      const row = rowByColumn.get(column) ?? 0;
+      block.parentId = null;
+      block.position = String(base + row).padStart(8, "0");
+      rowByColumn.set(column, row + 1);
+    });
+  });
+}
+
 function rootMoveItems(): RootMoveItem[] {
   if (!state) return [];
   const items: RootMoveItem[] = [];
@@ -2266,18 +2292,16 @@ function rootMoveItems(): RootMoveItem[] {
       items.push({ key: block.id, blocks: [block] });
     }
   });
+  const stableIndex = new Map(items.map((item, index) => [item.key, index]));
   return items.sort((left, right) => {
     const l = left.blocks[0]?.position ?? "";
     const r = right.blocks[0]?.position ?? "";
-    return l.localeCompare(r) || left.key.localeCompare(right.key);
+    return l.localeCompare(r) || (stableIndex.get(left.key)! - stableIndex.get(right.key)!);
   });
 }
 
 function applyRootMoveOrder(items: RootMoveItem[]) {
-  items.forEach((item, index) => item.blocks.forEach(block => {
-    block.parentId = null;
-    block.position = String((index + 1) * 1000).padStart(8, "0");
-  }));
+  positionRootMoveItems(items);
 }
 
 function restoreColumnGroup(groupId: string) {
@@ -2285,11 +2309,7 @@ function restoreColumnGroup(groupId: string) {
   const members = state.blocks.filter(block => block.properties.columnGroup === groupId);
   // Restore in deterministic column-then-row order. Each column is sorted by
   // its own vertical position before the next column is appended.
-  const columns = [...new Set(members.map(columnIndex))].sort((a, b) => a - b);
-  const byColumn = new Map<number, Block[]>();
-  columns.forEach(column => byColumn.set(column, members.filter(block => columnIndex(block) === column)
-    .sort((a, b) => a.position.localeCompare(b.position) || a.id.localeCompare(b.id))));
-  const restoredMembers: Block[] = columns.flatMap(column => byColumn.get(column) ?? []);
+  const restoredMembers = columnBlocksInVisualOrder(members);
   const items = rootMoveItems();
   const groupIndex = items.findIndex(item => item.key === `group:${groupId}`);
   if (groupIndex < 0) return;
@@ -3136,6 +3156,23 @@ function readOwnBlocks(): Block[] {
     }
     return retainedByOwner;
   });
+  const retainedById = new Map(retained.map(block => [block.id, block]));
+  const rootItems: RootMoveItem[] = [];
+  [...blockSurface.children].forEach(element => {
+    if (element instanceof HTMLElement && element.classList.contains("columns-row")) {
+      const groupId = element.dataset.columnGroup;
+      if (!groupId) return;
+      const members = [...element.querySelectorAll<HTMLElement>(".column-track > [data-own-block][data-id]")]
+        .map(shell => retainedById.get(shell.dataset.id ?? ""))
+        .filter((block): block is Block => Boolean(block));
+      if (members.length) rootItems.push({ key: `group:${groupId}`, blocks: members });
+      return;
+    }
+    if (!(element instanceof HTMLElement) || !element.matches("[data-own-block][data-id]")) return;
+    const block = retainedById.get(element.dataset.id ?? "");
+    if (block && block.parentId === null) rootItems.push({ key: block.id, blocks: [block] });
+  });
+  positionRootMoveItems(rootItems);
   removeReferencesFromLocalState(removedReferenceIds);
   return orderBlockTree(retained);
 }
@@ -3856,13 +3893,13 @@ function renderInlineLinkSuggestions(editable: HTMLElement) {
     const button = document.createElement("button");
     button.className = `link-suggestion ${index === linkMenuIndex ? "active" : ""}`;
     button.dataset.kind = item.kind;
-    if (item.kind === "target" && item.blockId) button.dataset.blockId = item.blockId;
+    if ((item.kind === "target" || item.kind === "heading") && item.blockId) button.dataset.blockId = item.blockId;
     if (item.kind === "target" && !item.blockId) {
       // The document target is an insertion shortcut, not a document preview.
       // Keep it deliberately compact so the block-level results remain scannable.
       button.textContent = "整篇文档";
       button.setAttribute("aria-label", "整篇文档");
-    } else if (item.kind === "target" && item.blockId) {
+    } else if ((item.kind === "target" || item.kind === "heading") && item.blockId) {
       button.setAttribute("aria-label", `${item.label} · ${item.meta}`);
       const preview = document.createElement("span");
       preview.className = "link-suggestion-block-line";
@@ -3871,7 +3908,7 @@ function renderInlineLinkSuggestions(editable: HTMLElement) {
     } else {
       button.innerHTML = `<strong>${escapeText(item.title)}</strong><span>${escapeText(item.meta)}</span>`;
     }
-    if (item.preview && !(item.kind === "target" && item.blockId)) {
+    if (item.preview && !((item.kind === "target" || item.kind === "heading") && item.blockId)) {
       const preview = document.createElement("div");
       preview.className = "link-suggestion-preview";
       preview.innerHTML = item.preview;
@@ -4818,10 +4855,20 @@ function normalizeColumnGroup(groupId: string) {
   const members = state.blocks.filter(block => block.properties.columnGroup === groupId);
   const columns = [...new Set(members.map(columnIndex))].sort((a, b) => a - b);
   if (columns.length < 2) {
-    members.forEach(block => {
-      const { columnGroup: _group, column: _column, columnWidths: _widths, ...properties } = block.properties;
-      block.properties = properties;
-    });
+    const items = rootMoveItems();
+    const groupIndex = items.findIndex(item => item.key === `group:${groupId}`);
+    const restored = members
+      .sort((a, b) => a.position.localeCompare(b.position) || a.id.localeCompare(b.id))
+      .map(block => {
+        const { columnGroup: _group, column: _column, columnWidths: _widths, ...properties } = block.properties;
+        block.properties = properties;
+        block.parentId = null;
+        return { key: block.id, blocks: [block] };
+      });
+    if (groupIndex >= 0) {
+      items.splice(groupIndex, 1, ...restored);
+      applyRootMoveOrder(items);
+    }
     return;
   }
   const remap = new Map(columns.map((column, index) => [column, index]));

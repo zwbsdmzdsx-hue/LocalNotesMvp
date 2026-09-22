@@ -9,8 +9,7 @@ test('heading suggestions preview rendered content and retain the heading sectio
 
   const heading = page.locator('.link-suggestion[data-kind="heading"]').filter({ hasText: '目标标题' });
   await expect(heading).toBeVisible();
-  await expect(heading.locator('.link-suggestion-preview h1')).toContainText('目标标题');
-  await expect(heading.locator('.link-suggestion-preview strong')).toContainText('可搜索正文');
+  await expect(heading.locator('.link-suggestion-block-line h1')).toContainText('目标标题');
 
   await heading.click();
   const link = editable.locator('.wiki-link');
@@ -32,4 +31,31 @@ test('source mode writes a complete heading wikilink', async ({ page }) => {
   await page.keyboard.type('研究/Zeta#目标');
   await page.locator('.link-suggestion[data-kind="heading"]').filter({ hasText: '目标标题' }).click();
   await expect(source).toContainText('[[研究/Zeta#目标标题]]');
+});
+
+test('a bare hash in the block stage lists headings and keeps block rows compact', async ({ page }) => {
+  page.on('pageerror', error => { throw error; });
+  await page.goto('/');
+  const editable = page.locator('[data-id="a1"] .block-text').first();
+  await editable.fill('[[');
+  await page.keyboard.type('研究/Zeta/#');
+  const heading = page.locator('.link-suggestion[data-kind="heading"]').filter({ hasText: '目标标题' });
+  await expect(heading).toBeVisible();
+  const height = await heading.evaluate(element => element.getBoundingClientRect().height);
+  expect(height).toBeLessThanOrEqual(24);
+});
+
+test('a heading-type block without Markdown hashes is available to the H1 filter', async ({ page }) => {
+  page.on('pageerror', error => { throw error; });
+  await page.goto('/');
+  await page.evaluate(() => {
+    const block = window.mockHost.docs.get('zeta').blocks.find(item => item.id === 'z1');
+    block.type = 'heading';
+    block.content = { text: '类型标题', html: '类型标题' };
+    window.mockHost.emitLoaded();
+  });
+  const editable = page.locator('[data-id="a1"] .block-text').first();
+  await editable.fill('[[');
+  await page.keyboard.type('研究/Zeta/#类型');
+  await expect(page.locator('.link-suggestion[data-kind="heading"]').filter({ hasText: '类型标题' })).toBeVisible();
 });

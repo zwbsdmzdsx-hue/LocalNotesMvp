@@ -24,13 +24,14 @@ button { cursor: pointer; }
 #status { margin-left: auto; font-size: 12px; color: #667085; white-space: nowrap; }
 .link-suggestions { position: absolute; }
 .link-suggestions { position: absolute; z-index: 100; left: 36px; top: 82px; width: 360px; max-height: 300px; overflow: auto; padding: 5px; background: #fff; border: 1px solid #d0d5dd; border-radius: 8px; box-shadow: 0 12px 30px rgba(16,24,40,.16); }
-.link-suggestion { display: block; width: 100%; min-height: 28px; border: 0; background: transparent; text-align: left; padding: 5px 8px; border-radius: 5px; color: #182230; line-height: 1.25; }
+.link-suggestion { display: block; width: 100%; min-height: 22px; border: 0; background: transparent; text-align: left; padding: 2px 7px; border-radius: 4px; color: #182230; line-height: 1.2; }
 .link-suggestion:hover, .link-suggestion.active { background: #f2f4f7; }
 .link-suggestion strong, .link-suggestion span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .link-suggestion span { margin-top: 1px; color: #667085; font-size: 11px; }
 .link-suggestion[data-kind="target"]:not([data-block-id]) { color: #344054; font-weight: 600; }
-.link-suggestion-block-line { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; color: #344054; font-size: 12px; line-height: 1.45; }
+.link-suggestion-block-line { display: block; height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; color: #344054; font-size: 12px; line-height: 18px; }
 .link-suggestion-block-line strong, .link-suggestion-block-line em, .link-suggestion-block-line mark, .link-suggestion-block-line code { display: inline; margin: 0; font-size: inherit; line-height: inherit; }
+.link-suggestion-block-line p, .link-suggestion-block-line h1, .link-suggestion-block-line h2, .link-suggestion-block-line h3, .link-suggestion-block-line h4, .link-suggestion-block-line h5, .link-suggestion-block-line h6, .link-suggestion-block-line ul, .link-suggestion-block-line ol, .link-suggestion-block-line blockquote { display: inline; margin: 0; padding: 0; font-size: inherit; line-height: inherit; }
 .link-suggestion-preview { max-height: 54px; margin-top: 5px; overflow: hidden; color: #475467; font-size: 11px; line-height: 1.35; white-space: normal; }
 .link-suggestion-preview h1, .link-suggestion-preview h2, .link-suggestion-preview h3, .link-suggestion-preview h4, .link-suggestion-preview h5, .link-suggestion-preview h6 { margin: 0; font-size: 12px; line-height: 1.35; }
 .link-suggestion-preview p, .link-suggestion-preview ul, .link-suggestion-preview ol, .link-suggestion-preview blockquote, .link-suggestion-preview pre { margin: 2px 0; }

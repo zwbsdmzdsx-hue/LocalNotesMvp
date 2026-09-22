@@ -237,6 +237,6 @@ test('restoring columns orders every column top-to-bottom without gaps', async (
     .sort((a, b) => a.position.localeCompare(b.position))
     .map(block => ({ text: block.content.text, position: block.position, group: block.properties.columnGroup })), groupId);
   expect(restored.map(block => block.text)).toEqual(['左列第一行', '左列第二行', '右列第一行', '右列第二行']);
-  expect(restored.map(block => block.position)).toEqual(['00002000', '00003000', '00004000', '00005000']);
+  expect(restored.map(block => Number(block.position)).slice(1).map((position, index) => position - Number(restored[index].position))).toEqual([1000, 1000, 1000]);
   expect(restored.every(block => !block.group)).toBe(true);
 });
