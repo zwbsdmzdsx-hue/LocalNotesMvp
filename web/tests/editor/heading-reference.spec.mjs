@@ -17,9 +17,9 @@ test('heading suggestions preview rendered content and retain the heading sectio
   await expect(link).toHaveAttribute('data-target-block-id', 'z2');
   await expect(link).toHaveAttribute('data-target-scope', 'heading');
   await expect(link).toHaveText('目标标题');
-  await page.getByRole('button', { name: '嵌入实时引用 · 正文直显', exact: true }).click();
-  await expect(page.locator('.embedded-reference')).toContainText('目标标题');
-  await expect(page.locator('.embedded-reference')).toContainText('可搜索正文');
+  await link.click();
+  await expect(page.locator('#reference-sidebar')).toContainText('目标标题');
+  await expect(page.locator('#reference-sidebar')).toContainText('可搜索正文');
 });
 
 test('source mode writes a complete heading wikilink', async ({ page }) => {

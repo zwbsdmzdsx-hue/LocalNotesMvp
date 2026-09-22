@@ -130,25 +130,12 @@ test('legacy rich content converts to Markdown and rich mode can continue editin
   await expect(firstBlock(page)).toHaveAttribute('contenteditable', 'true');
 });
 
-test('embedded references round-trip through Obsidian-style source markers', async ({ page }) => {
+test('ordinary wiki links round-trip through Markdown source without creating reference instances', async ({ page }) => {
   const owner = firstBlock(page);
-  await owner.fill('保留位置 [[');
-  await page.locator('.link-suggestion').filter({ hasText: 'Delta' }).click();
-  await page.getByRole('button', { name: '嵌入实时引用 · 正文直显', exact: true }).click();
-  const embedded = owner.locator('.embedded-reference');
-  await expect(embedded).toBeVisible();
-  const hostId = await embedded.locator('[data-own-block][data-type="reference"]').getAttribute('data-id');
-
   await switchMode(page, 'source');
-  await expect(owner).toContainText(`![[#^${hostId}]]`);
-  await expect(page.locator(`[data-own-block][data-id="${hostId}"]`)).toBeHidden();
-  await switchMode(page, 'preview');
-  await expect(owner.locator('.embedded-reference .reference-row')).toBeVisible();
-
-  await switchMode(page, 'source');
-  await owner.fill('引用标记已删除');
+  await owner.fill('保留位置 [[默认笔记本/Beta#^b1]]');
   await saved(page);
-  expect(await page.evaluate(id => window.mockHost.state('alpha').references.some(reference => reference.hostBlockId === id), hostId)).toBe(false);
-  await switchMode(page, 'preview');
-  await expect(owner.locator('.embedded-reference')).toHaveCount(0);
+  await switchMode(page, 'rich');
+  await expect(owner.locator('.wiki-link')).toHaveAttribute('data-target-id', 'beta');
+  expect(await page.evaluate(() => window.mockHost.state('alpha').references.filter(reference => reference.id !== 'ref1'))).toHaveLength(0);
 });

@@ -10,6 +10,7 @@ export type WorkspaceSnapshot = {
 export type SearchHit = {
   kind: "title" | "block"; documentId: string; documentTitle: string; blockId: string | null; excerpt: string;
 };
+export type CalendarTodo = { documentId: string; blockId: string; createdAt?: string; dueAt?: string };
 export type WorkspaceCommand =
   | { type: "selectNotebook" | "openNotebook" | "closeNotebook" | "removeNotebook" | "selectBookmark" | "removeBookmark" | "removeDocument"; id: string }
   | { type: "renameNotebook" | "renameBookmark" | "renameDocument"; id: string; name: string }
@@ -26,5 +27,6 @@ export interface WorkspaceApi {
   documentTitle(id: string): string;
   outline(): Block[];
   search(query: string, limit?: number): SearchHit[];
+  todoDates(): CalendarTodo[];
   execute(command: WorkspaceCommand): Promise<void>;
 }

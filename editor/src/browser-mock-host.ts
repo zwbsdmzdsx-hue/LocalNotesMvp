@@ -1,9 +1,9 @@
 import { EditorHistory } from "./history";
 import { orderBlockTree } from "./block-tree";
-import type { Notebook, Bookmark, WorkspaceDocument, WorkspaceSnapshot, SearchHit } from "./workspace-api";
+import type { Notebook, Bookmark, WorkspaceDocument, WorkspaceSnapshot, SearchHit, CalendarTodo } from "./workspace-api";
 import type { HostTransport } from "./editor-host-api";
 import { MockSaveStore } from "./mock-save-store";
-import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, StyleScope, MediaKind, DatabaseSource, DatabaseField, DatabaseRecord } from "../../protocol/types";
+import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, StyleScope, MediaKind, DatabaseSource, DatabaseField, DatabaseRecord, GeoLocation } from "../../protocol/types";
 import { parseDql, executeDql } from "./database-query";
 
 const block = (blockId: string, text: string) => ({ id: blockId, parentId: null, position: "00001000", type: "paragraph" as const, content: { text, html: text }, properties: {}, revision: 1 });
@@ -21,8 +21,14 @@ export class BrowserMockHost implements HostTransport {
   private documentHistories = new Map<string, EditorHistory>();
   private databases = new Map<string, { source: DatabaseSource; records: DatabaseRecord[] }>();
   private databaseMutations = new Set<string>();
+  private locations = new Map<string, GeoLocation>();
+  private locationVersion = 0;
+  private locationMutations = new Set<string>();
   private historySnapshot(id: string) {
     const state = structuredClone(this.docs.get(id)!);
+    const workspaceId = state.note.workspaceId;
+    state.locations = [...this.locations.values()].filter(location => location.scope === "global" || location.notebookId === workspaceId);
+    state.locationVersion = this.locationVersion;
     const moves = state.references.map(ref => [ref.id, [...(this.moves.get(ref.id) ?? new Map())]] as [string, Array<[string, { parentId: string | null; position: string }]>]);
     return { state, moves };
   }
@@ -37,7 +43,8 @@ export class BrowserMockHost implements HostTransport {
   notebooks: Notebook[] = [
     { id: "nb-default",   name: "默认笔记本" },
     { id: "nb-research",  name: "研究" },
-    { id: "nb-life",      name: "生活" }
+    { id: "nb-life",      name: "生活" },
+    { id: "nb-diary",     name: "日记" }
   ];
 
   bookmarks: Bookmark[] = [
@@ -46,7 +53,8 @@ export class BrowserMockHost implements HostTransport {
     { id: "bk-projects", notebookId: "nb-default",  name: "项目",     color: "#7C3AED" },
     { id: "bk-sources",  notebookId: "nb-research", name: "参考资料", color: "#EA580C" },
     { id: "bk-notes",    notebookId: "nb-research", name: "笔记",     color: "#0891B2" },
-    { id: "bk-life",     notebookId: "nb-life",     name: "日常",     color: "#DB2777" }
+    { id: "bk-life",     notebookId: "nb-life",     name: "日常",     color: "#DB2777" },
+    { id: "bk-diary",    notebookId: "nb-diary",    name: "日记",     color: "#64748B" }
   ];
 
   documentByBookmark = new Map<string, string[]>([
@@ -55,7 +63,8 @@ export class BrowserMockHost implements HostTransport {
     ["bk-projects", ["epsilon"]],
     ["bk-sources",  ["zeta"]],
     ["bk-notes",    ["eta"]],
-    ["bk-life",     ["theta"]]
+    ["bk-life",     ["theta"]],
+    ["bk-diary",    []]
   ]);
 
   /** 哪些笔记本当前处于打开状态（tab 栏中可见） */
@@ -87,7 +96,7 @@ export class BrowserMockHost implements HostTransport {
         documents: [],
         backlinks: [],
         overrideNotices: [],
-        references: [], databases: [], databaseRecords: {}, systemStyles: [], documentStyles: [], notebookStyles: []
+        references: [], locations: [], locationVersion: 0, databases: [], databaseRecords: {}, systemStyles: [], documentStyles: [], notebookStyles: []
       };
       if (d.id === "alpha") state.blocks.push({ ...block("ar1", ""), type: "reference" });
       this.docs.set(d.id, state);
@@ -105,6 +114,15 @@ export class BrowserMockHost implements HostTransport {
       id: "ref1", hostBlockId: "ar1", targetDocumentId: "beta", targetBlockId: "b1", targetTitle: "Beta",
       mode: "inline", blocks: [block("b1", "Beta 的内容")], overrides: [], hiddenBlockIds: []
     }];
+    const now = new Date().toISOString();
+    this.locations.set("loc-global-guangzhou", {
+      id: "loc-global-guangzhou", scope: "global", name: "广州越秀区", address: "广东省广州市越秀区",
+      latitude: 23.1291, longitude: 113.2644, source: "manual", precision: "district", createdAt: now, updatedAt: now
+    });
+    this.locations.set("loc-default-office", {
+      id: "loc-default-office", scope: "notebook", notebookId: "nb-default", name: "默认办公点", address: "默认笔记本示例位置",
+      latitude: 23.1291, longitude: 113.2644, source: "map", precision: "unknown", createdAt: now, updatedAt: now
+    });
     this.saves = new MockSaveStore(this.docs);
   }
   private allDocuments() {
@@ -306,6 +324,19 @@ export class BrowserMockHost implements HostTransport {
     this.documentByBookmark.set(bookmarkId, list);
     return id;
   }
+
+  todoDates(): CalendarTodo[] {
+    const todos: CalendarTodo[] = [];
+    for (const [documentId, state] of this.docs) {
+      state.blocks.forEach(block => {
+        if (block.type !== "todo") return;
+        const createdAt = block.properties.todoCreatedAt;
+        const dueAt = block.properties.todoDueAt;
+        if (createdAt || dueAt) todos.push({ documentId, blockId: block.id, createdAt, dueAt });
+      });
+    }
+    return todos;
+  }
   moveDocument(id: string, bookmarkId: string, parentId: string | null, index: number) {
     if (!this.titleByDocument.has(id) || !this.documentByBookmark.has(bookmarkId)) return;
     const descendants = new Set<string>(); const pending = [id];
@@ -371,10 +402,19 @@ export class BrowserMockHost implements HostTransport {
     result.backlinks = this.computeBacklinks(documentId);
     result.overrideNotices = this.computeOverrideNotices(documentId);
     const workspaceId = result.note.workspaceId;
+    result.locations = [...this.locations.values()].filter(location => location.scope === "global" || location.notebookId === workspaceId);
+    result.locationVersion = this.locationVersion;
     const visible = [...this.databases.values()].filter(item => !item.source.notebookId || item.source.notebookId === workspaceId);
     result.databases = visible.map(item => structuredClone(item.source));
     result.databaseRecords = Object.fromEntries(visible.map(item => [item.source.id, structuredClone(item.records)]));
     return result;
+  }
+  private restoreVisibleLocations(workspaceId: string | undefined, snapshot: GeoLocation[]) {
+    for (const [id, location] of this.locations) {
+      if (location.scope === "global" || location.notebookId === workspaceId) this.locations.delete(id);
+    }
+    snapshot.forEach(location => this.locations.set(location.id, structuredClone(location)));
+    this.locationVersion += 1;
   }
   private computeBacklinks(targetDocumentId: string): Backlink[] {
     const out: Backlink[] = [];
@@ -602,10 +642,11 @@ export class BrowserMockHost implements HostTransport {
           case "navigateBack": if (this.index > 0) this.index--; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "navigateForward": if (this.index + 1 < this.history.length) this.index++; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "executeCommand": {
-            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; targetScope?: "block" | "heading"; content?: BlockContent; properties?: BlockProperties; style?: StyleSheet; styleId?: string; scope?: StyleScope; databaseId?: string; database?: DatabaseSource; fields?: DatabaseField[]; record?: DatabaseRecord; query?: string };
+            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; targetScope?: "block" | "heading"; content?: BlockContent; properties?: BlockProperties; style?: StyleSheet; styleId?: string; scope?: StyleScope; databaseId?: string; database?: DatabaseSource; fields?: DatabaseField[]; record?: DatabaseRecord; query?: string; location?: GeoLocation; locationId?: string; locationsScope?: "global" | "notebook"; mutationId?: string; expectedLocationVersion?: number };
             const current = this.docs.get(request.sourceDocumentId ?? this.current)!;
             if (!current) throw new Error("文档不存在");
             const databaseWrites = new Set(["create-database", "save-database-schema", "upsert-database-record", "delete-database-record"]);
+            const locationWrites = new Set(["create-location", "update-location", "delete-location"]);
             const mutationId = typeof (payload as Record<string, unknown>).mutationId === "string" ? String((payload as Record<string, unknown>).mutationId) : "";
             const requestedVersion = Number((payload as Record<string, unknown>).clientVersion);
             const mutationKey = `${current.note.id}:${mutationId}`;
@@ -615,6 +656,41 @@ export class BrowserMockHost implements HostTransport {
               if (requestedVersion <= current.note.clientVersion) throw new Error("数据库写入版本已过期，请重新载入");
             }
             const finishDatabaseMutation = () => { current.note.clientVersion += 1; this.databaseMutations.add(mutationKey); };
+            const finishLocationMutation = () => { this.locationVersion += 1; this.locationMutations.add(mutationKey); };
+            if (payload.operation === "list-locations") {
+              const workspaceId = current.note.workspaceId;
+              const locations = [...this.locations.values()].filter(location => location.scope === "global" || location.notebookId === workspaceId);
+              this.respond(request, { state: this.state(current.note.id), result: { locations, locationVersion: this.locationVersion } });
+              break;
+            }
+            if (locationWrites.has(payload.operation ?? "")) {
+              if (!mutationId || !Number.isInteger(Number(payload.expectedLocationVersion))) throw new Error("位置写入缺少 mutationId 或版本");
+              if (this.locationMutations.has(mutationKey)) { this.respond(request, { state: this.state(current.note.id), result: { locations: [...this.locations.values()], locationVersion: this.locationVersion } }); break; }
+              if (Number(payload.expectedLocationVersion) !== this.locationVersion) throw new Error("位置目录已更新，请重新载入");
+              if (payload.operation === "create-location") {
+                const location = structuredClone(payload.location);
+                if (!location?.id || !location.name || !Number.isFinite(location.latitude) || !Number.isFinite(location.longitude)) throw new Error("位置缺少名称或有效坐标");
+                if (location.scope === "notebook") location.notebookId = current.note.workspaceId;
+                else delete location.notebookId;
+                this.locations.set(location.id, { ...location, createdAt: location.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString(), deletedAt: undefined });
+              } else if (payload.operation === "update-location") {
+                const previous = payload.locationId ? this.locations.get(payload.locationId) : undefined;
+                if (!previous) throw new Error("位置不存在");
+                const next = structuredClone(payload.location);
+                if (!next || next.id !== previous.id) throw new Error("位置 ID 不匹配");
+                if (next.scope === "notebook") next.notebookId = current.note.workspaceId;
+                else delete next.notebookId;
+                this.locations.set(next.id, { ...previous, ...next, updatedAt: new Date().toISOString() });
+              } else if (payload.operation === "delete-location") {
+                const previous = payload.locationId ? this.locations.get(payload.locationId) : undefined;
+                if (!previous) throw new Error("位置不存在");
+                this.locations.set(previous.id, { ...previous, deletedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+              }
+              finishLocationMutation();
+              this.documentHistory(current.note.id).record(this.historySnapshot(current.note.id), "更新位置");
+              this.respond(request, { state: this.state(current.note.id), result: { locations: [...this.locations.values()], locationVersion: this.locationVersion } });
+              break;
+            }
             if (payload.operation === "create-database") {
               const id = payload.database?.id ?? `db-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
               const source: DatabaseSource = { id, notebookId: current.note.workspaceId, title: payload.database?.title ?? "新数据库", fields: structuredClone(payload.fields ?? []), recordCount: 0 };
@@ -705,6 +781,7 @@ export class BrowserMockHost implements HostTransport {
               current.blocks = snapshot.state.blocks;
               current.blocks.forEach(b => b.revision = Math.max(b.revision, previous.get(b.id) ?? 0) + 1);
               current.references = snapshot.state.references;
+              this.restoreVisibleLocations(current.note.workspaceId, snapshot.state.locations ?? []);
               this.setDocumentTitle(current.note.id, current.note.title);
               this.respond(request, { state: this.state(current.note.id) });
               break;

@@ -39,11 +39,15 @@ const shell = mountShell(workspace, {
       await host.openDocument(id);
       shell.highlightActiveDocument(id);
     }).catch(editor.showError);
-  }
+  },
+  onLoadDocumentPreview: documentId => host.loadDocument(documentId),
+  onCreateDiary: (documentId, heading) => editor.createDiaryDocument(documentId, heading),
+  onInsertDiaryLink: (documentId, blockId, scope, label) => editor.insertCalendarLink(documentId, blockId, scope, label)
 });
 
 const editor = mountEditor(host, {
   showReferences: () => shell.showReferences(),
+  showLocations: () => shell.showLocations(),
   showHistory: () => shell.showHistory(),
   setDatabaseContext: (visible, activate) => shell.setDatabaseContext(visible, activate),
   updateHistory: model => shell.updateHistory(model)

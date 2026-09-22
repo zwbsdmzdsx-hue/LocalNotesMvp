@@ -271,6 +271,12 @@ button.database-computed-cell:hover { background: #eef4ff; color: #1849a9; }
 .block-menu button.danger { color: #b42318; }
 .block-menu button.danger:hover { background: #fef3f2; }
 .todo-check { margin-top: 9px; accent-color: #175cd3; }
+.todo-dates { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; margin-top: 5px; color: #667085; font-size: 10px; line-height: 1.2; }
+.todo-dates label { display: inline-flex; align-items: center; gap: 2px; }
+.todo-dates input { width: 104px; min-height: 24px; box-sizing: border-box; padding: 2px 4px; border: 1px solid #d0d5dd; border-radius: 4px; background: #fff; color: #475467; font: inherit; }
+.todo-dates input:focus { border-color: #84adff; outline: 2px solid #dbeafe; }
+.todo-dates input:disabled { color: #667085; background: #f8fafc; }
+[data-editor-mode-state="source"] .todo-dates { display: none; }
 .delete-block { width: 24px; height: 24px; margin-top: 3px; border: 0; border-radius: 4px; color: transparent; background: transparent; padding: 0; }
 .block-row:hover .delete-block, .delete-block:focus { color: #98a2b3; }
 .delete-block:hover { color: #d92d20; background: #fef3f2; }
@@ -355,6 +361,47 @@ mark { background: #fff2a8; color: inherit; }
 .sidebar-tab { flex: 1 0 0; min-height: 30px; border: 0; background: transparent; border-radius: 4px; color: #667085; font-size: 14px; padding: 4px 0; }
 .sidebar-tab:hover { background: #f2f4f7; color: #344054; }
 .sidebar-tab.active { background: #eaf2ff; color: #175cd3; }
+.calendar-head, .calendar-preview-head, .calendar-month-nav { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.calendar-head { padding: 2px 2px 10px; color: #344054; }
+.calendar-create, .calendar-insert-link { border: 1px solid #d0d5dd; border-radius: 4px; background: #fff; color: #175cd3; padding: 4px 7px; font-size: 11px; }
+.calendar-create:hover, .calendar-insert-link:hover:not(:disabled) { background: #eaf2ff; border-color: #98b9f4; }
+.calendar-insert-link:disabled { color: #98a2b3; cursor: not-allowed; }
+.calendar-years { display: flex; gap: 3px; overflow-x: auto; padding: 0 0 8px; }
+.calendar-years button { border: 0; border-radius: 4px; background: transparent; color: #667085; padding: 3px 7px; font-size: 11px; }
+.calendar-years button.active { background: #eaf2ff; color: #175cd3; font-weight: 650; }
+.calendar-month-nav { border-top: 1px solid #f2f4f7; padding: 8px 0 6px; color: #475467; font-size: 12px; }
+.calendar-month-nav button { width: 24px; height: 24px; border: 0; border-radius: 4px; background: transparent; color: #667085; font-size: 18px; }
+.calendar-month-nav button:hover { background: #f2f4f7; }
+.calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 2px; }
+.calendar-weekday { color: #98a2b3; font-size: 10px; text-align: center; padding: 2px 0 4px; }
+.calendar-day { position: relative; min-height: 28px; border: 0; border-radius: 4px; background: transparent; color: #98a2b3; font-size: 11px; }
+.calendar-day.has-calendar-activity { color: #344054; }
+.calendar-day:hover:not(:disabled) { background: #f2f4f7; }
+.calendar-day:disabled { opacity: .2; }
+.calendar-day.selected { background: #175cd3; color: #fff; font-weight: 650; }
+.calendar-dots { position: absolute; left: 50%; bottom: 2px; display: flex; align-items: center; gap: 2px; transform: translateX(-50%); }
+.calendar-dot { display: block; width: 3px; height: 3px; border-radius: 50%; }
+.calendar-dot-diary { background: #16a34a; }
+.calendar-dot-created { background: #175cd3; }
+.calendar-dot-due { background: #f04438; }
+.calendar-day.selected .calendar-dot-diary { background: #86efac; }
+.calendar-day.selected .calendar-dot-created { background: #b2ddff; }
+.calendar-day.selected .calendar-dot-due { background: #fca5a5; }
+.calendar-preview { margin-top: 12px; border-top: 1px solid #eaecf0; padding-top: 10px; }
+.calendar-preview-head { color: #344054; font-size: 12px; margin-bottom: 7px; }
+.calendar-preview-block { display: block; width: 100%; border: 0; border-left: 2px solid transparent; background: transparent; color: #475467; text-align: left; padding: 5px 5px 5px 8px; font-size: 12px; line-height: 1.45; overflow: hidden; }
+.calendar-preview-block:hover { background: #f8fafc; }
+.calendar-preview-block.active { border-left-color: #175cd3; background: #f2f4f7; }
+.calendar-preview-block h1, .calendar-preview-block h2, .calendar-preview-block h3 { margin: 0; font-size: 13px; }
+.calendar-preview-block p { margin: 0; }
+.calendar-empty { color: #98a2b3; font-size: 11px; line-height: 1.5; margin: 4px 0; }
+.calendar-create-popup { position: fixed; z-index: 1200; left: 50%; top: 42%; width: min(320px, calc(100vw - 32px)); display: grid; gap: 9px; padding: 14px; border: 1px solid #d0d5dd; border-radius: 7px; background: #fff; box-shadow: 0 12px 32px rgba(16, 24, 40, .18); transform: translate(-50%, -50%); }
+.calendar-create-popup strong { color: #344054; font-size: 14px; }
+.calendar-create-popup > span { color: #667085; font-size: 11px; }
+.calendar-create-popup input { width: 100%; box-sizing: border-box; border: 1px solid #d0d5dd; border-radius: 4px; padding: 7px 8px; color: #344054; }
+.calendar-create-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.calendar-create-actions button { border: 1px solid #d0d5dd; border-radius: 4px; background: #fff; color: #475467; padding: 5px 10px; }
+.calendar-create-actions button.primary { border-color: #175cd3; background: #175cd3; color: #fff; }
 .sidebar-body { flex: 1 1 0; min-height: 0; overflow: auto; padding: 4px 0; }
 .sidebar-foot { flex: 0 0 auto; display: flex; justify-content: flex-end; padding: 4px 6px; border-top: 1px solid #eaecf0; background: #fff; }
 .sidebar-foot button { border: 0; background: transparent; color: #667085; border-radius: 4px; padding: 4px 8px; font-size: 14px; cursor: pointer; }
@@ -460,6 +507,8 @@ body.right-collapsed .sidebar-right .sidebar-tabs { writing-mode: vertical-rl; f
 .reference-title:hover, .sidebar-reference-entry:hover { background: #f6f7f8; color: #344054; }
 .reference-expand { border: 0; padding: 0; width: 18px; height: 24px; background: transparent; color: #98a2b3; }
 .reference-expand:hover { background: #f2f4f7; }
+.reference-mode-menu { flex: 0 0 auto; min-height: 24px; padding: 2px 7px; border: 1px solid #d0d5dd; border-radius: 4px; background: #fff; color: #667085; cursor: pointer; font-size: 11px; white-space: nowrap; }
+.reference-mode-menu:hover, .reference-mode-menu:focus-visible { border-color: #84adff; background: #eff6ff; color: #175cd3; outline: none; }
 .reference-card.is-expanded > .reference-card-summary .reference-title { font-size: 11px; color: #98a2b3; text-decoration: none; }
 .reference-row { padding-right: 0; display: flex; align-items: flex-start; gap: 2px; }
 .block-row.embedded-only > .grip {
@@ -506,6 +555,24 @@ body.right-collapsed .sidebar-right .sidebar-tabs { writing-mode: vertical-rl; f
 .sidebar-preview-heading { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; color: #667085; font-size: 12px; }
 .sidebar-preview-heading span { flex: 1; overflow-wrap: anywhere; }
 .sidebar-preview-heading button { background: none; border: 0; color: #667085; padding: 3px; }
+.sidebar-preview-heading .link-display-mode {
+  flex: 0 0 auto;
+  min-height: 26px;
+  padding: 3px 8px;
+  border: 1px solid #d0d5dd;
+  border-radius: 4px;
+  background: #fff;
+  color: #475467;
+  cursor: pointer;
+  font-size: 11px;
+}
+.sidebar-preview-heading .link-display-mode:hover,
+.sidebar-preview-heading .link-display-mode:focus-visible {
+  border-color: #84adff;
+  background: #eff6ff;
+  color: #175cd3;
+  outline: none;
+}
 .linked-reference-heading { margin: 12px 0 4px; color: #667085; font-size: 11px; font-weight: 650; }
 .linked-reference-entry { padding: 7px 0; border-top: 1px solid #f2f4f7; cursor: pointer; }
 .linked-reference-entry .reference-title { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -966,6 +1033,23 @@ body.right-collapsed .sidebar-right .sidebar-tabs { writing-mode: vertical-rl; f
   color: #6941c6;
   text-decoration: none;
 }
+.relations-slot .linked-reference-entry .linked-reference-summary {
+  border-bottom: 0;
+}
+.relations-slot .linked-reference-entry .linked-reference-summary .reference-title {
+  flex: 1;
+  min-width: 0;
+}
+.relations-slot .linked-reference-entry .linked-reference-excerpt {
+  margin: 0;
+  padding: 0 10px 8px;
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.45;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .relations-slot .reference-card.sidebar .reference-expand {
   border: 1px solid #d6bbfb;
   width: 24px;
@@ -980,11 +1064,13 @@ body.right-collapsed .sidebar-right .sidebar-tabs { writing-mode: vertical-rl; f
 }
 .relations-slot .reference-card.sidebar .reference-mode-menu {
   border: 1px solid #d6bbfb;
-  width: 24px;
+  width: auto;
+  min-width: 24px;
   height: 24px;
-  padding: 0;
+  padding: 0 7px;
   border-radius: 4px;
-  font-size: 12px;
+  font-size: 11px;
+  white-space: nowrap;
   color: #6941c6;
   background: #fff;
   margin-left: auto;
@@ -994,6 +1080,41 @@ body.right-collapsed .sidebar-right .sidebar-tabs { writing-mode: vertical-rl; f
   border-color: #9b72e8;
   color: #5635b0;
 }
+
+/* Shared location catalog and read-only location blocks. */
+.location-manager-head, .location-editor-head, .location-body-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.location-manager-head, .location-editor-head { margin: 3px 0 9px; color: #344054; font-size: 13px; }
+.location-manager-head button, .location-editor-head button, .location-card-actions button, .location-editor-tools button, .location-editor-actions button { border: 1px solid #d0d5dd; border-radius: 4px; background: #fff; color: #475467; padding: 4px 7px; font-size: 11px; cursor: pointer; }
+.location-manager-head button:hover, .location-editor-head button:hover, .location-card-actions button:hover, .location-editor-tools button:hover, .location-editor-actions button:hover { border-color: #84adff; background: #eff6ff; color: #175cd3; }
+.location-card-actions button.danger { color: #b42318; }
+.location-card-actions button.danger:hover { border-color: #fda29b; background: #fef3f2; color: #b42318; }
+.location-scopes { display: flex; gap: 4px; margin-bottom: 9px; border-bottom: 1px solid #eaecf0; }
+.location-scopes button { border: 0; border-bottom: 2px solid transparent; background: transparent; color: #667085; padding: 5px 7px; font-size: 11px; cursor: pointer; }
+.location-scopes button.active { border-bottom-color: #175cd3; color: #175cd3; font-weight: 650; }
+.location-card { margin: 7px 0; padding: 8px 9px; border: 1px solid #e4e7ec; border-radius: 6px; background: #fff; }
+.location-card.is-deleted { opacity: .65; }
+.location-card-title { display: flex; align-items: center; gap: 5px; color: #344054; font-size: 12px; }
+.location-pin-icon { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; font-size: 15px; }
+.location-card-address, .location-card-coordinates, .location-body-address, .location-body-coordinates { margin: 4px 0 0; overflow: hidden; color: #667085; font-size: 11px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.location-card-coordinates, .location-body-coordinates { color: #98a2b3; font-family: "Cascadia Code", Consolas, monospace; font-size: 10px; }
+.location-card-actions, .location-editor-tools, .location-editor-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.location-card-actions button:first-child, .location-editor-actions .primary { border-color: #175cd3; background: #175cd3; color: #fff; }
+.location-deleted-heading { margin: 14px 0 4px; color: #98a2b3; font-size: 11px; }
+.location-empty, .location-missing { margin: 7px 0; color: #98a2b3; font-size: 11px; line-height: 1.5; }
+.location-editor-form { display: grid; gap: 8px; }
+.location-field { display: grid; gap: 3px; color: #667085; font-size: 10px; }
+.location-field input, .location-field select { width: 100%; box-sizing: border-box; min-height: 28px; padding: 4px 6px; border: 1px solid #d0d5dd; border-radius: 4px; color: #344054; background: #fff; font: inherit; font-size: 11px; }
+.location-field input:focus, .location-field select:focus { border-color: #84adff; outline: 2px solid #dbeafe; }
+.location-coordinate-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.location-editor-map, .location-body-map { width: 100%; min-height: 190px; overflow: hidden; border: 1px solid #e4e7ec; border-radius: 5px; background: #f8fafc; }
+.location-body-map { min-height: 150px; margin-top: 8px; }
+.location-map-canvas { min-height: inherit; }
+.location-map-pin { display: grid; place-items: center; width: 24px !important; height: 24px !important; font-size: 22px; line-height: 24px; filter: drop-shadow(0 1px 2px rgba(16,24,40,.35)); }
+.location-source { min-height: 70px; margin: 0; padding: 8px 10px; overflow: auto; border: 1px solid #e4e7ec; border-radius: 5px; background: #f8fafc; color: #344054; font: 12px/1.55 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; }
+.location-card-body { width: min(100%, 620px); margin: 0; padding: 10px 12px; border-left: 3px solid #f04438; border-radius: 0 7px 7px 0; background: #fffafa; }
+.location-card-body.is-deleted { border-left-color: #98a2b3; background: #f8fafc; }
+.location-body-head { justify-content: flex-start; color: #344054; font-size: 16px; }
+.location-body-head .location-pin-icon { font-size: 20px; }
 /* Inline-detach button on the card summary — removes the reference but keeps its
    content as plain text. Subtle styling so it doesn't compete with expand/menu. */
 .reference-detach {

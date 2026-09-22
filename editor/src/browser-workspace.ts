@@ -32,6 +32,7 @@ export function createBrowserWorkspace(store: BrowserMockHost, session: {
     documentTitle: id => store.getDocumentTitle(id),
     outline: () => structuredClone(store.docs.get(store.current)?.blocks ?? []),
     search: (query, limit) => store.searchDocuments(query, limit),
+    todoDates: () => store.todoDates(),
     execute(command) {
       const task = tail.catch(() => undefined).then(async () => {
         await session.flush();

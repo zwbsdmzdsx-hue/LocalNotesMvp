@@ -5,10 +5,12 @@ import type { HistoryModel } from "./history";
 import { orderBlockTree } from "./block-tree";
 import { markdownFromContent, markdownFromHtml, plainTextFromContent, renderMarkdown } from "./markdown";
 import { parseDql, executeDql } from "./database-query";
+import { LocationManager, renderLocationMap } from "./location-manager";
 
 // The existing renderer and editing operations are shared by browser and desktop.
 export function mountEditor(host: EditorHostApi, ui: {
   showReferences?(): void;
+  showLocations?(): void;
   showHistory?(): void;
   setDatabaseContext?(visible: boolean, activate?: boolean): void;
   updateHistory?(model: HistoryModel): void;
@@ -34,6 +36,7 @@ const referenceSidebarPanel = getSlot("reference-sidebar") as HTMLDivElement;
 const commentsPanel = getSlot("comments") as HTMLDivElement;
 const stylesPanel = getSlot("styles") as HTMLDivElement;
 const databasesPanel = getSlot("databases") as HTMLDivElement;
+const locationsPanel = getSlot("locations") as HTMLDivElement;
 const editorElement = document.querySelector<HTMLElement>(".editor")!;
 type EditorMode = "rich" | "source" | "preview";
 let editorMode = (localStorage.getItem("lnm-editor-mode") as EditorMode | null) ?? "rich";
@@ -41,6 +44,13 @@ if (!["rich", "source", "preview"].includes(editorMode)) editorMode = "rich";
 let stylePanelScope: "system" | "document" | "notebook" = "document";
 // The shell owns section visibility and tab selection. The core renders slot contents only.
 let state: EditorState | null = null;
+const locationManager = new LocationManager({
+  panel: locationsPanel,
+  getState: () => state ? { locations: state.locations ?? [], locationVersion: state.locationVersion ?? 0, notebookId: state.note.workspaceId } : null,
+  execute: (command, label) => executeLocationCommand(command, label).then(() => undefined),
+  insert: locationId => insertLocationBlock(locationId),
+  onError: showError
+});
 let mutationVersion = 0;
 let inFlightMutation: SaveMutation | null = null;
 let queuedMutation: SaveMutation | null = null;
@@ -54,6 +64,7 @@ let editTarget: EventTarget | null = null;
 let editTime = 0;
 const saveDrainWaiters: Array<() => void> = [];
 let activeEditable: HTMLElement | null = null;
+let lastEditorCaret: { editable: HTMLElement; range: Range } | null = null;
 let activeBlock: HTMLElement | null = null;
 // Keep the last valid rich-text range while the style panel is clicked. Browsers may
 // collapse the native selection when focus moves to a sidebar button, even when the
@@ -463,6 +474,14 @@ function rememberStyleSelection() {
   const finishOwn = finishEditable.closest<HTMLElement>("[data-own-block]");
   if (!startOwn?.dataset.id || !finishOwn?.dataset.id) return;
   styleSelection = { editable: startEditable, endEditable: finishEditable, range, blockId: startOwn.dataset.id, endBlockId: finishOwn.dataset.id, start, end };
+}
+
+function rememberEditorCaret() {
+  const selection = window.getSelection();
+  if (!selection?.rangeCount || !selection.isCollapsed || !selection.anchorNode) return;
+  const editable = editableForSelectionNode(selection.anchorNode);
+  if (!editable || !editable.matches(".block-text[contenteditable='true'], .block-text.markdown-source")) return;
+  lastEditorCaret = { editable, range: selection.getRangeAt(0).cloneRange() };
 }
 function applyStyleToSelection(style: StyleSheet) {
   if (!style.enabled) { saveStatus.textContent = "请先启用这个样式"; return; }
@@ -882,6 +901,7 @@ function renderAllPanels() {
   renderComments();
   renderStyles();
   renderDatabases();
+  locationManager.render();
   applyManagedStyles();
   if (openCommentBlockId) renderOpenCommentPopover();
   titleInput.value = state.note.title;
@@ -947,6 +967,10 @@ function syncBlockSurface() {
       const existingText = existing.querySelector<HTMLElement>(":scope > .block-row > .block-text");
       if (existingText) existingText.style.textAlign = block.properties.textAlign ?? "";
       syncBlockCommentBubble(existing, block);
+      if (block.type === "location" && existing.dataset.locationSignature !== locationSignature(block) && !document.activeElement?.closest(".location-source")) {
+        existing.querySelector<HTMLElement>(":scope > .block-row")?.replaceWith(createLocationRow(block));
+        existing.dataset.locationSignature = locationSignature(block);
+      }
       // For reference-type shells, the inner card may need re-rendering when the underlying
       // reference's structure changed (e.g. blocks hidden/added/overridden). We replace the
       // inner card only when its row signature differs from current state — typing inside a
@@ -1038,6 +1062,45 @@ function renderReferenceBody(reference: ReferenceInstance | undefined, mode: Ref
   return card;
 }
 
+function locationForBlock(block: Block) {
+  return state?.locations?.find(location => location.id === block.properties.locationId);
+}
+function locationSignature(block: Block) {
+  const location = locationForBlock(block);
+  return JSON.stringify([editorMode, block.properties.locationId ?? "", block.properties.locationLabelOverride ?? "", location?.updatedAt ?? "", location?.deletedAt ?? ""]);
+}
+
+function renderLocationCard(block: Block) {
+  const location = locationForBlock(block);
+  const card = document.createElement("figure");
+  card.className = `location-card-body${location?.deletedAt ? " is-deleted" : ""}`;
+  card.setAttribute("aria-label", location ? `位置：${location.name}` : "位置已删除");
+  const head = document.createElement("div"); head.className = "location-body-head";
+  const icon = document.createElement("span"); icon.className = "location-pin-icon"; icon.textContent = "📍";
+  const title = document.createElement("strong"); title.textContent = block.properties.locationLabelOverride || location?.name || "位置已删除";
+  head.append(icon, title); card.append(head);
+  if (!location || location.deletedAt) {
+    const missing = document.createElement("p"); missing.className = "location-missing"; missing.textContent = location ? "此位置已删除，可在地图管理中恢复" : `找不到位置 ${block.properties.locationId ?? ""}`; card.append(missing);
+    return card;
+  }
+  const address = document.createElement("p"); address.className = "location-body-address"; address.textContent = location.address || "未填写地址";
+  const coords = document.createElement("p"); coords.className = "location-body-coordinates"; coords.textContent = `${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`;
+  const map = document.createElement("div"); map.className = "location-body-map";
+  card.append(address, coords, map);
+  renderLocationMap(map, location);
+  return card;
+}
+
+function createLocationRow(block: Block) {
+  const row = document.createElement("div"); row.className = "block-row location-row";
+  const grip = document.createElement("button"); grip.type = "button"; grip.className = "grip"; grip.setAttribute("aria-label", "位置块菜单"); grip.title = "位置块菜单"; grip.draggable = editorMode !== "preview"; grip.textContent = "⠿";
+  if (editorMode === "source") {
+    const source = document.createElement("pre"); source.className = "location-source"; source.contentEditable = "plaintext-only"; source.spellcheck = false; source.textContent = `\`\`\`localnotes-location\nid: ${block.properties.locationId ?? ""}\nlabel: ${block.properties.locationLabelOverride ?? ""}\n\`\`\``; source.addEventListener("input", () => scheduleDocumentSave()); row.append(grip, source);
+  } else row.append(grip, renderLocationCard(block));
+  const remove = document.createElement("button"); remove.type = "button"; remove.className = "delete-block"; remove.title = "删除位置块"; remove.textContent = "×"; remove.disabled = editorMode === "preview"; remove.onclick = () => removeOwnBlock(row.closest<HTMLElement>("[data-own-block]"));
+  row.append(remove); return row;
+}
+
 /** Compact representation of a reference's currently visible rows. Includes mode, hidden
  * list, overrides fingerprint, and any visible row ids/parents/positions. Used by both
  * syncBlockSurface and renderRelations to decide whether to reuse existing DOM or rebuild.
@@ -1098,11 +1161,14 @@ function renderOwnBlockShell(block: Block): HTMLElement {
         summary.append(delBtn);
       }
     }
+  } else if (block.type === "location") {
+    shell.append(createLocationRow(block));
   } else if (block.type === "database_table" || block.type === "data_view") {
     shell.append(createDatabaseRow(block));
   } else {
     shell.append(createEditableRow(block));
   }
+  if (block.type === "location") shell.dataset.locationSignature = locationSignature(block);
   shell.addEventListener("pointerdown", () => activateOwnBlock(shell, true));
   shell.addEventListener("focusin", () => activateOwnBlock(shell, true));
   syncBlockCommentBubble(shell, block);
@@ -1133,6 +1199,7 @@ function blockCommentSummary(block: Block) {
   const content = plainTextFromContent(block.content).replace(/\s+/g, " ").trim();
   if (content) return content.length > 54 ? `${content.slice(0, 54)}…` : content;
   if (block.type === "media") return block.content.media?.name || "媒体块";
+  if (block.type === "location") return state?.locations?.find(location => location.id === block.properties.locationId)?.name || "位置块";
   if (block.type === "database_table") return "数据库表";
   if (block.type === "data_view") return "DQL 查询";
   if (block.type === "reference") return "引用块";
@@ -1607,6 +1674,20 @@ function executeDatabaseCommand(command: { operation: string; [key: string]: unk
   commandTail = task.then(() => undefined, error => { commandFailure = error; showError(error); });
   return task;
 }
+function executeLocationCommand(command: { operation: string; [key: string]: unknown }, sourceType: string) {
+  const owner = state?.note.id;
+  if (!owner) return Promise.reject(new Error("文档尚未载入"));
+  const previous = commandTail;
+  const task = previous.catch(() => undefined).then(async () => {
+    await new Promise<void>(resolve => runAfterSaveDrain(resolve));
+    if (!state || state.note.id !== owner) throw new Error("文档已切换，请重试位置操作。");
+    const result = await host.executeCommand({ ...command, mutationId: newId(), expectedLocationVersion: state.locationVersion ?? 0 }, owner);
+    applyServerState(result.state, sourceType);
+    return result;
+  });
+  commandTail = task.then(() => undefined, error => { commandFailure = error; showError(error); });
+  return task;
+}
 async function flush() {
   if (saveFailure) throw new Error(saveFailure);
   await new Promise<void>(resolve => runAfterSaveDrain(resolve));
@@ -1833,6 +1914,33 @@ function contentFromMarkdown(source: string, fallback: BlockContent): BlockConte
   return { ...editableContent(container, fallback), markdown: source.replace(/\r\n?/g, "\n") };
 }
 
+/**
+ * Todo blocks have one canonical data representation (checked + body), while
+ * their source representation uses the standard GFM task marker. Keep the
+ * marker out of the rendered body so rich/preview modes do not show a second
+ * checkbox for the same block.
+ */
+function todoBodyMarkdown(content: BlockContent) {
+  const source = markdownFromContent(content).replace(/\r\n?/g, "\n");
+  return source.replace(/^\s*[-*+]\s+\[[ xX]\]\s?/, "");
+}
+
+function todoMarkdownFromContent(content: BlockContent) {
+  const body = todoBodyMarkdown(content);
+  return `- [${content.checked ? "x" : " "}]${body ? ` ${body}` : ""}`;
+}
+
+function contentFromTodoMarkdown(source: string, fallback: BlockContent): BlockContent {
+  const normalized = source.replace(/\r\n?/g, "\n");
+  const firstLineEnd = normalized.indexOf("\n");
+  const firstLine = firstLineEnd < 0 ? normalized : normalized.slice(0, firstLineEnd);
+  const marker = firstLine.match(/^\s*[-*+]\s+\[([ xX])\]\s?(.*)$/);
+  const checked = marker ? marker[1].toLowerCase() === "x" : (fallback.checked ?? false);
+  const body = marker ? [marker[2], ...normalized.split("\n").slice(1)].join("\n") : normalized;
+  const content = contentFromMarkdown(body, fallback);
+  return { ...content, checked, markdown: body };
+}
+
 function contentFromRichEditable(editable: HTMLElement, fallback: BlockContent): BlockContent {
   if (editable.dataset.originalHtml === editable.innerHTML) return fallback;
   resolveWikiTargets(editable, fallback.links);
@@ -1875,6 +1983,22 @@ function linkDestination(element: EventTarget | null): LinkDestination | null {
   const documentId = anchor.dataset.targetId ?? state.documents.find(item =>
     item.title === rawTitle || item.title === leafTitle || item.path === rawTitle || item.path?.endsWith(`/${rawTitle}`))?.id;
   return documentId ? { documentId, blockId: anchor.dataset.targetBlockId, targetScope: anchor.dataset.targetScope as ReferenceTargetScope | undefined, referenceId: anchor.dataset.referenceId, anchor } : null;
+}
+
+function ordinaryLinkFromDestination(target: LinkDestination): OrdinaryLinkSidebarEntry | null {
+  const sourceBlockId = target.anchor.dataset.sourceBlockId
+    ?? target.anchor.closest<HTMLElement>("[data-own-block]")?.dataset.id;
+  if (!sourceBlockId) return null;
+  const source = state?.blocks.find(block => block.id === sourceBlockId);
+  return {
+    key: `${sourceBlockId}:${target.documentId}:${target.blockId ?? ""}`,
+    sourceBlockId,
+    documentId: target.documentId,
+    blockId: target.blockId,
+    targetScope: target.targetScope,
+    label: target.anchor.textContent?.trim() || state?.documents.find(document => document.id === target.documentId)?.title || target.documentId,
+    excerpt: source?.content.text ?? ""
+  };
 }
 function dismissPreview() {
   clearTimeout(previewTimer); previewSequence++;
@@ -1946,7 +2070,9 @@ function readOnlyProjection(reference: ReferenceInstance) {
     const content = override?.patch.content ?? block.content;
     const paragraph = document.createElement("div");
     paragraph.className = "preview-block";
-    if (block.type === "database_table" || block.type === "data_view") {
+    if (block.type === "location") {
+      paragraph.append(renderLocationCard(block));
+    } else if (block.type === "database_table" || block.type === "data_view") {
       paragraph.append(renderDatabaseTablePreview(block));
     } else {
       paragraph.innerHTML = content.markdown !== undefined
@@ -1977,18 +2103,24 @@ async function showLinkPreview(target: LinkDestination) {
 function renderSidebarPreview(reference: ReferenceInstance, target: LinkDestination) {
   const header = document.createElement("div"); header.className = "sidebar-preview-heading";
   const title = document.createElement("span"); title.textContent = reference.targetTitle;
-  const close = document.createElement("button"); close.textContent = "×"; close.setAttribute("aria-label", "关闭分栏");
-  close.onclick = () => { sidebarLink = null; sidebarSequence++; renderRelations(); };
-  const embed = document.createElement("button"); embed.textContent = "嵌入正文";
-  embed.onclick = () => {
-    if (target.referenceId) {
+  const mode = document.createElement("button");
+  mode.type = "button";
+  mode.className = "link-display-mode";
+  mode.textContent = "显示方式";
+  mode.setAttribute("aria-label", "引用显示方式");
+  mode.title = "选择引用显示方式";
+  const ordinaryLink = !target.referenceId ? ordinaryLinkFromDestination(target) : null;
+  if (ordinaryLink) {
+    mode.onclick = event => {
+      event.stopPropagation();
       sidebarLink = null;
       sidebarSequence++;
-      const current = state?.references.find(item => item.id === target.referenceId);
-      if (current) setReferenceMode(current, "inline");
-    } else createReferenceForTarget(target.documentId, target.blockId, "inline", target.anchor, target.targetScope);
-  };
-  header.append(title, embed, close);
+      showOrdinaryLinkModeMenu(mode, ordinaryLink);
+    };
+  } else mode.hidden = true;
+  const close = document.createElement("button"); close.textContent = "×"; close.setAttribute("aria-label", "关闭分栏");
+  close.onclick = () => { sidebarLink = null; sidebarSequence++; renderRelations(); };
+  header.append(title, mode, close);
   referenceSidebarPanel.replaceChildren(header, target.referenceId ? renderReference(reference, true) : readOnlyProjection(reference));
 }
 
@@ -2045,7 +2177,8 @@ document.addEventListener("contextmenu", event => {
   event.preventDefault();
   const instance = state?.references.find(item => item.id === target.referenceId);
   if (instance) showReferenceMenu(target.anchor, undefined, instance);
-  else showLinkChoiceMenu(target.anchor, { id: target.documentId, blockId: target.blockId, scope: target.targetScope, label: target.anchor.textContent ?? "链接" });
+  // Ordinary [[...]] links are read-only navigation targets. New live
+  // reference instances are not created from a secondary context menu.
 });
 document.addEventListener("keydown", event => { if (event.key === "Escape") dismissPreview(); });
 
@@ -2448,8 +2581,21 @@ function focusBlock(blockId: string) {
   }, 50);
 }
 
+function todayIsoDate() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
 function createBlock(type: BlockType = "paragraph", parentId: string | null = null): Block {
-  return { id: newId(), parentId, position: "", type, content: { text: "", html: "", markdown: "", checked: false }, properties: {}, revision: 1 };
+  return {
+    id: newId(),
+    parentId,
+    position: "",
+    type,
+    content: { text: "", html: "", markdown: "", checked: false },
+    properties: type === "todo" ? { todoCreatedAt: todayIsoDate() } : {},
+    revision: 1
+  };
 }
 
 function removeOwnBlock(shell: HTMLElement | null) {
@@ -2466,6 +2612,10 @@ function removeOwnBlock(shell: HTMLElement | null) {
     const reference = state?.references.find(item => item.hostBlockId === shell.dataset.id);
     if (reference) removedReferenceIds.add(reference.id);
   }
+  // A [[...]] link can be promoted to a reference instance while its host
+  // remains an ordinary paragraph. Deleting that host must remove the
+  // promoted instance as well, otherwise the sidebar keeps a dead card.
+  state?.references.filter(item => item.hostBlockId === shell.dataset.id).forEach(reference => removedReferenceIds.add(reference.id));
   state?.blocks.filter(block => block.type === "reference" && block.parentId === shell.dataset.id).forEach(block => {
     const reference = state?.references.find(item => item.hostBlockId === block.id);
     if (reference) removedReferenceIds.add(reference.id);
@@ -2532,25 +2682,46 @@ function createEditableRow(block: Block) {
   }
   row.className = "block-row";
   const checkbox = block.type === "todo" ? `<input class="todo-check" type="checkbox" ${block.content.checked ? "checked" : ""}>` : "";
-  row.innerHTML = `<button type="button" class="grip" aria-label="块菜单" draggable="${editorMode !== "preview"}">⠿</button>${checkbox}<div class="block-text ${block.type === "heading" ? "heading" : ""}"></div><button class="delete-block" title="删除块">×</button>`;
+  const todoDates = block.type === "todo"
+    ? `<span class="todo-dates" aria-label="待办日期">
+        <label title="记录创建日期"><span>创建</span><input class="todo-created-date" type="date" aria-label="记录创建日期"></label>
+        <label title="目标完成日期"><span>完成</span><input class="todo-due-date" type="date" aria-label="目标完成日期"></label>
+      </span>`
+    : "";
+  row.innerHTML = `<button type="button" class="grip" aria-label="块菜单" draggable="${editorMode !== "preview"}">⠿</button>${checkbox}<div class="block-text ${block.type === "heading" ? "heading" : ""}"></div>${todoDates}<button class="delete-block" title="删除块">×</button>`;
   const editable = row.querySelector<HTMLElement>(".block-text")!;
+  const todoCheckbox = row.querySelector<HTMLInputElement>(".todo-check");
+  const todoCreatedDate = row.querySelector<HTMLInputElement>(".todo-created-date");
+  const todoDueDate = row.querySelector<HTMLInputElement>(".todo-due-date");
+  if (todoCreatedDate) todoCreatedDate.value = block.properties.todoCreatedAt ?? "";
+  if (todoDueDate) todoDueDate.value = block.properties.todoDueAt ?? "";
+  if (block.type === "todo" && editorMode === "source") row.querySelector<HTMLElement>(".todo-dates")!.hidden = true;
+  if (editorMode === "preview") {
+    todoCreatedDate?.setAttribute("disabled", "");
+    todoDueDate?.setAttribute("disabled", "");
+  }
+  if (editorMode === "source" && todoCheckbox) todoCheckbox.hidden = true;
   if (editorMode === "source") {
     editable.classList.add("markdown-source");
     editable.contentEditable = "plaintext-only";
     editable.spellcheck = false;
-    editable.textContent = markdownFromContent(block.content);
+    editable.textContent = block.type === "todo"
+      ? todoMarkdownFromContent(block.content)
+      : markdownFromContent(block.content);
   } else if (editorMode === "preview") {
     editable.classList.add("markdown-preview");
-    editable.innerHTML = block.content.markdown !== undefined
-      ? markdownHtml(block.content.markdown, block.content.links)
+    const source = block.type === "todo" ? todoBodyMarkdown(block.content) : block.content.markdown;
+    editable.innerHTML = source !== undefined
+      ? markdownHtml(source, block.content.links)
       : renderLinkedHtml(block.content.html || escapeText(block.content.text));
   } else {
     editable.classList.add("rich-editor");
     editable.contentEditable = "true";
-    editable.innerHTML = block.content.html
+    const source = block.type === "todo" ? todoBodyMarkdown(block.content) : block.content.markdown;
+    editable.innerHTML = block.content.html && block.type !== "todo"
       ? renderLinkedHtml(block.content.html)
-      : block.content.markdown !== undefined
-        ? markdownHtml(block.content.markdown, block.content.links)
+      : source !== undefined
+        ? markdownHtml(source, block.content.links)
         : escapeText(block.content.text);
     editable.dataset.originalHtml = editable.innerHTML;
   }
@@ -2565,8 +2736,8 @@ function createEditableRow(block: Block) {
       scheduleDocumentSave();
     });
     editable.addEventListener("keydown", handleBlockKeydown);
-    row.querySelector("input")?.addEventListener("change", () => scheduleDocumentSave(0));
-  } else row.querySelector<HTMLInputElement>("input")?.setAttribute("disabled", "");
+    row.querySelectorAll<HTMLInputElement>("input").forEach(input => input.addEventListener("change", () => scheduleDocumentSave(0)));
+  } else row.querySelectorAll<HTMLInputElement>("input").forEach(input => input.setAttribute("disabled", ""));
   row.querySelector(".delete-block")?.addEventListener("click", () => {
     removeOwnBlock(row.closest<HTMLElement>("[data-own-block]"));
   });
@@ -3078,9 +3249,24 @@ function handleBlockKeydown(event: KeyboardEvent) {
     })() : start;
     const beforeSource = source.slice(0, start);
     const afterSource = source.slice(end);
-    currentBlock.content = contentFromMarkdown(beforeSource, currentBlock.content);
-    next.content = contentFromMarkdown(afterSource, currentBlock.content);
-    editable.textContent = beforeSource;
+    if (currentBlock.type === "todo") {
+      // Keep the GFM task marker with the todo block when Enter splits its body.
+      const firstLineEnd = source.indexOf("\n");
+      const firstLine = firstLineEnd < 0 ? source : source.slice(0, firstLineEnd);
+      const marker = firstLine.match(/^\s*[-*+]\s+\[([ xX])\]\s?(.*)$/);
+      const markerLength = marker ? marker[0].length : 0;
+      const body = marker ? [marker[2], ...source.split("\n").slice(1)].join("\n") : source;
+      const bodyStart = marker ? Math.min(body.length, Math.max(0, start - markerLength)) : start;
+      const bodyEnd = marker ? Math.min(body.length, Math.max(bodyStart, end - markerLength)) : end;
+      currentBlock.content = contentFromMarkdown(body.slice(0, bodyStart), currentBlock.content);
+      currentBlock.content.checked = marker ? marker[1].toLowerCase() === "x" : (currentBlock.content.checked ?? false);
+      next.content = contentFromMarkdown(body.slice(bodyEnd), { ...currentBlock.content, checked: false });
+      editable.textContent = todoMarkdownFromContent(currentBlock.content);
+    } else {
+      currentBlock.content = contentFromMarkdown(beforeSource, currentBlock.content);
+      next.content = contentFromMarkdown(afterSource, currentBlock.content);
+      editable.textContent = beforeSource;
+    }
   } else if (currentBlock && editorMode === "rich") {
     const range = selectionRangeInEditable(editable);
     if (range) {
@@ -3134,6 +3320,16 @@ function readOwnBlocks(): Block[] {
       id: shell.dataset.id!, parentId, position,
       type: "media", content: old?.content ?? { text: "", html: "" }, properties: old?.properties ?? {}, revision: old?.revision ?? 1
     };
+    if (shell.dataset.type === "location") {
+      const source = shell.querySelector<HTMLElement>(":scope > .block-row > .location-source")?.textContent ?? "";
+      const id = source.match(/^id:\s*(.+)$/m)?.[1]?.trim() || old?.properties.locationId;
+      const label = source.match(/^label:\s*(.*)$/m)?.[1]?.trim() || undefined;
+      return {
+        id: shell.dataset.id!, parentId, position,
+        type: "location", content: old?.content ?? { text: "", html: "" },
+        properties: { ...(old?.properties ?? {}), locationId: id, locationLabelOverride: label }, revision: old?.revision ?? 1
+      };
+    }
     if (shell.dataset.type === "database_table" || shell.dataset.type === "data_view") return {
       id: shell.dataset.id!, parentId, position, type: shell.dataset.type as BlockType,
       content: old?.content ?? { text: "", html: "" }, properties: old?.properties ?? {}, revision: old?.revision ?? 1
@@ -3146,7 +3342,9 @@ function readOwnBlocks(): Block[] {
     const content = editorMode === "preview"
       ? old?.content ?? { text: "", html: "", markdown: "" }
       : editorMode === "source"
-        ? contentFromMarkdown(sourceText(editable), old?.content ?? { text: "", html: "" })
+        ? shell.dataset.type === "todo"
+          ? contentFromTodoMarkdown(sourceText(editable), old?.content ?? { text: "", html: "", checked: false })
+          : contentFromMarkdown(sourceText(editable), old?.content ?? { text: "", html: "" })
         : contentFromRichEditable(editable, old?.content ?? { text: "", html: "" });
     const properties: BlockProperties = editorMode === "rich"
       ? {
@@ -3154,6 +3352,12 @@ function readOwnBlocks(): Block[] {
         background: editable.style.backgroundColor || undefined,
         textColor: editable.style.color || undefined,
         textAlign: editable.style.textAlign === "left" || editable.style.textAlign === "center" || editable.style.textAlign === "right" ? editable.style.textAlign : undefined,
+        ...(shell.dataset.type === "todo"
+          ? {
+            todoCreatedAt: shell.querySelector<HTMLInputElement>(".todo-created-date")?.value || undefined,
+            todoDueAt: shell.querySelector<HTMLInputElement>(".todo-due-date")?.value || undefined
+          }
+          : {}),
         ...(columnGroup ? { columnGroup, column } : shell.dataset.column === "" ? {} : { column: Number(shell.dataset.column) })
       }
       : {
@@ -3167,7 +3371,12 @@ function readOwnBlocks(): Block[] {
     return {
       id: shell.dataset.id!, parentId, position,
       type: shell.dataset.type as BlockType,
-      content: { ...content, checked: shell.querySelector<HTMLInputElement>(".todo-check")?.checked ?? old?.content.checked ?? false },
+      content: {
+        ...content,
+        ...(shell.dataset.type === "todo"
+          ? { checked: editorMode === "source" ? content.checked ?? old?.content.checked ?? false : shell.querySelector<HTMLInputElement>(".todo-check")?.checked ?? old?.content.checked ?? false }
+          : {})
+      },
       properties,
       revision: old?.revision ?? 1
     };
@@ -3275,9 +3484,12 @@ function renderReference(reference: ReferenceInstance, inSidebar = false) {
   const refTitle = escapeText(reference.targetTitle);
   const targetDocId = escapeText(reference.targetDocumentId);
   const refIdAttr = escapeText(reference.id);
-  summary.innerHTML = `<button type="button" class="reference-expand" aria-expanded="${isOpen}" aria-label="${toggleLabel}" title="${inSidebar ? (isOpen ? "折叠此引用" : "展开此引用") : (collapsed ? "展开引用正文" : "折叠引用正文")}">${toggleIcon}</button><button type="button" class="reference-title" data-target-id="${targetDocId}" data-reference-id="${refIdAttr}">${refTitle}</button>${inSidebar ? `<button type="button" class="reference-mode-menu" aria-label="引用显示方式" title="切换显示方式">⠿</button>` : ""}`;
-  const title = summary.querySelector<HTMLElement>(".reference-title")!;
-  if (reference.targetBlockId) title.dataset.targetBlockId = reference.targetBlockId;
+  const titleMarkup = inSidebar
+    ? ""
+    : `<button type="button" class="reference-title" data-target-id="${targetDocId}" data-reference-id="${refIdAttr}">${refTitle}</button>`;
+  summary.innerHTML = `<button type="button" class="reference-expand" aria-expanded="${isOpen}" aria-label="${toggleLabel}" title="${inSidebar ? (isOpen ? "折叠此引用" : "展开此引用") : (collapsed ? "展开引用正文" : "折叠引用正文")}">${toggleIcon}</button>${titleMarkup}<button type="button" class="reference-mode-menu" aria-label="引用显示方式" title="选择引用显示方式">显示方式</button>`;
+  const title = summary.querySelector<HTMLElement>(".reference-title");
+  if (title && reference.targetBlockId) title.dataset.targetBlockId = reference.targetBlockId;
   const toggle = summary.querySelector<HTMLButtonElement>(".reference-expand")!;
   toggle.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -3330,7 +3542,9 @@ function renderReference(reference: ReferenceInstance, inSidebar = false) {
     row.innerHTML = `<div class="reference-meta"><span>${local ? "本地新增" : override ? "已覆写" : "继承"}</span><button class="add-sibling" title="在同级新增块">+</button>${local ? "" : '<button class="reset" title="恢复源内容与位置">↺</button>'}<button class="hide" title="${local ? "删除本地块" : "在此引用中隐藏"}">×</button></div><div class="block-text ${source.type === "heading" ? "heading" : ""}"></div>`;
     const editable = row.querySelector<HTMLElement>(".block-text")!;
     if (override && source.revision > override.baseRevision) row.querySelector(".reference-meta span")!.textContent = "已覆写 · 源内容已更新";
-    if (source.type === "database_table" || source.type === "data_view") {
+    if (source.type === "location") {
+      editable.replaceChildren(renderLocationCard({ ...source, content, properties }));
+    } else if (source.type === "database_table" || source.type === "data_view") {
       // Database projections are intentionally read-only. Keep the source
       // declaration available in source mode, but render a compact table in
       // rich/preview modes just like an embedded database block.
@@ -3560,16 +3774,22 @@ function renderRelations() {
       sourceBlockId: block.id,
       documentId: link.targetDocumentId!,
       blockId: link.targetBlockId,
+      targetScope: link.targetScope,
       label: state!.documents.find(document => document.id === link.targetDocumentId)?.title ?? link.targetText,
       excerpt: block.content.text
     })));
+  const liveLinkKeys = new Set(state.references
+    .filter(reference => reference.mode !== "link")
+    .map(reference => `${reference.hostBlockId}:${reference.targetDocumentId}:${reference.targetBlockId ?? ""}`));
+  const visibleOrdinaryLinks = ordinaryLinks.filter(link =>
+    !liveLinkKeys.has(`${link.sourceBlockId}:${link.documentId}:${link.blockId ?? ""}`));
   const desiredSidebarRefs = state.references.filter((reference) => reference.mode === "sidebar");
-  let showCards: ReferenceInstance[] = desiredSidebarRefs;
+  const visibleReferences = state.references.filter(reference => reference.mode !== "link");
+  let showCards: ReferenceInstance[] = visibleReferences;
   let introOrEmpty: "intro" | "empty" | null = null;
-  if (desiredSidebarRefs.length === 0) {
-    showCards = state.references.filter(r => r.mode === "inline" || r.mode === "collapsed");
-    introOrEmpty = showCards.length > 0 ? "intro" : ordinaryLinks.length ? null : "empty";
-  }
+  if (desiredSidebarRefs.length === 0)
+    introOrEmpty = showCards.length > 0 ? "intro" : visibleOrdinaryLinks.length ? null : "empty";
+  else if (!showCards.length && !visibleOrdinaryLinks.length) introOrEmpty = "empty";
   // Index existing cards by their data-reference-id so we can decide reuse vs. rebuild.
   const existingCards = new Map<string, HTMLElement>();
   referenceSidebarPanel.querySelectorAll<HTMLElement>(".reference-card[data-reference-id]").forEach((el) => {
@@ -3583,8 +3803,11 @@ function renderRelations() {
     documentGroups.set(documentId, group);
     return group;
   };
-  showCards.forEach(reference => groupFor(reference.targetDocumentId, reference.targetTitle).references.push(reference));
-  ordinaryLinks.forEach(link => groupFor(link.documentId, link.label || link.documentId).links.push(link));
+  showCards.forEach(reference => groupFor(
+    reference.targetDocumentId,
+    state!.documents.find(document => document.id === reference.targetDocumentId)?.title ?? reference.targetTitle
+  ).references.push(reference));
+  visibleOrdinaryLinks.forEach(link => groupFor(link.documentId, link.label || link.documentId).links.push(link));
 
   // Collect everything into the fragment BEFORE replaceChildren, so the panel is never
   // temporarily blank even if showCards is empty or an error occurs mid-render.
@@ -3620,18 +3843,37 @@ function renderRelations() {
     }
     for (const link of group.links) {
       const entry = document.createElement("section");
-      entry.className = "linked-reference-entry";
+      // Ordinary [[...]] links and live reference instances share one visual
+      // list item in the grouped sidebar. The link remains read-only; only
+      // its presentation is aligned with the live reference card.
+      entry.className = "linked-reference-entry reference-card sidebar";
       entry.dataset.linkKey = link.key;
       const linkTitle = document.createElement("button");
       linkTitle.type = "button";
       linkTitle.className = "reference-title";
       linkTitle.dataset.targetId = link.documentId;
+      linkTitle.dataset.sourceBlockId = link.sourceBlockId;
       if (link.blockId) linkTitle.dataset.targetBlockId = link.blockId;
       linkTitle.textContent = link.label || "未命名链接";
       linkTitle.title = "悬停预览 · 单击分栏 · 双击打开源";
+      const summary = document.createElement("div");
+      summary.className = "reference-card-summary linked-reference-summary";
+      summary.append(linkTitle);
+      const modeMenu = document.createElement("button");
+      modeMenu.type = "button";
+      modeMenu.className = "reference-mode-menu";
+      modeMenu.setAttribute("aria-label", "引用显示方式");
+      modeMenu.title = "选择引用显示方式";
+      modeMenu.textContent = "显示方式";
+      modeMenu.addEventListener("click", event => {
+        event.stopPropagation();
+        showOrdinaryLinkModeMenu(modeMenu, link);
+      });
+      summary.append(modeMenu);
       const excerpt = document.createElement("p");
+      excerpt.className = "linked-reference-excerpt";
       excerpt.textContent = link.excerpt || "（空白段落）";
-      entry.append(linkTitle, excerpt);
+      entry.append(summary, excerpt);
       entry.addEventListener("click", event => {
         if ((event.target as HTMLElement).closest("button")) return;
         linkTitle.click();
@@ -3681,9 +3923,7 @@ function showMenu(anchor: HTMLElement, actions: Array<{ label: string; run: () =
 function showOwnBlockMenu(anchor: HTMLElement, block: Block) {
   activeEditable = anchor.closest("[data-own-block]")?.querySelector<HTMLElement>(".block-text") ?? activeEditable;
   const actions: Array<{ label: string; run: () => void; danger?: boolean }> = [
-    { label: "复制块链接", run: () => navigator.clipboard?.writeText(`[[${state?.note.title}^${block.id}]]`) },
-    { label: "插入块链接", run: () => insertTarget(block.id, state?.note.id, block.content.text || "块") },
-    { label: "嵌入为实时引用", run: () => createReferenceForTarget(state?.note.id, block.id) },
+    { label: "复制块链接", run: () => copyBlockLink(block) },
     { label: activeCommentsFor(block).length ? "管理注释" : "添加注释", run: () => {
       const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(block.id)}"]`);
       if (shell) showBlockCommentPopover(shell.querySelector<HTMLElement>(".block-comment-bubble") ?? anchor, block, true);
@@ -3704,6 +3944,57 @@ function showOwnBlockMenu(anchor: HTMLElement, block: Block) {
   else if (block.type === "data_view") actions.splice(3, 0, { label: "刷新 DQL 查询", run: () => { renderAllPanels(); } });
   else if (block.type === "paragraph" && parseGfmTable(markdownFromContent(block.content))) actions.splice(3, 0, { label: "转换为普通数据表", run: () => convertGfmBlockToDatabase(block) });
   showMenu(anchor, actions);
+}
+
+type OrdinaryLinkSidebarEntry = {
+  key: string;
+  sourceBlockId: string;
+  documentId: string;
+  blockId?: string;
+  targetScope?: ReferenceTargetScope;
+  label: string;
+  excerpt: string;
+};
+
+function ordinaryLinkReference(link: OrdinaryLinkSidebarEntry) {
+  return state?.references.find(reference =>
+    reference.hostBlockId === link.sourceBlockId &&
+    reference.targetDocumentId === link.documentId &&
+    (reference.targetBlockId ?? "") === (link.blockId ?? ""));
+}
+
+function setOrdinaryLinkReferenceMode(link: OrdinaryLinkSidebarEntry, mode: ReferenceMode) {
+  if (!state) return;
+  const existing = ordinaryLinkReference(link);
+  if (existing) {
+    setReferenceMode(existing, mode);
+    return;
+  }
+  const hostReference = state.references.find(reference => reference.hostBlockId === link.sourceBlockId);
+  if (hostReference) {
+    saveStatus.textContent = "同一正文块已有其他引用，请将其拆分到独立块后再设置显示方式";
+    return;
+  }
+  void post({
+    type: "createReference",
+    hostBlockId: link.sourceBlockId,
+    targetDocumentId: link.documentId,
+    targetBlockId: link.blockId,
+    targetScope: link.targetScope
+  }).then(() => {
+    const created = ordinaryLinkReference(link);
+    if (created && mode !== "inline") setReferenceMode(created, mode);
+  });
+}
+
+function showOrdinaryLinkModeMenu(anchor: HTMLElement, link: OrdinaryLinkSidebarEntry) {
+  const existing = ordinaryLinkReference(link);
+  showMenu(anchor, [
+    { label: "仅标题链接", run: () => { if (existing) setReferenceMode(existing, "link"); else renderRelations(); } },
+    { label: "正文直显", run: () => setOrdinaryLinkReferenceMode(link, "inline") },
+    { label: "折叠卡片", run: () => setOrdinaryLinkReferenceMode(link, "collapsed") },
+    { label: "右侧分栏", run: () => setOrdinaryLinkReferenceMode(link, "sidebar") }
+  ]);
 }
 
 function showReferenceMenu(anchor: HTMLElement, _block: Block | undefined, reference?: ReferenceInstance) {
@@ -3729,70 +4020,17 @@ function setReferenceMode(reference: ReferenceInstance, mode: ReferenceMode) {
   postAfterFlush({ type: "setReferenceMode", referenceInstanceId: reference.id, mode });
 }
 
-function createReferenceForTarget(targetDocumentId?: string, targetBlockId?: string, mode: ReferenceMode = "inline", anchor?: HTMLElement, targetScope?: ReferenceTargetScope) {
-  if (!state || !targetDocumentId) return;
-  const documentId = state.note.id;
-  const block = createBlock("reference");
-  block.content.targetDocumentId = targetDocumentId;
-  if (anchor?.closest(".reference-row")) { showError("请在普通正文块中嵌入引用；引用内的链接可在分栏预览。"); return; }
-  const ownerShell = (anchor ?? activeEditable)?.closest<HTMLElement>("[data-own-block]");
-  if (anchor?.isConnected && ownerShell) {
-    const marker = document.createElement("span");
-    marker.dataset.referenceHostId = block.id;
-    marker.contentEditable = "false";
-    anchor.replaceWith(marker);
-    block.parentId = ownerShell.dataset.id!;
-  } else block.parentId = ownerShell?.dataset.parentId || null;
-  state.blocks = readOwnBlocks();
-  const index = state.blocks.findIndex(item => item.id === ownerShell?.dataset.id);
-  state.blocks.splice(index < 0 ? state.blocks.length : index + 1, 0, block);
-  sidebarLink = null;
-  sidebarSequence++;
-
-  // Optimistically add the new reference to state so renderRelations() shows it immediately,
-  // avoiding a brief blank/old-state flash while the createReference command is in flight.
-  const optimisticRef: ReferenceInstance = {
-    id: `pending-${block.id}`,
-    hostBlockId: block.id,
-    targetDocumentId,
-    targetBlockId,
-    targetScope,
-    targetTitle: state.documents.find(d => d.id === targetDocumentId)?.title ?? targetDocumentId,
-    mode,
-    blocks: [],
-    overrides: [],
-    hiddenBlockIds: []
-  };
-  state.references.push(optimisticRef);
-
-  render(state);
-  saveDocument();
-  runAfterSaveDrain(async () => {
-    await post({ type: "createReference", hostBlockId: block.id, targetDocumentId, targetBlockId, targetScope }, documentId);
-    // applyServerState in post's ACK already synced state.references.
-    // For non-inline modes, switch the newly-created reference to the requested mode.
-    if (mode !== "inline") {
-      const reference = state?.references.find((item) => item.hostBlockId === block.id);
-      if (reference) void post({ type: "setReferenceMode", referenceInstanceId: reference.id, mode }, documentId);
-    }
-  });
-}
-
-function insertTarget(targetBlockId?: string, targetDocumentId?: string, label = "链接") {
-  if (!activeEditable || !targetDocumentId) return;
-  activeEditable.focus();
-  if (editorMode === "source") {
-    document.execCommand("insertText", false, `[[${label}${targetBlockId ? `#^${targetBlockId}` : ""}]]`);
-    activeEditable.dispatchEvent(new Event("input", { bubbles: true }));
-    return;
+async function copyBlockLink(block: Block) {
+  if (!state) return;
+  const document = state.documents.find(item => item.id === state!.note.id);
+  const notebook = document?.notebookName ?? "当前笔记本";
+  const link = `[[${notebook}/${state.note.title}#^${block.id}]]`;
+  try {
+    await navigator.clipboard?.writeText(link);
+    saveStatus.textContent = "块链接已复制，可粘贴到 [[ 联想中使用";
+  } catch {
+    showError("无法访问剪贴板，请手动复制块链接");
   }
-  const escapedLabel = escapeText(label);
-  const html = `<span contenteditable="false" class="wiki-link" data-target-id="${escapeText(targetDocumentId)}"${targetBlockId ? ` data-target-block-id="${escapeText(targetBlockId)}"` : ""} data-target-title="${escapedLabel}">${escapedLabel}</span>`;
-  document.execCommand("insertHTML", false, html);
-  activeEditable.closest(".reference-row") ? activeEditable.dispatchEvent(new Event("input", { bubbles: true })) : scheduleDocumentSave(0);
-  const links = [...activeEditable.querySelectorAll<HTMLElement>(".wiki-link")];
-  const inserted = links[links.length - 1];
-  if (inserted) showLinkChoiceMenu(inserted, { id: targetDocumentId, blockId: targetBlockId, label });
 }
 
 function normalizedSearch(value: string) { return value.trim().toLocaleLowerCase(); }
@@ -4066,41 +4304,38 @@ function insertInlineSuggestion(item: LinkSuggestion) {
   selection.removeAllRanges(); selection.addRange(range);
   hideInlineLinkSuggestions();
   activeEditable.dispatchEvent(new Event("input", { bubbles: true }));
-  showLinkChoiceMenu(link, { ...item, label: targetLabel });
 }
 
-function showLinkChoiceMenu(anchor: HTMLElement, item: { id: string; blockId?: string; scope?: ReferenceTargetScope; label: string }) {
-  document.querySelector(".link-mode-menu")?.remove();
-  const menu = document.createElement("div");
-  menu.className = "link-mode-menu";
-  menu.setAttribute("role", "menu");
-  menu.innerHTML = `<strong>已插入双链</strong><span>选择后续操作</span>`;
-  const choices: Array<{ label: string; mode?: ReferenceMode }> = [
-    { label: "保持普通双链" },
-    { label: "嵌入实时引用 · 正文直显", mode: "inline" },
-    { label: "嵌入实时引用 · 折叠卡片", mode: "collapsed" },
-    { label: "嵌入实时引用 · 右侧分栏", mode: "sidebar" }
-  ];
-  choices.forEach((choice) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = choice.label;
-    button.addEventListener("click", () => {
-      menu.remove();
-      if (choice.mode) createReferenceForTarget(item.id, item.blockId, choice.mode, anchor, item.scope);
-    });
-    menu.append(button);
-  });
-  document.body.append(menu);
-  const rect = anchor.getBoundingClientRect();
-  menu.style.left = `${Math.min(window.innerWidth - 260, Math.max(8, rect.left))}px`;
-  menu.style.top = `${Math.min(window.innerHeight - 210, rect.bottom + 8)}px`;
-  const close = (event: MouseEvent) => {
-    if (!menu.contains(event.target as Node) && event.target !== anchor) {
-      menu.remove(); document.removeEventListener("mousedown", close);
-    }
-  };
-  window.setTimeout(() => document.addEventListener("mousedown", close), 0);
+function insertCalendarLink(targetDocumentId: string, targetBlockId?: string, targetScope?: ReferenceTargetScope, label = "日记") {
+  if (editorMode === "preview") return;
+  const editable = lastEditorCaret?.editable?.isConnected ? lastEditorCaret.editable : activeEditable;
+  if (!editable) { saveStatus.textContent = "请先把光标放在正文中"; return; }
+  const selection = window.getSelection();
+  const range = selection?.rangeCount && editable.contains(selection.anchorNode)
+    ? selection.getRangeAt(0).cloneRange()
+    : lastEditorCaret?.editable === editable ? lastEditorCaret.range.cloneRange() : null;
+  if (!range) { saveStatus.textContent = "请先把光标放在正文中"; return; }
+  const target = state?.documents.find(document => document.id === targetDocumentId);
+  const notebook = target?.notebookName ?? "日记";
+  const title = target?.title ?? "日记";
+  const sourceTarget = `${notebook}/${title}${targetBlockId ? targetScope === "heading" ? `#${label}` : `#^${targetBlockId}` : ""}`;
+  range.deleteContents();
+  if (editorMode === "source") {
+    const text = document.createTextNode(`[[${sourceTarget}|📅 ${label}]]`);
+    range.insertNode(text); range.setStartAfter(text); range.collapse(true);
+  } else {
+    const link = document.createElement("span");
+    link.className = "wiki-link calendar-link"; link.contentEditable = "false";
+    link.dataset.targetId = targetDocumentId; link.dataset.targetTitle = title;
+    if (targetBlockId) link.dataset.targetBlockId = targetBlockId;
+    if (targetScope === "heading") { link.dataset.targetHeading = label; link.dataset.targetScope = "heading"; }
+    link.textContent = `📅 ${label}`;
+    range.insertNode(link); range.setStartAfter(link); range.collapse(true);
+  }
+  selection?.removeAllRanges(); selection?.addRange(range);
+  activeEditable = editable; editable.focus({ preventScroll: true });
+  editable.dispatchEvent(new Event("input", { bubbles: true }));
+  saveStatus.textContent = "已插入日记普通链接";
 }
 
 function handleInlineLinkKeys(event: KeyboardEvent) {
@@ -4126,6 +4361,22 @@ function addBlock(type: BlockType, options: { focusFirst?: boolean } = {}) {
   const shell = renderOwnBlockShell(block);
   blockSurface.append(shell);
   if (options.focusFirst !== false) shell.querySelector<HTMLElement>(".block-text")?.focus();
+  scheduleDocumentSave(0);
+}
+
+function insertLocationBlock(locationId: string) {
+  if (editorMode === "preview" || !state) return;
+  const location = state.locations?.find(item => item.id === locationId && !item.deletedAt);
+  if (!location) { showError(new Error("位置不存在或已删除")); return; }
+  const block = createBlock("location");
+  block.properties = { ...block.properties, locationId };
+  state.blocks.push(block);
+  const anchor = activeBlock?.dataset.id ? state.blocks.find(item => item.id === activeBlock?.dataset.id && item.id !== block.id) : undefined;
+  if (anchor) insertBlocksRelative([block], anchor, "after");
+  else { block.parentId = null; block.position = nextPosition(null); }
+  renderAllPanels();
+  blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(block.id)}"]`)?.scrollIntoView({ block: "nearest" });
+  activeBlock = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(block.id)}"]`) ?? null;
   scheduleDocumentSave(0);
 }
 
@@ -4545,6 +4796,7 @@ document.querySelector("#add-columns")!.addEventListener("click", addColumns);
 document.querySelector("#add-media")?.addEventListener("click", () => document.querySelector<HTMLInputElement>("#media-file-input")?.click());
 document.querySelector("#add-database")?.addEventListener("click", addDatabaseTable);
 document.querySelector("#add-query")?.addEventListener("click", addDataView);
+document.querySelector("#add-location")?.addEventListener("click", () => ui.showLocations?.());
 document.querySelector<HTMLInputElement>("#media-file-input")?.addEventListener("change", event => {
   const input = event.target as HTMLInputElement;
   const files = input.files ? [...input.files] : [];
@@ -4613,7 +4865,21 @@ document.addEventListener("click", (event) => {
   if (reference) showReferenceMenu(grip, block, reference);
   else if (block) showOwnBlockMenu(grip, block);
 }, true);
-document.addEventListener("selectionchange", rememberStyleSelection);
+document.addEventListener("selectionchange", () => {
+  rememberStyleSelection();
+  rememberEditorCaret();
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || !selection.anchorNode) return;
+  const anchorElement = selection.anchorNode instanceof Element
+    ? selection.anchorNode
+    : selection.anchorNode.parentElement;
+  const card = anchorElement?.closest<HTMLElement>(".reference-card:not(.sidebar)");
+  if (!card) return;
+  const referenceId = card.dataset.referenceId;
+  const reference = referenceId ? state?.references.find(item => item.id === referenceId) : undefined;
+  const modeAnchor = card.querySelector<HTMLElement>(".reference-mode-menu");
+  if (reference && modeAnchor) showReferenceMenu(modeAnchor, undefined, reference);
+});
 document.addEventListener("paste", event => {
   const target = event.target as HTMLElement | null;
   if (!target?.closest(".block-text[contenteditable='true'], .media-name[contenteditable='true']")) return;
@@ -5101,6 +5367,25 @@ function clear() {
   ui.updateHistory?.({ documentId: "", entries: [], currentId: "", canUndo: false, canRedo: false });
   saveStatus.textContent = "请选择或新建笔记";
 }
+async function createDiaryDocument(documentId: string, headingTitle: string) {
+  await flush();
+  const loaded = await host.loadDocument(documentId);
+  const exists = loaded.blocks.some(block => {
+    const source = markdownFromContent(block.content).split(/\r?\n/).find(value => value.trim()) ?? "";
+    return /^\s*#(?:[ \u3000]+|$)/.test(source) && source.replace(/^\s*#[ \u3000]*/, "").trim() === headingTitle;
+  });
+  if (!exists) {
+    const position = String((loaded.blocks.length + 1) * 1000).padStart(8, "0");
+    loaded.blocks.push({
+      id: newId(), parentId: null, position, type: "heading",
+      content: { text: headingTitle, html: `<h1>${escapeText(headingTitle)}</h1>`, markdown: `# ${headingTitle}` },
+      properties: { headingLevel: 1 }, revision: 1
+    });
+  }
+  render(loaded);
+  enqueueDocumentSave();
+  await flush();
+}
 return {
   flush: async () => { await historyTail; await flush(); },
   showError,
@@ -5109,6 +5394,8 @@ return {
   undo: () => moveHistory("undo"),
   redo: () => moveHistory("redo"),
   restoreHistory,
+  createDiaryDocument,
+  insertCalendarLink,
   retry: () => { saveFailure = null; commandFailure = null; enqueueDocumentSave(); },
   load: render
 };

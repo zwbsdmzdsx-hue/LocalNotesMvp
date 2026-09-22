@@ -2,7 +2,24 @@ export type HistoryEntry = { id: string; timestamp: number; label: string; kind:
 export type HistoryModel = { documentId: string; entries: HistoryEntry[]; currentId: string; canUndo: boolean; canRedo: boolean };
 export type MediaKind = "image" | "video" | "audio" | "pdf" | "file";
 export type MediaAsset = { id: string; kind: MediaKind; name: string; mimeType: string; size: number; url: string };
-export type BlockType = "paragraph" | "heading" | "todo" | "reference" | "media" | "database_table" | "data_view";
+export type LocationScope = "global" | "notebook";
+export type LocationSource = "manual" | "map" | "browser" | "ip";
+export type LocationPrecision = "exact" | "street" | "district" | "city" | "unknown";
+export type GeoLocation = {
+  id: string;
+  scope: LocationScope;
+  notebookId?: string;
+  name: string;
+  address: string;
+  latitude: number;
+  longitude: number;
+  source: LocationSource;
+  precision: LocationPrecision;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string;
+};
+export type BlockType = "paragraph" | "heading" | "todo" | "reference" | "media" | "location" | "database_table" | "data_view";
 export type ReferenceTargetScope = "block" | "heading";
 export type LinkToken = { targetDocumentId?: string; targetBlockId?: string; targetScope?: ReferenceTargetScope; targetText: string; alias?: string; start: number; end: number };
 export type BlockContent = { text: string; html: string; markdown?: string; checked?: boolean; targetDocumentId?: string; links?: LinkToken[]; media?: MediaAsset; caption?: string };
@@ -33,8 +50,16 @@ export type BlockProperties = {
   databaseViewId?: string;
   databaseSource?: "gfm" | "database";
   dataQuery?: string;
+  /** Stable reference to a shared location catalog entry. */
+  locationId?: string;
+  /** Optional block-local label without copying the location's address/coordinates. */
+  locationLabelOverride?: string;
   /** Comments are part of the owning block snapshot, so normal save/history semantics apply. */
   comments?: BlockComment[];
+  /** ISO calendar date when a todo block was created. */
+  todoCreatedAt?: string;
+  /** ISO calendar date targeted for completing a todo block. */
+  todoDueAt?: string;
 };
 export type Block = { id: string; parentId: string | null; position: string; type: BlockType; content: BlockContent; properties: BlockProperties; revision: number; scopeType?: "canonical" | "reference_instance" };
 export type Note = { id: string; title: string; isSticky: boolean; clientVersion: number };
@@ -63,13 +88,14 @@ export type DatabaseView = { id: string; databaseId: string; name: string; type:
 export type DataQuery = { table?: string[]; from: "current" | { notebookId: string }; where?: string; sort?: Array<{ key: string; direction: "asc" | "desc" }>; groupBy?: string; limit?: number; };
 export type FormulaError = { code: "syntax" | "type" | "unknown_property" | "cycle" | "runtime"; message: string; };
 export type DataQueryResult = { columns: Array<{ key: string; title: string; type: DatabaseFieldType }>; rows: Array<{ recordId: string; sourceDocumentId?: string; sourceBlockId?: string; values: Record<string, DatabaseValue | FormulaError>; grouped?: boolean; readonlyKeys?: string[]; }>; errors: FormulaError[]; };
-export type EditorState = { history?: HistoryModel; note: Note & { workspaceId?: string }; blocks: Block[]; documents: LinkCatalogDocument[]; backlinks: Backlink[]; overrideNotices: OverrideNotice[]; references: ReferenceInstance[]; databases?: DatabaseSource[]; databaseRecords?: Record<string, DatabaseRecord[]>; databaseViews?: DatabaseView[]; systemStyles?: StyleSheet[]; documentStyles?: StyleSheet[]; notebookStyles?: StyleSheet[] };
+export type EditorState = { history?: HistoryModel; note: Note & { workspaceId?: string }; blocks: Block[]; documents: LinkCatalogDocument[]; backlinks: Backlink[]; overrideNotices: OverrideNotice[]; references: ReferenceInstance[]; locations?: GeoLocation[]; locationVersion?: number; databases?: DatabaseSource[]; databaseRecords?: Record<string, DatabaseRecord[]>; databaseViews?: DatabaseView[]; systemStyles?: StyleSheet[]; documentStyles?: StyleSheet[]; notebookStyles?: StyleSheet[] };
 export type SaveDocumentPayload = { title: string; blocks: Block[] };
 export type SaveMutation = SaveDocumentPayload & { documentId: string; mutationId: string; historyGroup?: string; clientVersion: number };
 
 
 export const PROTOCOL_VERSION = 1 as const;
 export type ReferenceCommandMap = {
+  /** Used when an ordinary [[...]] link explicitly chooses a live display mode; default insertion remains an ordinary link. */
   createReference: { hostBlockId: string; targetDocumentId: string; targetBlockId?: string; targetScope?: ReferenceTargetScope };
   setReferenceMode: { referenceInstanceId: string; mode: ReferenceMode };
   saveOverride: { historyGroup?: string; referenceInstanceId: string; targetBlockId: string; content: BlockContent; properties: BlockProperties };

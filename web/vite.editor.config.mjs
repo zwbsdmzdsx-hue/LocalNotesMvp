@@ -8,7 +8,8 @@ export default defineConfig({
     alias: {
       dompurify: resolve(process.cwd(), "node_modules/dompurify/dist/purify.es.mjs"),
       marked: resolve(process.cwd(), "node_modules/marked/lib/marked.esm.js"),
-      turndown: resolve(process.cwd(), "node_modules/turndown/lib/turndown.browser.es.js")
+      turndown: resolve(process.cwd(), "node_modules/turndown/lib/turndown.browser.es.js"),
+      leaflet: resolve(process.cwd(), "node_modules/leaflet/dist/leaflet-src.esm.js")
     }
   },
   server: { host: "localhost", port: 4173, strictPort: true },

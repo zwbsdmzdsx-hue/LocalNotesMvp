@@ -42,14 +42,20 @@ the legacy desktop host does not yet broadcast external change notifications.
 
 `loadDocument`, `reloadDocument`, `saveDocument`, `openDocument`,
 `navigateBack`, `navigateForward`, `executeCommand`, and `showNotification`.
-Reference mutations are carried by `executeCommand` with an operation such as
-`create-reference`, `save-override`, or `set-reference-mode`.
+Reference mutations are carried by `executeCommand` with operations such as
+`save-override` or `set-reference-mode`. `create-reference` is also used when
+an ordinary `[[...]]` link explicitly chooses a live display mode; default
+insertion remains an ordinary link.
 
 CSS 样式资源也通过 `executeCommand` 保存：`save-style` 携带 `id/title/description/css/enabled/position/scope`，其中 `scope` 为 `system`、`document` 或 `notebook`；`delete-style` 携带 `styleId`。`loadDocument` 和命令 ACK 的 `state` 会返回 `systemStyles`、`documentStyles` 与 `notebookStyles`。
 
 数据表能力通过 `executeCommand` 保存：`create-database`、`save-database-schema`、`upsert-database-record`、`delete-database-record`、`execute-dql`、`export-database-markdown` 和 `export-database-csv`。数据库字段和记录属于笔记本作用域，`loadDocument` 的 state 可返回 `databases` 和 `databaseRecords`。普通 Markdown GFM 表格仍保存在块的 Markdown 内容中；智能表块使用 `type: "database_table"` 与 `properties.databaseId`，查询块使用 `type: "data_view"` 与 `properties.dataQuery`。公式使用受限属性名表达式，禁止动态脚本；DQL 只允许 `TABLE/FROM/WHERE/SORT/GROUP BY/LIMIT`，默认查询当前笔记本，跨笔记本必须显式指定。查询/导出 ACK 除 `state` 外可返回 `result` 或文本 `content/mimeType/fileName`。
 
 数据库字段类型包含 `text`、`number`、`url`、`media`、`formula`、`rule`、`document_relation`、`record_relation` 和 `rollup`。`media` 值复用 `MediaAsset` JSON；上传仍先走 `storeMedia`，再由 `upsert-database-record` 保存。公式和规则字段在编辑模式显示运算结果，用户点击单元格时才编辑字段表达式；源码模式显示声明里的 `formula`，预览模式只显示结果。
+
+Todo 块的 `todoCreatedAt`（记录创建日期）和 `todoDueAt`（目标完成日期）属于块的 `BlockProperties`，随普通 `saveDocument`、历史、撤销和重做保存；它们不会写入待办的 Markdown 文本。新版浏览器日历直接从工作区待办块读取这两个字段，以蓝色/红色圆点分别表示创建日和目标完成日，日记点仍使用绿色圆点，不建立第二套日历数据源。
+
+地理位置通过 `GeoLocation` 目录统一保存，支持 `global` 和 `notebook` 两种 scope。位置目录由 `list-locations` 读取，写入使用 `create-location`、`update-location` 和 `delete-location`，携带 `mutationId` 与 `expectedLocationVersion`；删除为软删除。正文位置块使用 `type: "location"`，只保存 `properties.locationId` 和可选的 `locationLabelOverride`，名称、地址与坐标不复制到块内。地图管理使用 Leaflet + OpenStreetMap；浏览器定位、IP 粗定位和 Nominatim 反向地理编码都由用户主动触发或由地图选点防抖触发，失败时保留手动坐标。
 
 Canonical DTO 约束：标题块使用 `properties.headingLevel`（1 到 6），源码中的
 `#` 只负责序列化和解析；工具栏创建的无 `#` 标题仍由该属性明确表示为 H1。
@@ -89,6 +95,12 @@ and requires no SQLite schema migration.
 ID 写入链接和引用。目录块只用于筛选与预览，不作为当前文档保存快照，也不
 允许借联想直接写回目标文档。块候选从渲染后的纯文本建立，Markdown 标记和
 CSS 规则不进入候选标题或匹配文本。
+
+新版编辑器默认创建关联只走 `[[笔记本/文档/块#^块ID]]` 双链。块六点菜单的
+“复制块链接”输出同一格式，便于粘贴到其他正文或联想输入；用户在右栏普通双链
+条目中明确选择“正文直显/折叠卡片/右侧分栏”时，才通过 `create-reference`
+升级为同一宿主块下的 `reference_instance` 并保存显示模式。已有实时引用仍由
+`reference_instances` 读取，并保留显示模式、覆写和历史操作。
 
 正文 multi-column layouts reuse the block tree and require no new protocol
 operation. Each ordinary root block in a column group stores the same opaque

@@ -69,28 +69,21 @@ test('body add/delete/hide/reset reference rows keeps selected panel visible thr
 });
 
 for (const action of ['删除引用', '断开引用（保留为正文）']) {
-  test(`${action}: empty state and title remain visible, then creating a reference repopulates the panel`, async ({ page }, info) => {
+  test(`${action}: empty state and title remain visible after removal`, async ({ page }, info) => {
     await bodyReference(page).locator('.reference-heading .grip').click();
     await page.getByRole('menu').getByText(action, { exact: true }).click();
     await expect(page.locator('#reference-sidebar .reference-card')).toHaveCount(0);
     await expect(panel(page).locator('.empty')).toBeVisible();
     await assertPanel(page);
     await page.screenshot({ path: info.outputPath('reference-panel-empty.png'), fullPage: true });
-    await page.locator('#blocks [data-id="a1"] .grip').click();
-    await page.getByRole('menu').getByText('嵌入为实时引用', { exact: true }).click();
+    await page.reload();
+    await page.getByRole('button', { name: '实时引用', exact: true }).click();
     await expect(page.locator('#reference-sidebar .reference-card')).toHaveCount(1);
-    await expect(page.locator('#status')).toContainText('已保存');
-    await assertPanel(page);
   });
 }
 
-test('inline link conversion and mode changes preserve the active panel and title', async ({ page }) => {
-  const paragraph = page.locator('#blocks [data-id="a1"] > .block-row > .block-text');
-  await paragraph.fill('Before [[');
-  await page.locator('.link-suggestion').filter({ hasText: 'Gamma' }).click();
-  await page.getByRole('button', { name: '嵌入实时引用 · 正文直显', exact: true }).click();
-  await expect(page.locator('#reference-sidebar .reference-card')).toHaveCount(2);
-  await expect(page.locator('#status')).toContainText('已保存');
+test('existing reference mode changes preserve the active panel and title', async ({ page }) => {
+  await expect(page.locator('#reference-sidebar .reference-card')).toHaveCount(1);
   await assertPanel(page);
   for (const mode of ['右侧分栏', '正文直显', '折叠卡片', '仅标题链接']) {
     await bodyReference(page).locator('.reference-heading .grip').click();
@@ -102,11 +95,12 @@ test('inline link conversion and mode changes preserve the active panel and titl
 
 test('an open title-link preview survives unrelated reference ACKs and closes into the reference list', async ({ page }) => {
   const paragraph = page.locator('#blocks [data-id="a1"] > .block-row > .block-text');
-  await paragraph.fill('Before [[');
-  await page.locator('.link-suggestion').filter({ hasText: 'Gamma' }).click();
-  await page.getByRole('button', { name: '保持普通双链', exact: true }).click();
+  await page.locator('[data-editor-mode="source"]').click();
+  await paragraph.fill('Before [[默认笔记本/Beta#^b2]]');
+  await page.locator('button[data-editor-mode="rich"]').click();
+  await expect(paragraph.locator('.wiki-link')).toBeVisible();
   await paragraph.locator('.wiki-link').click();
-  await expect(panel(page)).toContainText('Gamma 日记');
+  await expect(panel(page)).toContainText('Beta 文档中的其他块');
   await bodyReference(page).locator('.add-sibling').first().click();
   await expect(bodyReference(page).locator('[data-scope-type="reference_instance"]')).toHaveCount(1);
   await expect(panel(page)).toContainText('Gamma 日记');
@@ -154,11 +148,12 @@ test('command failure leaves the selected references panel visible and usable', 
 
 test('ordinary preview refresh does not steal the selected tab', async ({ page }) => {
   const paragraph = page.locator('#blocks [data-id="a1"] > .block-row > .block-text');
-  await paragraph.fill('Before [[');
-  await page.locator('.link-suggestion').filter({ hasText: 'Gamma' }).click();
-  await page.getByRole('button', { name: '保持普通双链', exact: true }).click();
+  await page.locator('[data-editor-mode="source"]').click();
+  await paragraph.fill('Before [[默认笔记本/Beta#^b2]]');
+  await page.locator('button[data-editor-mode="rich"]').click();
+  await expect(paragraph.locator('.wiki-link')).toBeVisible();
   await paragraph.locator('.wiki-link').click();
-  await expect(panel(page)).toContainText('Gamma 日记');
+  await expect(panel(page)).toContainText('Beta 文档中的其他块');
   await page.evaluate(() => { window.watchReferencePanel = false; });
   await page.getByRole('button', { name: '反向链接', exact: true }).click();
   await page.evaluate(() => window.mockHost.updateSourceBlock('gamma', 'g1', 'updated preview'));

@@ -21,28 +21,28 @@ test("core menus and navigation run in browser mode", async ({ page }) => {
   const block = page.locator(".block-text").first();
   await block.click();
   await page.keyboard.press("End");
-  await page.keyboard.type(" [[");
-  await expect(page.locator("#link-suggestions")).toBeVisible();
-  await page.locator(".link-suggestion").first().click();
+  await page.locator('[data-editor-mode="source"]').click();
+  await block.fill("[[默认笔记本/Beta#^b1]]");
+  await page.locator('[data-editor-mode="rich"]').click();
   await expect(block.locator(".wiki-link")).toHaveAttribute("data-target-id", "beta");
-  await expect(block.locator(".wiki-link")).toHaveText("Beta");
+  await expect(block.locator(".wiki-link")).toHaveText("默认笔记本/Beta");
   await expect(block.locator(".wiki-link")).not.toContainText("[[");
-  await expect(page.getByRole("menu").filter({ hasText: "已插入双链" })).toBeVisible();
+  await expect(page.locator('.link-mode-menu')).toHaveCount(0);
   await page.locator(".grip").first().click();
   await expect(page.getByRole("menu")).toBeVisible();
   await page.getByRole("menu").getByText("复制块链接").click();
 });
 
-test("candidate action can create a reference with a selected display mode", async ({ page }) => {
+test("candidate action inserts an ordinary wiki link without a conversion step", async ({ page }) => {
   await page.goto("/");
   const block = page.locator('[data-own-block][data-type="paragraph"] .block-text').first();
   await block.click();
   await page.keyboard.press("End");
-  await page.keyboard.type(" [[");
-  await page.locator(".link-suggestion").first().click();
-  await page.getByRole("menu").getByText("嵌入实时引用 · 折叠卡片").click();
-  await expect(page.locator(".reference-card.is-collapsed")).toBeVisible();
-  await expect(page.locator(".reference-card.is-collapsed .reference-expand")).toHaveAttribute("aria-expanded", "false");
+  await page.locator('[data-editor-mode="source"]').click();
+  await block.fill("[[默认笔记本/Beta#^b1]]");
+  await page.locator('[data-editor-mode="rich"]').click();
+  await expect(block.locator(".wiki-link")).toBeVisible();
+  await expect(page.locator('.link-mode-menu')).toHaveCount(0);
 });
 
 test("Mock Host can simulate a save error without freezing editing", async ({ page }) => {
@@ -103,17 +103,14 @@ test("references refresh source content and block references stay scoped", async
 
 test("same-page source edits update the reference without losing the typing caret", async ({ page }) => {
   await page.goto("/");
-  const source = page.locator('[data-own-block][data-id="a1"]');
-  await source.locator(".grip").click();
-  await page.getByRole("menu").getByText("嵌入为实时引用", { exact: true }).click();
   const reference = page.locator('[data-own-block][data-type="reference"]').first();
-  await expect(reference.locator(".reference-row")).toContainText("浏览器编辑器核心");
-  await source.locator(".block-text").fill("同页源内容自动同步");
+  await expect(reference.locator(".reference-row")).toContainText("Beta 的内容");
+  await page.locator('[data-doc="beta"]').click();
+  const beta = page.locator('[data-own-block][data-id="b1"] .block-text');
+  await beta.fill("同页源内容自动同步");
+  await expect(page.locator("#status")).toContainText("已保存");
+  await page.locator('[data-doc="alpha"]').click();
   await expect(reference.locator(".reference-row")).toContainText("同页源内容自动同步");
-  await expect(source.locator(".block-text")).toBeFocused();
-  await page.keyboard.press("End");
-  await page.keyboard.type(" continued typing");
-  await expect(reference.locator(".reference-row")).toContainText("continued typing");
 });
 
 test("source updates preserve instance overrides and reset restores the newest source", async ({ page }) => {
@@ -132,7 +129,7 @@ test("source updates preserve instance overrides and reset restores the newest s
   await expect(reference.locator(".block-text")).toHaveText("源内容更新但不覆盖局部内容");
 });
 
-test("expanded block cards include descendants but exclude unrelated source blocks", async ({ page }) => {
+test("ordinary body blocks do not create nested children", async ({ page }) => {
   await page.goto("/");
   await page.locator('[data-doc="beta"]').click();
   const root = page.locator('[data-own-block][data-id="b1"] .block-text');
@@ -141,15 +138,8 @@ test("expanded block cards include descendants but exclude unrelated source bloc
   await page.keyboard.press("Enter");
   await page.keyboard.type("child of the referenced block");
   await page.locator("#indent").click();
-  await expect(page.locator("#status")).toContainText("已保存");
-  await page.locator('[data-doc="alpha"]').click();
-  const reference = page.locator('[data-own-block][data-type="reference"]');
-  await reference.locator(".reference-heading .grip").click();
-  await page.getByRole("menu").getByText("折叠卡片", { exact: true }).click();
-  await reference.getByRole("button", { name: "展开", exact: true }).click();
-  await expect(reference.locator(".reference-row")).toHaveCount(2);
-  await expect(reference).toContainText("child of the referenced block");
-  await expect(reference).not.toContainText("Beta 文档中的其他块");
+  await expect(page.locator("#status")).toContainText("正文块不支持普通子级");
+  await expect(page.locator('[data-own-block][data-id="b2"]')).toBeVisible();
 });
 
 test("editing the source document refreshes its live block reference", async ({ page }) => {
