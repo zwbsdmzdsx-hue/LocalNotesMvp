@@ -33,6 +33,13 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test('live references share one document header per source document', async ({ page }) => {
+  const groups = page.locator('#reference-sidebar .reference-document-group');
+  await expect(groups).toHaveCount(1);
+  await expect(groups.first().locator('.reference-document-head')).toContainText('Beta');
+  await expect(groups.first().locator('.reference-card[data-reference-id="ref1"]')).toHaveCount(1);
+});
+
 async function assertPanel(page) {
   await expect(panel(page)).toBeVisible();
   await expect(panel(page).locator('.panel-head')).toBeVisible();

@@ -45,6 +45,7 @@ const shell = mountShell(workspace, {
 const editor = mountEditor(host, {
   showReferences: () => shell.showReferences(),
   showHistory: () => shell.showHistory(),
+  setDatabaseContext: (visible, activate) => shell.setDatabaseContext(visible, activate),
   updateHistory: model => shell.updateHistory(model)
 });
 host.onEvent(event => { if (event.kind === "documentLoaded") shell.highlightActiveDocument(event.payload.state.note.id); });

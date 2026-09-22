@@ -10,6 +10,7 @@ import { parseDql, executeDql } from "./database-query";
 export function mountEditor(host: EditorHostApi, ui: {
   showReferences?(): void;
   showHistory?(): void;
+  setDatabaseContext?(visible: boolean, activate?: boolean): void;
   updateHistory?(model: HistoryModel): void;
 } = {}) {
 const titleInput = document.querySelector<HTMLInputElement>("#title")!;
@@ -669,61 +670,205 @@ function downloadText(content: string, fileName: string, mimeType: string) {
 function renderDatabases() {
   if (!state || !databasesPanel) return;
   databasesPanel.replaceChildren();
+  const activeId = activeBlock?.dataset.id;
+  const block = activeId ? state.blocks.find(item => item.id === activeId) : undefined;
+  if (!block || (block.type !== "database_table" && block.type !== "data_view")) {
+    ui.setDatabaseContext?.(false);
+    return;
+  }
+  const database = databaseForBlock(block);
+  if (!database) {
+    ui.setDatabaseContext?.(false);
+    return;
+  }
+  ui.setDatabaseContext?.(true);
   const sources = state.databases ?? [];
-  if (!sources.length) { const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "当前笔记本还没有数据库。"; databasesPanel.append(empty); }
-  sources.forEach(database => {
-    const details = document.createElement("details"); details.className = "database-manager-card";
-    const summary = document.createElement("summary"); summary.textContent = `${database.title} · ${database.recordCount} 条`; details.append(summary);
-    const title = document.createElement("input"); title.value = database.title; title.placeholder = "数据库名称";
-    const fields = document.createElement("div"); fields.className = "database-field-list";
-    const drafts = database.fields.map(field => ({ ...field }));
-    const drawFields = () => {
-      fields.replaceChildren();
-      drafts.forEach((field, index) => {
-        const row = document.createElement("div"); row.className = "database-field-row";
-        const name = document.createElement("input"); name.value = field.title; name.placeholder = "字段名"; name.oninput = () => field.title = name.value;
-        const key = document.createElement("input"); key.value = field.key; key.placeholder = "key"; key.oninput = () => field.key = key.value;
-        const type = document.createElement("select");
-        (Object.keys(databaseFieldMeta) as DatabaseField["type"][]).forEach(value => { const option = document.createElement("option"); option.value = value; option.textContent = `${databaseFieldMeta[value].icon} ${databaseFieldMeta[value].label}`; option.selected = field.type === value; type.append(option); });
-        type.onchange = () => { field.type = type.value as DatabaseField["type"]; drawFields(); };
-        row.append(name, key, type);
-        if (field.type === "formula" || field.type === "rule") { const formula = document.createElement("input"); formula.value = field.formula ?? ""; formula.placeholder = 'prop("字段") * 1'; formula.oninput = () => field.formula = formula.value; row.append(formula); }
-        if (field.type === "record_relation" || field.type === "rollup") {
-          const target = document.createElement("select"); const empty = document.createElement("option"); empty.value = ""; empty.textContent = "当前数据库"; target.append(empty);
-          sources.forEach(source => { const option = document.createElement("option"); option.value = source.id; option.textContent = source.title; option.selected = field.relationDatabaseId === source.id; target.append(option); });
-          target.onchange = () => { field.relationDatabaseId = target.value || undefined; drawFields(); }; row.append(target);
-        }
-        if (field.type === "rollup") {
-          const operation = document.createElement("select"); (["count", "sum", "avg", "min", "max", "unique"] as const).forEach(value => { const option = document.createElement("option"); option.value = value; option.textContent = value; option.selected = field.rollup === value; operation.append(option); }); operation.onchange = () => field.rollup = operation.value as DatabaseField["rollup"]; row.append(operation);
-          const targetSource = sources.find(source => source.id === field.relationDatabaseId) ?? database;
-          const targetField = document.createElement("select"); targetSource.fields.forEach(candidate => { const option = document.createElement("option"); option.value = candidate.key; option.textContent = candidate.title; option.selected = field.rollupFieldKey === candidate.key; targetField.append(option); }); targetField.onchange = () => field.rollupFieldKey = targetField.value; row.append(targetField);
-        }
-        const remove = document.createElement("button"); remove.textContent = "×"; remove.title = "删除字段"; remove.onclick = () => { drafts.splice(index, 1); drafts.forEach((item, i) => item.position = String((i + 1) * 1000).padStart(8, "0")); drawFields(); }; row.append(remove); fields.append(row);
-      });
+  const panel = document.createElement("section");
+  panel.className = "database-context-panel";
+  const heading = document.createElement("div");
+  heading.className = "database-context-heading";
+  const headingText = document.createElement("strong");
+  headingText.textContent = block.type === "data_view" ? "查询视图属性" : "数据表属性";
+  const count = document.createElement("span");
+  count.textContent = `${database.recordCount} 条记录`;
+  heading.append(headingText, count);
+  panel.append(heading);
+
+  if (block.type === "data_view") {
+    const source = document.createElement("div");
+    source.className = "database-context-source";
+    source.textContent = `数据源 · ${database.title}`;
+    const query = document.createElement("textarea");
+    query.className = "database-context-query";
+    query.value = block.properties.dataQuery ?? "FROM current";
+    query.setAttribute("aria-label", "DQL 查询");
+    const refresh = document.createElement("button");
+    refresh.textContent = "保存并刷新";
+    refresh.onclick = () => {
+      block.properties = { ...block.properties, dataQuery: query.value };
+      renderAllPanels();
+      scheduleDocumentSave(0);
     };
+    panel.append(source, query, refresh);
+    databasesPanel.append(panel);
+    return;
+  }
+
+  const titleLabel = document.createElement("label");
+  titleLabel.className = "database-context-control";
+  const titleCaption = document.createElement("span");
+  titleCaption.textContent = "数据表名称";
+  const title = document.createElement("input");
+  title.value = database.title;
+  title.placeholder = "数据表名称";
+  title.setAttribute("aria-label", "数据表名称");
+  titleLabel.append(titleCaption, title);
+  panel.append(titleLabel);
+
+  const fields = document.createElement("div");
+  fields.className = "database-context-fields";
+  const drafts = database.fields.map(field => ({ ...field }));
+  const addControl = (container: HTMLElement, caption: string, control: HTMLElement) => {
+    const label = document.createElement("label");
+    label.className = "database-context-control";
+    const text = document.createElement("span");
+    text.textContent = caption;
+    label.append(text, control);
+    container.append(label);
+  };
+  const databaseSelect = (field: DatabaseField) => {
+    const select = document.createElement("select");
+    for (const source of sources) {
+      const option = document.createElement("option");
+      option.value = source.id;
+      option.textContent = source.title;
+      option.selected = (field.relationDatabaseId ?? database.id) === source.id;
+      select.append(option);
+    }
+    select.onchange = () => { field.relationDatabaseId = select.value || database.id; drawFields(); };
+    return select;
+  };
+  const drawFields = () => {
+    fields.replaceChildren();
+    drafts.forEach((field, index) => {
+      const details = document.createElement("details");
+      details.className = "database-context-field";
+      const summary = document.createElement("summary");
+      const icon = document.createElement("span");
+      icon.className = "database-field-icon";
+      icon.textContent = databaseFieldMeta[field.type].icon;
+      const fieldTitle = document.createElement("span");
+      fieldTitle.textContent = field.title || "未命名字段";
+      const fieldType = document.createElement("small");
+      fieldType.textContent = databaseFieldMeta[field.type].label;
+      summary.append(icon, fieldTitle, fieldType);
+      details.append(summary);
+
+      const body = document.createElement("div");
+      body.className = "database-context-field-body";
+      const name = document.createElement("input");
+      name.value = field.title;
+      name.oninput = () => { field.title = name.value; fieldTitle.textContent = name.value || "未命名字段"; };
+      addControl(body, "字段名称", name);
+      const key = document.createElement("input");
+      key.value = field.key;
+      key.oninput = () => field.key = key.value;
+      addControl(body, "属性 key", key);
+      const type = document.createElement("select");
+      (Object.keys(databaseFieldMeta) as DatabaseField["type"][]).forEach(value => {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = `${databaseFieldMeta[value].icon} ${databaseFieldMeta[value].label}`;
+        option.selected = field.type === value;
+        type.append(option);
+      });
+      type.onchange = () => { field.type = type.value as DatabaseField["type"]; drawFields(); };
+      addControl(body, "字段类型", type);
+
+      if (field.type === "formula" || field.type === "rule") {
+        const formula = document.createElement("textarea");
+        formula.value = field.formula ?? "";
+        formula.placeholder = field.type === "rule" ? 'prop("状态") = "完成"' : 'prop("单价") * prop("数量")';
+        formula.oninput = () => field.formula = formula.value;
+        addControl(body, field.type === "rule" ? "规则表达式" : "公式表达式", formula);
+      }
+      if (field.type === "document_relation") {
+        field.relationScope = "document";
+        const hint = document.createElement("p");
+        hint.className = "database-context-hint";
+        hint.textContent = "关联当前笔记本中的文档；单元格保存稳定文档 ID。";
+        body.append(hint);
+      }
+      if (field.type === "record_relation" || field.type === "rollup") {
+        field.relationScope = "record";
+        addControl(body, "关联数据表", databaseSelect(field));
+      }
+      if (field.type === "rollup") {
+        const targetSource = sources.find(source => source.id === field.relationDatabaseId) ?? database;
+        const targetField = document.createElement("select");
+        for (const candidate of targetSource.fields) {
+          const option = document.createElement("option");
+          option.value = candidate.key;
+          option.textContent = `${databaseFieldMeta[candidate.type].icon} ${candidate.title}`;
+          option.selected = field.rollupFieldKey === candidate.key;
+          targetField.append(option);
+        }
+        targetField.onchange = () => field.rollupFieldKey = targetField.value;
+        addControl(body, "汇总字段", targetField);
+        const operation = document.createElement("select");
+        const rollupLabels: Record<NonNullable<DatabaseField["rollup"]>, string> = { count: "计数", sum: "求和", avg: "平均值", min: "最小值", max: "最大值", unique: "去重计数" };
+        (Object.keys(rollupLabels) as NonNullable<DatabaseField["rollup"]>[]).forEach(value => {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = rollupLabels[value];
+          option.selected = (field.rollup ?? "count") === value;
+          operation.append(option);
+        });
+        operation.onchange = () => field.rollup = operation.value as DatabaseField["rollup"];
+        addControl(body, "计算方式", operation);
+      }
+      const remove = document.createElement("button");
+      remove.className = "danger database-context-remove";
+      remove.textContent = "删除字段";
+      remove.onclick = () => {
+        drafts.splice(index, 1);
+        drafts.forEach((item, itemIndex) => item.position = String((itemIndex + 1) * 1000).padStart(8, "0"));
+        drawFields();
+      };
+      body.append(remove);
+      details.append(body);
+      fields.append(details);
+    });
+  };
+  drawFields();
+  panel.append(fields);
+
+  const actions = document.createElement("div");
+  actions.className = "database-manager-actions";
+  const add = document.createElement("button");
+  add.textContent = "+ 添加字段";
+  add.onclick = () => {
+    drafts.push({ id: `field-${newId()}`, databaseId: database.id, key: `field_${drafts.length + 1}`, title: "新字段", type: "text", position: String((drafts.length + 1) * 1000).padStart(8, "0") });
     drawFields();
-    const actions = document.createElement("div"); actions.className = "database-manager-actions";
-    const add = document.createElement("button"); add.textContent = "+ 字段"; add.onclick = () => { drafts.push({ id: `field-${newId()}`, databaseId: database.id, key: `field_${drafts.length + 1}`, title: "新字段", type: "text", position: String((drafts.length + 1) * 1000).padStart(8, "0") }); drawFields(); };
-    const save = document.createElement("button"); save.textContent = "保存字段"; save.onclick = () => { void executeDatabaseCommand({ operation: "save-database-schema", databaseId: database.id, database: { ...database, title: title.value }, fields: drafts }, "database-schema"); };
-    const exportButton = (csv: boolean) => { const button = document.createElement("button"); button.textContent = csv ? "CSV" : "Markdown"; button.onclick = () => { void host.executeCommand({ operation: csv ? "export-database-csv" : "export-database-markdown", databaseId: database.id }, state!.note.id).then(result => { if (result.content) downloadText(result.content, result.fileName ?? `${database.title}.${csv ? "csv" : "md"}`, result.mimeType ?? "text/plain"); }).catch(showError); }; return button; };
-    actions.append(add, save, exportButton(false), exportButton(true)); details.append(title, fields, actions); databasesPanel.append(details);
-  });
-  const properties = document.createElement("section"); properties.className = "database-properties";
-  const propertyTitle = document.createElement("strong"); propertyTitle.textContent = "当前文档属性"; properties.append(propertyTitle);
-  const propertyRecords = sources.flatMap(database => (state!.databaseRecords?.[database.id] ?? []).filter(record => record.sourceDocumentId === state!.note.id).map(record => ({ database, record })));
-  propertyRecords.forEach(({ database, record }) => {
-    const row = document.createElement("div"); row.className = "database-property-record"; const label = document.createElement("span"); label.textContent = database.title; row.append(label);
-    database.fields.filter(field => field.type === "text" || field.type === "number" || field.type === "url").forEach(field => { const input = document.createElement("input"); input.type = field.type === "number" ? "number" : field.type === "url" ? "url" : "text"; input.placeholder = field.title; input.value = String(record.values[field.key] ?? ""); input.onchange = () => { const next = { ...record, values: { ...record.values, [field.key]: field.type === "number" ? Number(input.value) : input.value } }; void executeDatabaseCommand({ operation: "upsert-database-record", databaseId: database.id, record: next }, "document-property"); }; row.append(input); }); properties.append(row);
-  });
-  if (sources.length) { const bind = document.createElement("button"); bind.textContent = "+ 绑定到数据库"; bind.onclick = () => { const database = sources[0]; const record: DatabaseRecord = { id: `record-${newId()}`, databaseId: database.id, position: String(((state!.databaseRecords?.[database.id]?.length ?? 0) + 1) * 1000).padStart(8, "0"), sourceDocumentId: state!.note.id, values: {} }; void executeDatabaseCommand({ operation: "upsert-database-record", databaseId: database.id, record }, "document-property"); }; properties.append(bind); }
-  databasesPanel.prepend(properties);
-  state.blocks.filter(block => block.type === "data_view").forEach(block => {
-    const card = document.createElement("div"); card.className = "database-query-card";
-    const label = document.createElement("strong"); label.textContent = "DQL 查询";
-    const query = document.createElement("textarea"); query.value = block.properties.dataQuery ?? "FROM current";
-    const refresh = document.createElement("button"); refresh.textContent = "保存并刷新"; refresh.onclick = () => { block.properties = { ...block.properties, dataQuery: query.value }; renderAllPanels(); scheduleDocumentSave(0); };
-    card.append(label, query, refresh); databasesPanel.append(card);
-  });
+    fields.lastElementChild?.setAttribute("open", "");
+  };
+  const save = document.createElement("button");
+  save.className = "primary";
+  save.textContent = "保存属性";
+  save.onclick = () => { void saveDatabaseFields(database, drafts, title.value.trim() || "未命名数据表"); };
+  const exportButton = (csv: boolean) => {
+    const button = document.createElement("button");
+    button.textContent = csv ? "导出 CSV" : "导出 Markdown";
+    button.onclick = () => {
+      void host.executeCommand({ operation: csv ? "export-database-csv" : "export-database-markdown", databaseId: database.id }, state!.note.id)
+        .then(result => { if (result.content) downloadText(result.content, result.fileName ?? `${database.title}.${csv ? "csv" : "md"}`, result.mimeType ?? "text/plain"); })
+        .catch(showError);
+    };
+    return button;
+  };
+  actions.append(add, save, exportButton(false), exportButton(true));
+  panel.append(actions);
+  databasesPanel.append(panel);
 }
 
 function renderAllPanels() {
@@ -958,14 +1103,22 @@ function renderOwnBlockShell(block: Block): HTMLElement {
   } else {
     shell.append(createEditableRow(block));
   }
-  shell.addEventListener("pointerdown", () => {
-    if (activeBlock !== shell) {
-      activeBlock = shell;
-      renderComments();
-    }
-  });
+  shell.addEventListener("pointerdown", () => activateOwnBlock(shell, true));
+  shell.addEventListener("focusin", () => activateOwnBlock(shell, true));
   syncBlockCommentBubble(shell, block);
   return shell;
+}
+
+function activateOwnBlock(shell: HTMLElement, activateDatabase: boolean) {
+  const changed = activeBlock !== shell;
+  activeBlock = shell;
+  if (changed) {
+    renderComments();
+    renderDatabases();
+  }
+  const block = state?.blocks.find(item => item.id === shell.dataset.id);
+  if (activateDatabase && (block?.type === "database_table" || block?.type === "data_view"))
+    ui.setDatabaseContext?.(true, true);
 }
 
 function commentsFor(block: Block): BlockComment[] {
@@ -2354,6 +2507,7 @@ function render(next: EditorState) {
   next.references.forEach(reference => reference.blocks = orderBlockTree(reference.blocks));
   state = next;
   activeEditable = null;
+  if (changed) activeBlock = null;
   if (changed) {
     saveFailure = null;
     commandFailure = null;
@@ -2424,6 +2578,7 @@ function createBlock(type: BlockType = "paragraph", parentId: string | null = nu
 
 function removeOwnBlock(shell: HTMLElement | null) {
   if (!shell) return;
+  const removedActiveBlock = activeBlock === shell || (!!activeBlock && shell.contains(activeBlock));
   const removedBlock = state?.blocks.find(block => block.id === shell.dataset.id);
   const removedGroup = removedBlock?.properties.columnGroup;
   const layoutBlock = state?.blocks.find(block => block.id === shell.dataset.id && block.properties.layout === "columns");
@@ -2464,6 +2619,12 @@ function removeOwnBlock(shell: HTMLElement | null) {
     }
   }
   removeReferencesFromLocalState(removedReferenceIds);
+  if (removedActiveBlock) {
+    activeBlock = null;
+    activeEditable = null;
+    renderComments();
+    renderDatabases();
+  }
   recalculateDepths();
   if (!blockSurface.querySelector("[data-own-block]")) addBlock("paragraph");
   scheduleDocumentSave(0);
@@ -3547,48 +3708,71 @@ function renderRelations() {
   referenceSidebarPanel.querySelectorAll<HTMLElement>(".reference-card[data-reference-id]").forEach((el) => {
     existingCards.set(el.dataset.referenceId!, el);
   });
+  const documentGroups = new Map<string, { title: string; references: ReferenceInstance[]; links: typeof ordinaryLinks }>();
+  const groupFor = (documentId: string, title: string) => {
+    const existing = documentGroups.get(documentId);
+    if (existing) return existing;
+    const group = { title, references: [], links: [] as typeof ordinaryLinks };
+    documentGroups.set(documentId, group);
+    return group;
+  };
+  showCards.forEach(reference => groupFor(reference.targetDocumentId, reference.targetTitle).references.push(reference));
+  ordinaryLinks.forEach(link => groupFor(link.documentId, link.label || link.documentId).links.push(link));
+
   // Collect everything into the fragment BEFORE replaceChildren, so the panel is never
   // temporarily blank even if showCards is empty or an error occurs mid-render.
   const fragment = document.createDocumentFragment();
-  for (const reference of showCards) {
-    const existing = existingCards.get(reference.id);
-    const sig = rowSignature(reference);
-    if (existing && (existing as HTMLElement & { __rowSig?: string }).__rowSig === sig) {
-      // Structure unchanged → reuse existing DOM (preserves focused contentEditable).
-      fragment.append(existing);
-    } else {
-      // Either no existing card (new) or structural change (rows added/hidden/moved).
-      const fresh = renderReference(reference, true);
-      (fresh as HTMLElement & { __rowSig?: string }).__rowSig = sig;
-      fragment.append(fresh);
+  for (const [documentId, group] of documentGroups) {
+    const section = document.createElement("section");
+    section.className = "reference-document-group";
+    section.dataset.documentId = documentId;
+    const header = document.createElement("header");
+    header.className = "reference-document-head";
+    const title = document.createElement("button");
+    title.type = "button";
+    title.className = "reference-document-title reference-title";
+    title.dataset.targetId = documentId;
+    title.textContent = group.title || "未命名文档";
+    title.title = "打开源文档";
+    const total = document.createElement("span");
+    total.className = "reference-document-count";
+    total.textContent = `${group.references.length + group.links.length} 项`;
+    header.append(title, total);
+    section.append(header);
+    const items = document.createElement("div");
+    items.className = "reference-document-items";
+    for (const reference of group.references) {
+      const existing = existingCards.get(reference.id);
+      const sig = rowSignature(reference);
+      const card = existing && (existing as HTMLElement & { __rowSig?: string }).__rowSig === sig
+        ? existing
+        : renderReference(reference, true);
+      (card as HTMLElement & { __rowSig?: string }).__rowSig = sig;
+      items.append(card);
+      existingCards.delete(reference.id);
     }
-    existingCards.delete(reference.id);
-  }
-  if (ordinaryLinks.length) {
-    const heading = document.createElement("div");
-    heading.className = "linked-reference-heading";
-    heading.textContent = `普通双链 ${ordinaryLinks.length}`;
-    fragment.append(heading);
-    for (const link of ordinaryLinks) {
+    for (const link of group.links) {
       const entry = document.createElement("section");
       entry.className = "linked-reference-entry";
       entry.dataset.linkKey = link.key;
-      const title = document.createElement("button");
-      title.type = "button";
-      title.className = "reference-title";
-      title.dataset.targetId = link.documentId;
-      if (link.blockId) title.dataset.targetBlockId = link.blockId;
-      title.textContent = link.label || "未命名链接";
-      title.title = "悬停预览 · 单击分栏 · 双击打开源";
+      const linkTitle = document.createElement("button");
+      linkTitle.type = "button";
+      linkTitle.className = "reference-title";
+      linkTitle.dataset.targetId = link.documentId;
+      if (link.blockId) linkTitle.dataset.targetBlockId = link.blockId;
+      linkTitle.textContent = link.label || "未命名链接";
+      linkTitle.title = "悬停预览 · 单击分栏 · 双击打开源";
       const excerpt = document.createElement("p");
       excerpt.textContent = link.excerpt || "（空白段落）";
-      entry.append(title, excerpt);
+      entry.append(linkTitle, excerpt);
       entry.addEventListener("click", event => {
         if ((event.target as HTMLElement).closest("button")) return;
-        title.click();
+        linkTitle.click();
       });
-      fragment.append(entry);
+      items.append(entry);
     }
+    section.append(items);
+    fragment.append(section);
   }
   // Remove cards that no longer belong (e.g. reference was removed).
   existingCards.forEach((el) => el.remove());
@@ -4102,7 +4286,10 @@ function addDatabaseTable() {
     { id: `field-${newId()}`, databaseId, key: "total", title: "合计", type: "formula", formula: 'prop("amount") * 1', position: "00003000" }
   ];
   void executeDatabaseCommand({ operation: "create-database", databaseId, database: { id: databaseId, title: "新数据库", fields, recordCount: 0 }, fields }, "create-database").then(() => {
-    const block = createBlock("database_table"); block.properties.databaseId = databaseId; block.properties.databaseViewId = `view-${databaseId}`; block.properties.databaseSource = "database"; state!.blocks.push(block); state!.blocks = orderBlockTree(state!.blocks); renderAllPanels(); scheduleDocumentSave(0);
+    const block = createBlock("database_table"); block.properties.databaseId = databaseId; block.properties.databaseViewId = `view-${databaseId}`; block.properties.databaseSource = "database"; state!.blocks.push(block); state!.blocks = orderBlockTree(state!.blocks); renderAllPanels();
+    const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(block.id)}"]`);
+    if (shell) activateOwnBlock(shell, true);
+    scheduleDocumentSave(0);
   }).catch(showError);
 }
 
@@ -4111,7 +4298,10 @@ function addDataView() {
   const database = state.databases?.[0];
   if (!database) { saveStatus.textContent = "请先插入一个数据库表"; return; }
   const block = createBlock("data_view"); block.properties.databaseId = database.id; block.properties.dataQuery = `TABLE ${database.fields.map(field => field.key).join(", ")}\nFROM current\nLIMIT 50`;
-  state.blocks.push(block); state.blocks = orderBlockTree(state.blocks); renderAllPanels(); scheduleDocumentSave(0);
+  state.blocks.push(block); state.blocks = orderBlockTree(state.blocks); renderAllPanels();
+  const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(block.id)}"]`);
+  if (shell) activateOwnBlock(shell, true);
+  scheduleDocumentSave(0);
 }
 
 function parseGfmTable(source: string) {
@@ -4139,7 +4329,10 @@ function convertGfmBlockToDatabase(block: Block) {
   }).then(() => {
     const current = state?.blocks.find(item => item.id === block.id); if (!current || !state) return;
     current.type = "database_table"; current.properties = { ...current.properties, databaseId, databaseViewId: `view-${databaseId}`, databaseSource: "gfm" }; current.content = { text: "", html: "" };
-    renderAllPanels(); scheduleDocumentSave(0);
+    renderAllPanels();
+    const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(current.id)}"]`);
+    if (shell) activateOwnBlock(shell, true);
+    scheduleDocumentSave(0);
   });
   void chain.catch(showError);
 }
@@ -4356,6 +4549,7 @@ function updateEditorModeUi() {
 
 async function switchEditorMode(next: EditorMode) {
   if (next === editorMode) return;
+  const activeId = activeBlock?.dataset.id;
   if (state && editorMode !== "preview") {
     enqueueDocumentSave();
     await flush();
@@ -4370,6 +4564,10 @@ async function switchEditorMode(next: EditorMode) {
   updateEditorModeUi();
   if (!state) return;
   renderAllPanels();
+  if (activeId) {
+    const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(activeId)}"]`);
+    if (shell) activateOwnBlock(shell, true);
+  }
   saveStatus.textContent = editorMode === "preview" ? "预览模式" : editorMode === "source" ? "Markdown 源码模式" : "编辑模式";
 }
 

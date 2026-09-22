@@ -110,6 +110,32 @@ button.database-computed-cell:hover { background: #eef4ff; color: #1849a9; }
 .database-relation { min-height: 52px; }
 .database-properties { display: grid; gap: 6px; margin: 8px; padding: 8px; border-bottom: 1px solid #eaecf0; }
 .database-property-record { display: grid; gap: 4px; }
+.database-context-panel { display: grid; gap: 8px; padding: 8px 10px 14px; }
+.database-context-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding-bottom: 7px; border-bottom: 1px solid #eaecf0; color: #344054; }
+.database-context-heading strong { font-size: 13px; }
+.database-context-heading span, .database-context-source { color: #98a2b3; font-size: 11px; }
+.database-context-control { display: grid; gap: 4px; color: #667085; font-size: 11px; }
+.database-context-control input, .database-context-control select, .database-context-control textarea { width: 100%; box-sizing: border-box; min-width: 0; border: 1px solid #d0d5dd; border-radius: 4px; padding: 5px 6px; background: #fff; color: #344054; font: inherit; }
+.database-context-query { width: 100%; min-height: 110px; box-sizing: border-box; resize: vertical; border: 1px solid #d0d5dd; border-radius: 4px; padding: 7px; font: 12px/1.5 monospace; }
+.database-context-fields { display: grid; gap: 5px; }
+.database-context-field { border: 1px solid #eaecf0; border-radius: 5px; background: #fff; overflow: hidden; }
+.database-context-field > summary { display: flex; align-items: center; gap: 6px; padding: 7px; cursor: pointer; list-style: none; color: #344054; font-size: 12px; }
+.database-context-field > summary::-webkit-details-marker { display: none; }
+.database-context-field > summary small { margin-left: auto; color: #98a2b3; font-size: 10px; }
+.database-context-field-body { display: grid; gap: 7px; padding: 8px; border-top: 1px solid #eaecf0; background: #fcfcfd; }
+.database-context-field-body textarea { min-height: 62px; resize: vertical; font: 11px/1.45 monospace; }
+.database-context-hint { margin: 0; color: #98a2b3; font-size: 10px; line-height: 1.5; }
+.database-context-remove { justify-self: start; }
+.database-context-panel .database-manager-actions { margin-top: 2px; }
+
+.reference-document-group { display: grid; gap: 3px; margin: 5px 0 10px; }
+.reference-document-head { display: flex; align-items: center; gap: 6px; padding: 4px 2px 5px; border-bottom: 1px solid #eaecf0; }
+.reference-document-title { flex: 1; min-width: 0; padding: 0; border: 0; background: transparent; color: #344054; text-align: left; font-size: 12px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.reference-document-title:hover { color: #175cd3; }
+.reference-document-count { color: #98a2b3; font-size: 10px; }
+.reference-document-items { display: grid; gap: 4px; }
+.reference-document-items .reference-card { margin-left: 0; }
+.reference-document-items .linked-reference-entry { border-top: 0; padding: 5px 2px 5px 8px; }
 .media-preview { flex: 1 1 auto; min-width: 0; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; }
 .media-stage { position: relative; width: fit-content; max-width: 100%; }
 .media-stage[data-media-align="center"] { margin-left: auto; margin-right: auto; }

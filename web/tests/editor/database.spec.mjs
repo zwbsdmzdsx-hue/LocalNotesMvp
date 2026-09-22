@@ -168,3 +168,29 @@ test('media and rule field types keep typed previews across modes', async ({ pag
   await expect(table.locator('.database-source')).toContainText('type: media');
   await expect(table.locator('.database-source')).toContainText('type: rule');
 });
+
+test('database sidebar is contextual and clears when the active table is deleted', async ({ page }) => {
+  await page.goto('/');
+  const tab = page.locator('[data-pane-btn="databases"]');
+  await expect(tab).toBeHidden();
+  await page.locator('#add-database').click();
+  const table = page.locator('[data-own-block][data-type="database_table"]');
+  await expect(table).toBeVisible();
+  await expect(tab).toBeVisible();
+  await expect(page.locator('#databases-section')).toBeVisible();
+  await expect(page.locator('#databases .database-context-panel input[aria-label="数据表名称"]')).toHaveValue('新数据库');
+  await expect(page.locator('#databases .database-context-field')).toHaveCount(3);
+  const formulaField = page.locator('#databases .database-context-field').filter({ hasText: '合计' });
+  await formulaField.locator('summary').click();
+  await expect(formulaField).toContainText('公式表达式');
+  await expect(formulaField.locator('textarea')).toHaveValue('prop("amount") * 1');
+
+  await page.locator('[data-id="a1"]').click();
+  await expect(tab).toBeHidden();
+  await expect(page.locator('#databases-section')).toBeHidden();
+
+  await table.locator('.delete-block').click();
+  await expect(table).toHaveCount(0);
+  await expect(tab).toBeHidden();
+  await expect(page.locator('#databases')).toBeEmpty();
+});

@@ -54,6 +54,7 @@ export interface ShellApi {
   highlightActiveDocument(documentId: string): void;
   showReferences(): void;
   showHistory(): void;
+  setDatabaseContext(visible: boolean, activate?: boolean): void;
   updateHistory(model: HistoryModel): void;
 }
 
@@ -93,6 +94,8 @@ const BOOKMARK_COLORS = [
 
 export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellApi {
   const layout = loadLayout();
+  let databaseContextVisible = false;
+  let rightTabBeforeDatabase = layout.rightActiveTab === "databases" ? "reference-sidebar" : layout.rightActiveTab;
   function execute(command: WorkspaceCommand) {
     void workspace.execute(command).then(() => renderAll()).catch(cb.onError);
   }
@@ -124,7 +127,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       { tab: "comments", label: "注释管理", slot: "comments" },
       { tab: "history", label: "历史记录", slot: "history" },
       { tab: "styles", label: "CSS 管理", slot: "styles" },
-      { tab: "databases", label: "数据库与查询", slot: "databases" }
+      { tab: "databases", label: "数据表属性", slot: "databases" }
     ];
     for (const s of sections) {
       const sec = document.createElement("section");
@@ -143,9 +146,12 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
   }
 
   function applyRightTab(tab?: string) {
-    const active = tab ?? layout.rightActiveTab;
+    let active = tab ?? layout.rightActiveTab;
+    if (active === "databases" && !databaseContextVisible) active = rightTabBeforeDatabase || "reference-sidebar";
+    if (active !== "databases") rightTabBeforeDatabase = active;
     layout.rightActiveTab = active;
     sidebarRight.querySelectorAll<HTMLElement>("[data-pane-btn]").forEach((b) => {
+      if (b.dataset.paneBtn === "databases") b.hidden = !databaseContextVisible;
       b.classList.toggle("active", b.dataset.paneBtn === active);
     });
     // Only top-level panel sections (direct children of sidebarRightBody), not inner reference cards.
@@ -153,6 +159,19 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       if (s instanceof HTMLElement && s.dataset.panel) s.hidden = s.dataset.panel !== active;
     });
     saveLayout(layout);
+  }
+
+  function setDatabaseContext(visible: boolean, activate = false) {
+    databaseContextVisible = visible;
+    if (visible && activate) {
+      if (layout.rightCollapsed) {
+        layout.rightCollapsed = false;
+        applyWidths();
+      }
+      applyRightTab("databases");
+      return;
+    }
+    applyRightTab(!visible && layout.rightActiveTab === "databases" ? rightTabBeforeDatabase : undefined);
   }
 
   // ── Left sidebar top tabs (docs / search / outline) ────────────────
@@ -837,6 +856,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     highlightActiveDocument: (id: string) => renderAll(id),
     showReferences,
     showHistory,
+    setDatabaseContext,
     updateHistory,
     renderAll,
     renderOutline
@@ -846,6 +866,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     refresh: () => renderAll(),
     showReferences,
     showHistory,
+    setDatabaseContext,
     updateHistory,
     highlightActiveDocument: (id: string) => renderAll(id)
   };
