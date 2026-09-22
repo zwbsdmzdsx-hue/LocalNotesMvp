@@ -51,6 +51,13 @@ CSS 样式资源也通过 `executeCommand` 保存：`save-style` 携带 `id/titl
 
 数据库字段类型包含 `text`、`number`、`url`、`media`、`formula`、`rule`、`document_relation`、`record_relation` 和 `rollup`。`media` 值复用 `MediaAsset` JSON；上传仍先走 `storeMedia`，再由 `upsert-database-record` 保存。公式和规则字段在编辑模式显示运算结果，用户点击单元格时才编辑字段表达式；源码模式显示声明里的 `formula`，预览模式只显示结果。
 
+Canonical DTO 约束：标题块使用 `properties.headingLevel`（1 到 6），源码中的
+`#` 只负责序列化和解析；工具栏创建的无 `#` 标题仍由该属性明确表示为 H1。
+数据库正文块只绑定 `properties.databaseId`，视图通过 `databaseViews` 的
+`databaseId` 关联；`databaseViewId` 是旧快照兼容字段，新编辑器不会写入。
+分栏只使用下方约定的 `columnGroup/column/columnWidths`，旧 `layout` 容器字段
+只在加载迁移时读取。
+
 媒体上传使用 `storeMedia` 请求。payload 为 `{ name, mimeType, size, data }`，其中 `data` 是不带 data URL 前缀的 base64 内容；宿主返回 `{ media: { id, kind, name, mimeType, size, url } }`。宿主将内容复制到应用数据库旁的 `media` 目录并返回持久 `file:///` 地址。浏览器 Mock 返回内存 data URL。正文媒体块使用 `type: "media"`，并在 `content.media` 保存该资源对象，随 `saveDocument` 快照持久化。`kind` 支持 `image`、`video`、`audio`、`pdf` 和普通 `file`；`content.caption` 保存用户编辑的说明文字，`properties.textAlign` 保存媒体对齐方式，`properties.mediaWidth` 保存图片预览宽度百分比。文件选择、拖放和剪贴板图片都必须先调用 `storeMedia`，再创建同一种媒体块；PDF 使用统一预览组件的内嵌阅读器，普通文件提供下载链接。
 
 `saveDocument` is a serialized transaction. Its payload includes the document

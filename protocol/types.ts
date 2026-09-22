@@ -14,18 +14,22 @@ export type BlockProperties = {
   textAlign?: "left" | "center" | "right";
   /** Relative width of a media preview, expressed as a percentage of its block. */
   mediaWidth?: number;
-  /** A paragraph block with this layout owns a set of visual columns. */
+  /** Explicit heading semantics. Markdown source is a serialization of this value. */
+  headingLevel?: 1 | 2 | 3 | 4 | 5 | 6;
+  /** @deprecated Legacy column-container representation. Read only for migration. */
   layout?: "columns";
-  /** Zero-based column index for blocks whose nearest columns ancestor owns them. */
+  /** @deprecated Legacy column-container representation. Read only for migration. */
   column?: number;
-  /** Number of columns rendered by a columns layout block. */
+  /** @deprecated Legacy column-container representation. Read only for migration. */
   columnCount?: number;
+  /** @deprecated Legacy column-container representation. Read only for migration. */
   columnGap?: string;
-  /** Shared visual row identity for Notion-like columns. */
+  /** Canonical shared visual row identity for Notion-like columns. */
   columnGroup?: string;
-  /** Persisted widths as CSS grid fractions for this column row. */
+  /** Canonical persisted widths as CSS grid fractions for this column row. */
   columnWidths?: number[];
   databaseId?: string;
+  /** @deprecated Views are resolved from databaseId and databaseViews. Read only for old snapshots. */
   databaseViewId?: string;
   databaseSource?: "gfm" | "database";
   dataQuery?: string;

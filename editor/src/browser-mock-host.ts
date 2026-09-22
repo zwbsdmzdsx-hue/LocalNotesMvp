@@ -523,7 +523,11 @@ export class BrowserMockHost implements HostTransport {
     const source = block.content.markdown ?? block.content.text ?? "";
     const line = source.split(/\r?\n/).find(value => value.trim()) ?? "";
     const match = line.match(/^\s*(#{1,6})[ \u3000]+(.+?)\s*$/);
-    return match ? { level: match[1].length, title: match[2].trim() } : null;
+    const title = (block.content.text ?? source).trim();
+    if (block.type === "heading" && block.properties.headingLevel && title)
+      return { level: block.properties.headingLevel, title };
+    return match ? { level: match[1].length as 1 | 2 | 3 | 4 | 5 | 6, title: match[2].trim() } :
+      (block.type === "heading" && title ? { level: 1 as const, title } : null);
   }
   private headingSection(blocks: EditorState["blocks"], headingId: string) {
     const ordered = orderBlockTree(blocks);

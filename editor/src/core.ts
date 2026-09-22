@@ -1884,9 +1884,18 @@ function headingInfo(block: Block) {
   const source = markdownFromContent(block.content);
   const line = source.split(/\r?\n/).find(value => value.trim()) ?? "";
   const match = line.match(/^\s*(#{1,6})[ \u3000]+(.+?)\s*$/);
-  if (match) return { level: match[1].length, title: match[2].trim() };
   const title = plainTextFromContent(block.content).trim();
+  if (block.type === "heading" && block.properties.headingLevel && title) {
+    return { level: block.properties.headingLevel, title };
+  }
+  if (match) return { level: match[1].length as 1 | 2 | 3 | 4 | 5 | 6, title: match[2].trim() };
   return block.type === "heading" && title ? { level: 1, title } : null;
+}
+
+function headingLevelFromMarkdown(content: BlockContent) {
+  const line = markdownFromContent(content).split(/\r?\n/).find(value => value.trim()) ?? "";
+  const match = line.match(/^\s*(#{1,6})[ \u3000]+/);
+  return match ? match[1].length as 1 | 2 | 3 | 4 | 5 | 6 : undefined;
 }
 function headingSection(blocks: Block[], headingId: string) {
   const ordered = orderBlockTree(blocks);
@@ -2052,158 +2061,9 @@ function blockDepth(block: Block, all: Block[]) {
   return depth;
 }
 
-function findBlock(blockId: string | null | undefined) {
-  return blockId && state ? state.blocks.find(candidate => candidate.id === blockId) : undefined;
-}
-
-/** Return the nearest columns layout that owns this block, if any. */
-function columnAncestor(block: Block) {
-  if (block.properties.columnGroup) {
-    return { id: block.properties.columnGroup, parentId: null, position: "", type: "paragraph", content: { text: "", html: "" }, properties: { layout: "columns", columnCount: columnCountForGroup(block.properties.columnGroup) }, revision: 0 } as Block;
-  }
-  let parent = findBlock(block.parentId);
-  const visited = new Set<string>();
-  while (parent && !visited.has(parent.id)) {
-    if (parent.properties.layout === "columns") return parent;
-    visited.add(parent.id);
-    parent = findBlock(parent.parentId);
-  }
-  return undefined;
-}
-
-function columnCountForGroup(groupId: string) {
-  if (!state) return 2;
-  return Math.max(2, ...state.blocks.filter(block => block.properties.columnGroup === groupId).map(block => columnIndex(block) + 1));
-}
-
 function columnIndex(block: Block, fallback = 0) {
   const value = block.properties.column;
   return Number.isInteger(value) && value! >= 0 ? value! : fallback;
-}
-
-function columnRelativeDepth(block: Block, container: Block) {
-  return Math.max(0, blockDepth(block, state?.blocks ?? []) - blockDepth(container, state?.blocks ?? []) - 1);
-}
-
-function columnMembers(container: Block) {
-  if (!state) return [];
-  if (container.properties.columnGroup) return state.blocks.filter(block => block.properties.columnGroup === container.properties.columnGroup);
-  if (container.properties.layout === "columns") return state.blocks.filter(block => {
-    let parent = findBlock(block.parentId);
-    while (parent) {
-      if (parent.id === container.id) return true;
-      parent = findBlock(parent.parentId);
-    }
-    return false;
-  });
-  return state.blocks.filter(block => columnAncestor(block)?.id === container.id);
-}
-
-function clearColumnPlacement(block: Block) {
-  const { column: _column, ...properties } = block.properties;
-  block.properties = properties;
-}
-
-function normalizeSiblingPositions(parentId: string | null, column?: number) {
-  if (!state) return;
-  const siblings = state.blocks
-    .filter(block => block.parentId === parentId && (column === undefined || columnIndex(block) === column))
-    .sort((left, right) => left.position.localeCompare(right.position) || left.id.localeCompare(right.id));
-  siblings.forEach((block, index) => { block.position = String((index + 1) * 1000).padStart(8, "0"); });
-}
-
-function removeEmptyColumnContainers() {
-  if (!state) return;
-  const empty = state.blocks.filter(block => block.properties.layout === "columns" && !state!.blocks.some(child => child.parentId === block.id));
-  if (!empty.length) return;
-  const ids = new Set(empty.map(block => block.id));
-  state.blocks = state.blocks.filter(block => !ids.has(block.id));
-}
-
-function createColumnLayout(container: Block) {
-  const layout = document.createElement("div");
-  layout.className = "columns-layout";
-  layout.dataset.containerId = container.id;
-  syncColumnsContainerLayout(layout, container);
-  return layout;
-}
-
-function syncColumnsContainerLayout(layout: HTMLElement, container: Block) {
-  const count = Math.max(2, Math.min(6, Math.floor(container.properties.columnCount ?? 2)));
-  layout.style.setProperty("--column-count", String(count));
-  layout.style.setProperty("--column-gap", container.properties.columnGap ?? "16px");
-  const members = columnMembers(container);
-  const wanted = new Set(members.map(block => block.id));
-  layout.querySelectorAll<HTMLElement>(":scope > .column-slot > [data-own-block]").forEach(shell => {
-    if (!wanted.has(shell.dataset.id ?? "")) shell.remove();
-  });
-  for (let index = 0; index < count; index++) {
-    let slot = layout.querySelector<HTMLElement>(`:scope > .column-slot[data-column="${index}"]`);
-    if (!slot) {
-      slot = document.createElement("div");
-      slot.className = "column-slot";
-      slot.dataset.column = String(index);
-      const head = document.createElement("div");
-      head.className = "column-slot-head";
-      const grip = document.createElement("button");
-      grip.type = "button";
-      grip.className = "column-grip";
-      grip.draggable = editorMode !== "preview";
-      grip.textContent = "⠿";
-      grip.title = "拖拽调整列顺序";
-      grip.setAttribute("aria-label", `第 ${index + 1} 列菜单`);
-      const label = document.createElement("span");
-      label.textContent = `第 ${index + 1} 列`;
-      const add = document.createElement("button");
-      add.type = "button";
-      add.className = "column-add-child";
-      add.textContent = "+";
-      add.title = "在此列添加子块";
-      add.disabled = editorMode === "preview";
-      add.addEventListener("click", () => addColumnChild(container.id, index));
-      head.append(grip, label, add);
-      slot.append(head);
-      layout.append(slot);
-    } else {
-      const grip = slot.querySelector<HTMLButtonElement>(".column-grip");
-      if (grip) grip.draggable = editorMode !== "preview";
-      const add = slot.querySelector<HTMLButtonElement>(".column-add-child");
-      if (add) add.disabled = editorMode === "preview";
-      const label = slot.querySelector<HTMLElement>(":scope > .column-slot-head > span");
-      if (label) label.textContent = `第 ${index + 1} 列`;
-    }
-  }
-  layout.querySelectorAll<HTMLElement>(":scope > .column-slot").forEach(slot => {
-    const index = Number(slot.dataset.column);
-    if (index >= count) slot.remove();
-  });
-  members.forEach(block => {
-    const index = Math.min(count - 1, columnIndex(block));
-    const slot = layout.querySelector<HTMLElement>(`:scope > .column-slot[data-column="${index}"]`);
-    if (!slot) return;
-    let shell = layout.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(block.id)}"]`);
-    if (!shell || shell.dataset.editorMode !== editorMode) {
-      shell?.remove();
-      shell = renderOwnBlockShell(block);
-    }
-    shell.dataset.column = String(index);
-    shell.style.setProperty("--depth", String(columnRelativeDepth(block, container)));
-    slot.append(shell);
-  });
-}
-
-function syncColumnsContainer(shell: HTMLElement, block: Block) {
-  let layout = shell.querySelector<HTMLElement>(":scope > .columns-layout");
-  if (!layout) {
-    layout = createColumnLayout(block);
-    shell.append(layout);
-  } else syncColumnsContainerLayout(layout, block);
-  const restore = shell.querySelector<HTMLButtonElement>(":scope > .block-row .delete-block");
-  if (restore) {
-    restore.title = "还原为普通块并保留内容";
-    restore.setAttribute("aria-label", "还原为普通块并保留内容");
-    restore.onclick = () => restoreColumns(shell);
-  }
 }
 
 /** Convert the old hidden layout-block representation to ordinary blocks that
@@ -2235,6 +2095,22 @@ function migrateLegacyColumns(blocks: Block[]) {
     const { column, columnCount: _count, columnGap: _gap, ...properties } = block.properties;
     return { ...block, parentId: replacement.parentId, properties: { ...properties, columnGroup: replacement.group, column: column ?? 0 } };
   });
+}
+
+function normalizeCanonicalBlockProperties(block: Block) {
+  if (block.type === "heading") {
+    const parsedLevel = headingLevelFromMarkdown(block.content);
+    if (!block.properties.headingLevel) block.properties.headingLevel = parsedLevel ?? 1;
+  }
+  if (block.properties.columnGroup) {
+    const { layout: _layout, columnCount: _count, columnGap: _gap, ...properties } = block.properties;
+    block.properties = properties;
+  }
+  if (block.properties.databaseViewId) {
+    const { databaseViewId: _view, ...properties } = block.properties;
+    block.properties = properties;
+  }
+  return block;
 }
 
 function syncColumnGroups() {
@@ -2488,7 +2364,7 @@ function render(next: EditorState) {
   if (changed) { sidebarLink = null; sidebarSequence++; styleSelection = null; }
   // Upgrade the old hidden layout-block representation once when a document is
   // loaded. New columns are ordinary root blocks sharing a columnGroup.
-  next.blocks = migrateLegacyColumns(next.blocks);
+  next.blocks = migrateLegacyColumns(next.blocks).map(normalizeCanonicalBlockProperties);
   const blockById = new Map(next.blocks.map(block => [block.id, block]));
   next.blocks.forEach(block => {
     if (block.properties.columnGroup) {
@@ -2497,7 +2373,7 @@ function render(next: EditorState) {
     }
     if (!block.parentId) return;
     const parent = blockById.get(block.parentId);
-    if (block.type !== "reference" && parent?.properties.layout !== "columns") {
+    if (block.type !== "reference") {
       block.parentId = null;
       const { column: _column, columnGroup: _group, columnWidths: _widths, ...properties } = block.properties;
       block.properties = properties;
@@ -2581,11 +2457,6 @@ function removeOwnBlock(shell: HTMLElement | null) {
   const removedActiveBlock = activeBlock === shell || (!!activeBlock && shell.contains(activeBlock));
   const removedBlock = state?.blocks.find(block => block.id === shell.dataset.id);
   const removedGroup = removedBlock?.properties.columnGroup;
-  const layoutBlock = state?.blocks.find(block => block.id === shell.dataset.id && block.properties.layout === "columns");
-  if (layoutBlock) {
-    restoreColumns(shell);
-    return;
-  }
   const removedReferenceIds = new Set<string>();
   shell.querySelectorAll<HTMLElement>("[data-own-block][data-type='reference']").forEach(referenceShell => {
     const reference = state?.references.find(item => item.hostBlockId === referenceShell.dataset.id);
@@ -2660,18 +2531,8 @@ function createEditableRow(block: Block) {
     return row;
   }
   row.className = "block-row";
-  if (block.properties.layout === "columns") row.classList.add("columns-container-row");
   const checkbox = block.type === "todo" ? `<input class="todo-check" type="checkbox" ${block.content.checked ? "checked" : ""}>` : "";
   row.innerHTML = `<button type="button" class="grip" aria-label="块菜单" draggable="${editorMode !== "preview"}">⠿</button>${checkbox}<div class="block-text ${block.type === "heading" ? "heading" : ""}"></div><button class="delete-block" title="删除块">×</button>`;
-  if (block.properties.layout === "columns") {
-    const restore = row.querySelector<HTMLButtonElement>(".delete-block");
-    if (restore) {
-      restore.classList.add("columns-restore");
-      restore.textContent = "↶";
-      restore.title = "还原为普通块并保留内容";
-      restore.setAttribute("aria-label", "还原为普通块并保留内容");
-    }
-  }
   const editable = row.querySelector<HTMLElement>(".block-text")!;
   if (editorMode === "source") {
     editable.classList.add("markdown-source");
@@ -3197,6 +3058,8 @@ function handleBlockKeydown(event: KeyboardEvent) {
     next.properties = { ...currentBlock.properties };
     delete next.properties.layout;
     delete next.properties.columnCount;
+    delete next.properties.columnGap;
+    delete next.properties.headingLevel;
   }
 
   const editable = event.currentTarget as HTMLElement;
@@ -3285,23 +3148,27 @@ function readOwnBlocks(): Block[] {
       : editorMode === "source"
         ? contentFromMarkdown(sourceText(editable), old?.content ?? { text: "", html: "" })
         : contentFromRichEditable(editable, old?.content ?? { text: "", html: "" });
+    const properties: BlockProperties = editorMode === "rich"
+      ? {
+        ...(old?.properties ?? {}),
+        background: editable.style.backgroundColor || undefined,
+        textColor: editable.style.color || undefined,
+        textAlign: editable.style.textAlign === "left" || editable.style.textAlign === "center" || editable.style.textAlign === "right" ? editable.style.textAlign : undefined,
+        ...(columnGroup ? { columnGroup, column } : shell.dataset.column === "" ? {} : { column: Number(shell.dataset.column) })
+      }
+      : {
+        ...(old?.properties ?? {}),
+        ...(old?.properties.textAlign ? { textAlign: old.properties.textAlign } : {}),
+        ...(columnGroup ? { columnGroup, column } : shell.dataset.column === "" ? {} : { column: Number(shell.dataset.column) })
+      };
+    if (shell.dataset.type === "heading") {
+      properties.headingLevel = headingLevelFromMarkdown(content) ?? properties.headingLevel ?? 1;
+    }
     return {
       id: shell.dataset.id!, parentId, position,
       type: shell.dataset.type as BlockType,
       content: { ...content, checked: shell.querySelector<HTMLInputElement>(".todo-check")?.checked ?? old?.content.checked ?? false },
-      properties: editorMode === "rich"
-        ? {
-          ...(old?.properties ?? {}),
-          background: editable.style.backgroundColor || undefined,
-          textColor: editable.style.color || undefined,
-          textAlign: editable.style.textAlign === "left" || editable.style.textAlign === "center" || editable.style.textAlign === "right" ? editable.style.textAlign : undefined,
-           ...(columnGroup ? { columnGroup, column } : shell.dataset.column === "" ? {} : { column: Number(shell.dataset.column) })
-        }
-        : {
-          ...(old?.properties ?? {}),
-          ...(old?.properties.textAlign ? { textAlign: old.properties.textAlign } : {}),
-           ...(columnGroup ? { columnGroup, column } : shell.dataset.column === "" ? {} : { column: Number(shell.dataset.column) })
-        },
+      properties,
       revision: old?.revision ?? 1
     };
   });
@@ -4254,6 +4121,7 @@ function addBlock(type: BlockType, options: { focusFirst?: boolean } = {}) {
   if (editorMode === "preview") return;
   if (!state) return;
   const block = createBlock(type);
+  if (type === "heading") block.properties.headingLevel = 1;
   state.blocks.push(block);
   const shell = renderOwnBlockShell(block);
   blockSurface.append(shell);
@@ -4286,7 +4154,7 @@ function addDatabaseTable() {
     { id: `field-${newId()}`, databaseId, key: "total", title: "合计", type: "formula", formula: 'prop("amount") * 1', position: "00003000" }
   ];
   void executeDatabaseCommand({ operation: "create-database", databaseId, database: { id: databaseId, title: "新数据库", fields, recordCount: 0 }, fields }, "create-database").then(() => {
-    const block = createBlock("database_table"); block.properties.databaseId = databaseId; block.properties.databaseViewId = `view-${databaseId}`; block.properties.databaseSource = "database"; state!.blocks.push(block); state!.blocks = orderBlockTree(state!.blocks); renderAllPanels();
+    const block = createBlock("database_table"); block.properties.databaseId = databaseId; block.properties.databaseSource = "database"; state!.blocks.push(block); state!.blocks = orderBlockTree(state!.blocks); renderAllPanels();
     const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(block.id)}"]`);
     if (shell) activateOwnBlock(shell, true);
     scheduleDocumentSave(0);
@@ -4328,7 +4196,7 @@ function convertGfmBlockToDatabase(block: Block) {
     return parsed.rows.reduce((tail, values, rowIndex) => tail.then(() => executeDatabaseCommand({ operation: "upsert-database-record", databaseId, record: { id: `record-${newId()}`, databaseId, position: String((rowIndex + 1) * 1000).padStart(8, "0"), sourceDocumentId: state!.note.id, sourceBlockId: block.id, values: Object.fromEntries(fields.map((field, index) => [field.key, values[index] ?? ""])) } }, "database-record").then(() => undefined)), Promise.resolve());
   }).then(() => {
     const current = state?.blocks.find(item => item.id === block.id); if (!current || !state) return;
-    current.type = "database_table"; current.properties = { ...current.properties, databaseId, databaseViewId: `view-${databaseId}`, databaseSource: "gfm" }; current.content = { text: "", html: "" };
+    current.type = "database_table"; current.properties = { ...current.properties, databaseId, databaseSource: "gfm" }; current.content = { text: "", html: "" };
     renderAllPanels();
     const shell = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(current.id)}"]`);
     if (shell) activateOwnBlock(shell, true);
@@ -4473,22 +4341,6 @@ function restoreColumns(shell: HTMLElement) {
   if (shell.dataset.columnGroup) restoreColumnGroup(shell.dataset.columnGroup);
 }
 
-function reorderColumns(containerId: string, from: number, to: number) {
-  if (!state || from === to) return;
-  const container = state.blocks.find(block => block.id === containerId && block.properties.layout === "columns");
-  if (!container) return;
-  const count = Math.max(2, Math.min(6, Math.floor(container.properties.columnCount ?? 2)));
-  if (from < 0 || to < 0 || from >= count || to >= count) return;
-  columnMembers(container).forEach(block => {
-    const current = columnIndex(block);
-    if (current === from) block.properties = { ...block.properties, column: to };
-    else if (from < to && current > from && current <= to) block.properties = { ...block.properties, column: current - 1 };
-    else if (from > to && current >= to && current < from) block.properties = { ...block.properties, column: current + 1 };
-  });
-  renderAllPanels();
-  scheduleDocumentSave(0);
-}
-
 function applyFormat(command: "bold" | "italic" | "hiliteColor") {
   if (!activeEditable || editorMode === "preview") return;
   activeEditable.focus();
@@ -4608,7 +4460,7 @@ function indent(direction: "in" | "out") {
   if (current) {
     // Ordinary blocks are intentionally flat. Columns are the only block hierarchy.
     const block = state?.blocks.find(item => item.id === current.dataset.id);
-    if (block && columnAncestor(block)) saveStatus.textContent = "分列中的块请使用左右拖拽调整";
+    if (block?.properties.columnGroup) saveStatus.textContent = "分列中的块请使用左右拖拽调整";
     else saveStatus.textContent = "正文块不支持普通子级";
     return;
   }

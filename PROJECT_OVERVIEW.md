@@ -35,6 +35,17 @@ flowchart LR
 
 不要把 `npm run build:editor` 当成更新桌面 EXE 的命令；它生成 `editor/dist`。桌面 `.csproj` 执行的是 `web/` 的 `npm run build`，生成并复制 `web/dist`。
 
+### 当前 canonical 规则
+
+为避免同一能力继续出现第二套状态，新版编辑器遵循以下唯一事实来源：
+
+- **标题**：`Block.type="heading"` 表示标题块，`Block.properties.headingLevel` 表示 1–6 级；Markdown 中的 `#` 只是源码序列化。旧块没有等级时按 Markdown 推断，仍没有标记时默认为 H1。工具栏创建标题始终写入 `headingLevel: 1`。
+- **分栏**：普通块通过 `properties.columnGroup`、`column` 和 `columnWidths` 组成列组；不存在独立的分栏容器块。旧的 `layout/columnCount/columnGap` 只允许在加载迁移时读取，保存不会再产生这些字段。
+- **数据库块**：`data_sources/data_fields/data_records/data_values` 是数据唯一来源；正文块只保存 `properties.databaseId`，视图配置由 `databaseViews` 按数据库 ID 关联。旧 `databaseViewId` 只为兼容读取保留，新代码不得写入。
+- **作用域实现**：`editor/` 是当前新版网页入口，`web/` 是桌面兼容入口；两者不是同一运行时。新版先在 `BrowserMockHost` 验证交互，不能把 Mock 当成 SQLite 持久化实现，也不能为同一功能在两端各自发明一套模型。
+
+新增正文能力应先扩展上述 canonical DTO 和宿主命令，再接入渲染与 Mock；禁止把同一数据复制到正文内容、临时 UI 状态和另一张表中。兼容字段必须有明确的迁移入口和退役条件。
+
 ## 3. 技术栈与实际文件导航
 
 桌面目标框架是 `net8.0`；依赖 Avalonia 11.0.0、WebView.Avalonia 11.0.0.1 和 Microsoft.Data.Sqlite 9.0.0。Windows 下使用 WebView2。前端是原生 TypeScript/DOM，没有 React、Vue 或第三方块编辑器框架。Vite 8、TypeScript、Playwright 安装在 `web/` 下，具体版本以 `web/package-lock.json` 为准。
