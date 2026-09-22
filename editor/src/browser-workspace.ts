@@ -22,9 +22,13 @@ export function createBrowserWorkspace(store: BrowserMockHost, session: {
       case "createNotebook": store.notebooksPush(command.notebook); store.openNotebook(command.notebook.id); break;
       case "createBookmark": store.bookmarksPush(command.bookmark); break;
       case "createDocument": store.createDocument(command.document.title, command.document.id, command.bookmarkId, command.parentId ?? null); break;
+      case "createCanvas": store.createCanvas(command.canvas.title, command.canvas.id, command.bookmarkId, command.parentId ?? null); break;
       case "moveDocument": store.moveDocument(command.id, command.bookmarkId, command.parentId, command.index); break;
       case "moveBookmark": store.moveBookmark(command.id, command.index); break;
       case "recolorBookmark": store.recolorBookmark(command.id, command.color); break;
+      case "saveCanvas": store.saveCanvas(command.canvasId, command.nodes, command.viewport, command.mutationId, command.expectedVersion); break;
+      case "undoCanvas": store.moveCanvasHistory(command.canvasId, "undo", command.expectedVersion); break;
+      case "redoCanvas": store.moveCanvasHistory(command.canvasId, "redo", command.expectedVersion); break;
     }
   }
   return {
@@ -33,6 +37,8 @@ export function createBrowserWorkspace(store: BrowserMockHost, session: {
     outline: () => structuredClone(store.docs.get(store.current)?.blocks ?? []),
     search: (query, limit) => store.searchDocuments(query, limit),
     todoDates: () => store.todoDates(),
+    canvas: id => store.canvas(id),
+    canLinkCanvas: (sourceCanvasId, targetCanvasId) => store.canLinkCanvas(sourceCanvasId, targetCanvasId),
     execute(command) {
       const task = tail.catch(() => undefined).then(async () => {
         await session.flush();

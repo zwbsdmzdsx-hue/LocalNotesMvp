@@ -2,7 +2,32 @@ import type { Block } from "../../protocol/types";
 
 export type Notebook = { id: string; name: string };
 export type Bookmark = { id: string; notebookId: string; name: string; color: string };
-export type WorkspaceDocument = { id: string; title: string; bookmarkId: string; parentId: string | null; position: number };
+export type WorkspaceItemKind = "document" | "canvas";
+export type WorkspaceDocument = { id: string; title: string; bookmarkId: string; parentId: string | null; position: number; kind: WorkspaceItemKind };
+export type CanvasNodeKind = "text" | "document" | "canvas";
+export type CanvasDisplayMode = "preview" | "icon";
+export type CanvasNode = {
+  id: string;
+  kind: CanvasNodeKind;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  zIndex: number;
+  content?: string;
+  targetId?: string;
+  displayMode?: CanvasDisplayMode;
+};
+export type CanvasViewport = { x: number; y: number; zoom: number };
+export type CanvasDocument = {
+  id: string;
+  title: string;
+  nodes: CanvasNode[];
+  viewport: CanvasViewport;
+  version: number;
+  canUndo: boolean;
+  canRedo: boolean;
+};
 export type WorkspaceSnapshot = {
   notebooks: Notebook[]; bookmarks: Bookmark[]; openNotebookIds: string[];
   activeNotebookId: string; activeBookmarkId: string; documentIds: string[]; documents: WorkspaceDocument[];
@@ -17,9 +42,12 @@ export type WorkspaceCommand =
   | { type: "createNotebook"; notebook: Notebook }
   | { type: "createBookmark"; bookmark: Bookmark }
   | { type: "createDocument"; document: { id: string; title: string }; bookmarkId: string; parentId?: string | null }
+  | { type: "createCanvas"; canvas: { id: string; title: string }; bookmarkId: string; parentId?: string | null }
   | { type: "moveDocument"; id: string; bookmarkId: string; parentId: string | null; index: number }
   | { type: "moveBookmark"; id: string; index: number }
-  | { type: "recolorBookmark"; id: string; color: string };
+  | { type: "recolorBookmark"; id: string; color: string }
+  | { type: "saveCanvas"; canvasId: string; nodes: CanvasNode[]; viewport: CanvasViewport; mutationId: string; expectedVersion: number }
+  | { type: "undoCanvas" | "redoCanvas"; canvasId: string; expectedVersion: number };
 
 /** Read models and acknowledged commands; no transport or editor DOM exposed to the shell. */
 export interface WorkspaceApi {
@@ -28,5 +56,7 @@ export interface WorkspaceApi {
   outline(): Block[];
   search(query: string, limit?: number): SearchHit[];
   todoDates(): CalendarTodo[];
+  canvas(id: string): CanvasDocument | undefined;
+  canLinkCanvas(sourceCanvasId: string, targetCanvasId: string): boolean;
   execute(command: WorkspaceCommand): Promise<void>;
 }

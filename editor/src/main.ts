@@ -3,10 +3,12 @@ import { EditorHostApi } from "./editor-host-api";
 import { BrowserMockHost } from "./browser-mock-host";
 import { mountShell } from "./shell";
 import { createBrowserWorkspace } from "./browser-workspace";
+import { mountCanvasManager, type CanvasManager } from "./canvas-manager";
 import "./style.css";
 
 const transport = new BrowserMockHost();
 const host = new EditorHostApi(transport);
+let canvasManager: CanvasManager;
 
 const workspace = createBrowserWorkspace(transport, {
   flush: () => editor.flush(),
@@ -20,12 +22,22 @@ const shell = mountShell(workspace, {
   onError: error => editor.showError(error),
   onRestoreHistory: entryId => void editor.restoreHistory(entryId),
   onOpenDocument: (id, blockId) => {
+    canvasManager?.close();
     void editor.flush().then(() => host.openDocument(id, blockId)).then(() => {
       shell.highlightActiveDocument(id);
     }).catch(editor.showError);
   },
+  onOpenCanvas: id => {
+    void editor.flush().then(() => {
+      canvasManager.open(id);
+      shell.highlightActiveDocument(id);
+    }).catch(editor.showError);
+  },
   onNavigateBack: () => {
-    void editor.flush().then(() => host.navigateBack()).catch(editor.showError);
+    if (canvasManager?.isOpen()) {
+      canvasManager.close();
+      void host.loadDocument(transport.current).then(state => editor.load(state)).then(() => shell.highlightActiveDocument(transport.current)).catch(editor.showError);
+    } else void editor.flush().then(() => host.navigateBack()).catch(editor.showError);
   },
   onNavigateForward: () => {
     void editor.flush().then(() => host.navigateForward()).catch(editor.showError);
@@ -52,7 +64,22 @@ const editor = mountEditor(host, {
   setDatabaseContext: (visible, activate) => shell.setDatabaseContext(visible, activate),
   updateHistory: model => shell.updateHistory(model)
 });
-host.onEvent(event => { if (event.kind === "documentLoaded") shell.highlightActiveDocument(event.payload.state.note.id); });
+canvasManager = mountCanvasManager(workspace, {
+  onOpenDocument: id => {
+    canvasManager.close();
+    void editor.flush().then(() => host.openDocument(id)).then(() => shell.highlightActiveDocument(id)).catch(editor.showError);
+  },
+  onOpenCanvas: id => { canvasManager.open(id); shell.highlightActiveDocument(id); },
+  onError: editor.showError,
+  onWorkspaceChanged: () => shell.refresh(),
+  onLoadDocumentPreview: documentId => host.loadDocument(documentId)
+});
+host.onEvent(event => {
+  if (event.kind === "documentLoaded") {
+    canvasManager.close();
+    shell.highlightActiveDocument(event.payload.state.note.id);
+  }
+});
 transport.subscribe(message => {
   if ("requestId" in message && message.ok && message.kind === "saveDocument") shell.refresh();
 });
@@ -71,4 +98,4 @@ bar.querySelector<HTMLButtonElement>("#dev-forward")!.onclick = () => void edito
 bar.querySelector<HTMLButtonElement>("#dev-fail")!.onclick = () => transport.failNextSave = true;
 bar.querySelector<HTMLButtonElement>("#dev-retry")!.onclick = () => editor.retry();
 bar.querySelector<HTMLButtonElement>("#dev-reset-layout")!.onclick = () => { localStorage.removeItem("lnm-shell-layout-v1"); location.reload(); };
-Object.assign(window, { mockHost: transport, shell });
+Object.assign(window, { mockHost: transport, shell, canvasManager });

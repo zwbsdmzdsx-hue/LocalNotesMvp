@@ -4,7 +4,7 @@
 
 ## 1. 产品定位
 
-从本地笔记和桌面便签起步，逐步建设支持稳定对象 ID、块树、双向链接、实时引用、局部覆写的笔记系统。长期目标包括多平台、云同步、思维导图和自由画布，但这些不等于当前已经实现。
+从本地笔记和桌面便签起步，逐步建设支持稳定对象 ID、块树、双向链接、实时引用、局部覆写的笔记系统。新版浏览器已提供内存态自由画布；多平台、云同步、思维导图以及画布的真实数据库落盘仍是后续目标，不能当成当前已经完成。
 
 桌面信息组织是：工作区 → 彩色书签 → 笔记文档 → 块树。文档与书签通过关联表连接，不能简单理解成数据库中每篇文档只能有一个书签。引用关系与真实父子关系也不是一回事。
 
@@ -43,6 +43,7 @@ flowchart LR
 - **分栏**：普通块通过 `properties.columnGroup`、`column` 和 `columnWidths` 组成列组；不存在独立的分栏容器块。旧的 `layout/columnCount/columnGap` 只允许在加载迁移时读取，保存不会再产生这些字段。
 - **数据库块**：`data_sources/data_fields/data_records/data_values` 是数据唯一来源；正文块只保存 `properties.databaseId`，视图配置由 `databaseViews` 按数据库 ID 关联。旧 `databaseViewId` 只为兼容读取保留，新代码不得写入。
 - **地理位置**：位置目录是 `GeoLocation` 的唯一事实来源，支持全局和笔记本 scope；正文 `type="location"` 块只保存 `properties.locationId` 与可选显示名称覆盖，地图管理负责坐标、地址和来源更新。
+- **Canvas**：工作区项目以唯一 `kind=document|canvas` 区分；Canvas 内的文档和 Canvas 节点只保存稳定目标 ID 与几何信息，是打开关系，不修改左侧目录 `parentId`。嵌套引用建立时必须拒绝直接和间接循环。
 - **链接与引用**：默认新建关联统一使用正文 `[[笔记本/文档/块#^块ID]]` 双链。六点菜单只复制这个稳定链接；用户在右栏普通双链条目中明确选择显示方式时，才把该链接升级为同一宿主块下的 `reference_instance`。已有 `reference_instances` 仍可展示、切换模式和编辑兼容内容。
 - **作用域实现**：`editor/` 是当前新版网页入口，`web/` 是桌面兼容入口；两者不是同一运行时。新版先在 `BrowserMockHost` 验证交互，不能把 Mock 当成 SQLite 持久化实现，也不能为同一功能在两端各自发明一套模型。
 
@@ -60,6 +61,7 @@ flowchart LR
 | [editor/src/editor-host-api.ts](editor/src/editor-host-api.ts) | 请求 ID、响应匹配、Promise、10 秒超时、宿主事件订阅 |
 | [editor/src/workspace-api.ts](editor/src/workspace-api.ts) | 侧栏只依赖类型化的快照、搜索、大纲和异步命令接口，不直接读写 Mock 或编辑器 DOM |
 | [editor/src/browser-workspace.ts](editor/src/browser-workspace.ts) | 浏览器工作区适配；命令串行执行，等待编辑保存后修改数据，重命名/删除后同步当前编辑器。原生工作区适配尚未接入 |
+| [editor/src/canvas-manager.ts](editor/src/canvas-manager.ts) | 新版无限画布视图；负责平移缩放、自由卡片、文档/Canvas 引用、移动缩放、预览/Icon 模式和画布历史交互 |
 | [editor/src/mock-save-store.ts](editor/src/mock-save-store.ts) | Mock 保存幂等记录、版本规则和完整快照校验 |
 | [editor/src/block-content.ts](editor/src/block-content.ts) | 正文序列化与 HTML 清理；剥离引用投影、保留空锚点 |
 | [editor/src/markdown.ts](editor/src/markdown.ts) | 新版 Markdown 的安全渲染、旧 HTML 转源码、双链与引用锚点往返 |
@@ -114,7 +116,7 @@ flowchart LR
 
 `blocks.scope_type='canonical'` 表示真实内容；`reference_instance` 表示实例专属新增内容，`scope_id` 关联实例。`parent_id` 与 `position` 构成树与排序，`position` 是同一父块下的兄弟相对顺序；读取、保存和历史恢复都按稳定树先序展开，不能对整篇文档直接按 `position` 扁平排序。当前前端常以补零字符串顺序值排列，不是 CRDT 排序方案。
 
-`documents.client_version` 用于保存事务，`blocks.revision` 用于源块修订与覆写通知。两者不能互换。`views/placements/edges` 有表不代表 Canvas 或思维导图 UI 已完成。
+`documents.client_version` 用于保存事务，`blocks.revision` 用于源块修订与覆写通知。两者不能互换。`views/placements/edges` 仍是预留结构；新版浏览器 Canvas 当前由 Browser Mock 内存模型承载，不能据此推断已接入这些 SQLite 表或桌面端。
 
 ## 5. 保存链路与不可破坏的语义
 
@@ -146,7 +148,7 @@ flowchart LR
 
 新版浏览器编辑器提供“编辑 / 源码 / 预览”三态。编辑态保留现有富文本与引用操作；源码态编辑逐块 Markdown 原文；预览态只读渲染 GFM 标题、强调、删除线、引用、列表、代码、表格及普通链接，并禁用正文结构操作。模式切换会先排空保存队列，正文的 `content_json` 同时保留无损 `markdown`、经 DOMPurify 清理的 `html`、搜索用 `text` 和稳定双链 `links`。旧块没有 `markdown` 时从已有安全 HTML 转换，不修改 SQLite 表结构。该三态目前只接入 4173 的新版编辑器，桌面 EXE 默认加载的兼容编辑器仍是独立入口。
 
-新版 4173 侧栏的书签支持拖拽重排，书签右侧悬浮“+”可创建文档；文档可拖到其他文档下形成最多三层的树，并显示全部后代数量。该层级与排序目前属于浏览器 Mock 的内存工作区快照，未扩展桌面 SQLite/原生工作区协议；刷新浏览器页面会按 fixture 重置。
+新版 4173 侧栏的书签支持拖拽重排，书签右侧悬浮“+”可选择创建文档或 Canvas；两类项目都可在目录中拖到其他项目下形成最多三层的树，并显示全部后代数量。Canvas 正文是可平移缩放的自由画布，可新建自由卡片，也可从左侧拖入文档或其他 Canvas。节点保存稳定目标 ID、坐标、尺寸和层次；文档以可调整大小的只读内容窗口显示，Canvas 可切换缩略图预览或固定圆角方形 Icon，双击或打开按钮进入源项目。Canvas 嵌套是跳转关系，不改目录层级，并阻止直接或间接循环。目录和画布数据目前都属于浏览器 Mock 的内存工作区快照，未扩展桌面 SQLite/原生工作区协议；刷新浏览器页面会按 fixture 重置。
 
 正文分列使用普通块共享列组，而不是单独的布局容器：同一行的根块在 `properties.columnGroup` 中保存相同组 ID，以 `properties.column` 保存零基列号，并用 `properties.columnWidths` 保存相对列宽；所有列块保持 `parentId=null`，同一列可按普通 `position` 排列多行。工具栏创建两列；拖到块左右边缘会在原位置新增列，拖到上下区域会在对应列或普通正文流中插入，拖出列组会恢复普通块，列间分隔线悬浮后可拖拽调宽，恢复按钮会移除列组属性并保留块。旧的 `properties.layout=columns` 容器快照在加载时迁移，不再写回；该信息仍属于现有块 `properties` JSON，不需要 SQLite 表迁移，历史快照会还原列归属与宽度。Markdown/HTML/CSS 仍可用于列内内容和样式，不能取代列结构。
 

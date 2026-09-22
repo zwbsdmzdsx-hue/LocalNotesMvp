@@ -40,6 +40,7 @@ function saveLayout(layout: Layout) {
 
 export interface ShellCallbacks {
   onOpenDocument: (documentId: string, blockId?: string) => void;
+  onOpenCanvas: (canvasId: string) => void;
   onNavigateBack: () => void;
   onNavigateForward: () => void;
   onOpenSticky: () => void;
@@ -101,7 +102,9 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
   let databaseContextVisible = false;
   let rightTabBeforeDatabase = layout.rightActiveTab === "databases" ? "reference-sidebar" : layout.rightActiveTab;
   function execute(command: WorkspaceCommand) {
-    void workspace.execute(command).then(() => renderAll()).catch(cb.onError);
+    const task = workspace.execute(command).then(() => renderAll());
+    void task.catch(cb.onError);
+    return task;
   }
 
   const sidebarLeft = document.getElementById("sidebar-left") as HTMLElement;
@@ -373,13 +376,14 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       btn.draggable = true;
       btn.style.setProperty("--doc-depth", String(depth));
       const count = descendantCount(doc.id, snap.documents);
-      btn.innerHTML = `<span class="list-icon">&#128196;</span><span class="list-label">${escapeHtml(doc.title)}</span>${count ? `<span class="doc-count">${count}</span>` : ""}`;
-      btn.onclick = () => cb.onOpenDocument(doc.id);
-      btn.oncontextmenu = (e) => { e.preventDefault(); showDocumentMenu(btn, doc.id, doc.title); };
+      btn.innerHTML = `<span class="list-icon${doc.kind === "canvas" ? " canvas-item-icon" : ""}">${doc.kind === "canvas" ? "◇" : "&#128196;"}</span><span class="list-label">${escapeHtml(doc.title)}</span>${count ? `<span class="doc-count">${count}</span>` : ""}`;
+      btn.onclick = () => doc.kind === "canvas" ? cb.onOpenCanvas(doc.id) : cb.onOpenDocument(doc.id);
+      btn.oncontextmenu = (e) => { e.preventDefault(); showDocumentMenu(btn, doc); };
       btn.addEventListener("dragstart", event => {
         event.stopPropagation();
         event.dataTransfer?.setData("text/x-document-id", doc.id);
-        if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer?.setData("text/x-workspace-item-id", doc.id);
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = "all";
         node.classList.add("is-dragging");
       });
       btn.addEventListener("dragend", () => node.classList.remove("is-dragging"));
@@ -446,8 +450,8 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       strip.appendChild(accent);
       strip.appendChild(label);
       const addDoc = document.createElement("button");
-      addDoc.type = "button"; addDoc.className = "bookmark-add-document"; addDoc.title = "添加文档"; addDoc.setAttribute("aria-label", `在${bk.name}中添加文档`); addDoc.textContent = "+";
-      addDoc.onclick = (event) => { event.stopPropagation(); createDocument(bk.id); };
+      addDoc.type = "button"; addDoc.className = "bookmark-add-document"; addDoc.title = "新建文档或 Canvas"; addDoc.setAttribute("aria-label", `在${bk.name}中新建文档或 Canvas`); addDoc.textContent = "+";
+      addDoc.onclick = (event) => { event.stopPropagation(); showWorkspaceCreateMenu(addDoc, bk.id); };
       strip.appendChild(addDoc);
       strip.onclick = () => {
         execute({ type: "selectBookmark", id: bk.id });
@@ -1047,16 +1051,17 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       }
     ]);
   }
-  function showDocumentMenu(anchor: HTMLElement, id: string, title: string) {
+  function showDocumentMenu(anchor: HTMLElement, item: WorkspaceDocument) {
+    const noun = item.kind === "canvas" ? "Canvas" : "文档";
     showContextMenu(anchor, [
       { label: "重命名", run: () => {
-          const newName = prompt("重命名文档：", title);
-          if (newName && newName.trim()) execute({ type: "renameDocument", id, name: newName.trim() });
+          const newName = prompt(`重命名${noun}：`, item.title);
+          if (newName && newName.trim()) execute({ type: "renameDocument", id: item.id, name: newName.trim() });
         }
       },
-      { label: "删除文档", danger: true, run: () => {
-          if (!confirm(`删除文档「${title}」？此操作不可恢复。`)) return;
-          execute({ type: "removeDocument", id });
+      { label: `删除${noun}`, danger: true, run: () => {
+          if (!confirm(`删除${noun}「${item.title}」？画布中的引用会显示为目标已删除。`)) return;
+          execute({ type: "removeDocument", id: item.id });
         }
       }
     ]);
@@ -1099,7 +1104,42 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     const title = prompt("文档名称：", "未命名文档");
     if (!title || !title.trim()) return;
     const id = "doc-" + uid();
-    execute({ type: "createDocument", document: { id, title: title.trim() }, bookmarkId, parentId: null });
+    void execute({ type: "createDocument", document: { id, title: title.trim() }, bookmarkId, parentId: null })
+      .then(() => cb.onOpenDocument(id));
+  }
+  function createCanvas(bookmarkId: string) {
+    const title = prompt("Canvas 名称：", "未命名 Canvas");
+    if (!title || !title.trim()) return;
+    const id = "canvas-" + uid();
+    void execute({ type: "createCanvas", canvas: { id, title: title.trim() }, bookmarkId, parentId: null })
+      .then(() => cb.onOpenCanvas(id));
+  }
+  function showWorkspaceCreateMenu(anchor: HTMLElement, bookmarkId: string) {
+    document.querySelector(".workspace-create-menu")?.remove();
+    const menu = document.createElement("div");
+    menu.className = "workspace-create-menu";
+    const options = [
+      { icon: "▤", label: "新建文档", run: () => createDocument(bookmarkId) },
+      { icon: "◇", label: "新建 Canvas", run: () => createCanvas(bookmarkId) }
+    ];
+    options.forEach(option => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.innerHTML = `<span aria-hidden="true">${option.icon}</span><span>${option.label}</span>`;
+      button.onclick = event => { event.stopPropagation(); menu.remove(); option.run(); };
+      menu.append(button);
+    });
+    document.body.append(menu);
+    const rect = anchor.getBoundingClientRect();
+    menu.style.left = `${Math.min(window.innerWidth - 184, rect.left)}px`;
+    menu.style.top = `${rect.bottom + 4}px`;
+    const close = (event: MouseEvent) => {
+      if (!menu.contains(event.target as Node) && event.target !== anchor) {
+        menu.remove();
+        document.removeEventListener("mousedown", close);
+      }
+    };
+    setTimeout(() => document.addEventListener("mousedown", close), 0);
   }
 
   // ── Init ───────────────────────────────────────────────────────────

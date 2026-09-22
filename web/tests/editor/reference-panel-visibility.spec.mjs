@@ -96,18 +96,22 @@ test('existing reference mode changes preserve the active panel and title', asyn
 test('an open title-link preview survives unrelated reference ACKs and closes into the reference list', async ({ page }) => {
   const paragraph = page.locator('#blocks [data-id="a1"] > .block-row > .block-text');
   await page.locator('[data-editor-mode="source"]').click();
+  await expect(page.locator('button[data-editor-mode="source"]')).toHaveAttribute('aria-pressed', 'true');
   await paragraph.fill('Before [[默认笔记本/Beta#^b2]]');
+  await expect(page.locator('#status')).toContainText('正在保存');
+  await expect(page.locator('#status')).toContainText('已保存');
   await page.locator('button[data-editor-mode="rich"]').click();
+  await expect(page.locator('button[data-editor-mode="rich"]')).toHaveAttribute('aria-pressed', 'true');
   await expect(paragraph.locator('.wiki-link')).toBeVisible();
   await paragraph.locator('.wiki-link').click();
   await expect(panel(page)).toContainText('Beta 文档中的其他块');
   await bodyReference(page).locator('.add-sibling').first().click();
   await expect(bodyReference(page).locator('[data-scope-type="reference_instance"]')).toHaveCount(1);
-  await expect(panel(page)).toContainText('Gamma 日记');
+  await expect(panel(page)).toContainText('Beta 文档中的其他块');
   await expect(panel(page).getByRole('button', { name: '关闭分栏', exact: true })).toBeVisible();
   await assertPanel(page);
   await panel(page).getByRole('button', { name: '关闭分栏', exact: true }).click();
-  await expect(page.locator('#reference-sidebar .reference-card')).toHaveCount(1);
+  await expect(page.locator('#reference-sidebar .reference-card')).toHaveCount(2);
   await assertPanel(page);
 });
 
@@ -149,15 +153,20 @@ test('command failure leaves the selected references panel visible and usable', 
 test('ordinary preview refresh does not steal the selected tab', async ({ page }) => {
   const paragraph = page.locator('#blocks [data-id="a1"] > .block-row > .block-text');
   await page.locator('[data-editor-mode="source"]').click();
+  await expect(page.locator('button[data-editor-mode="source"]')).toHaveAttribute('aria-pressed', 'true');
   await paragraph.fill('Before [[默认笔记本/Beta#^b2]]');
+  await expect(page.locator('#status')).toContainText('正在保存');
+  await expect(page.locator('#status')).toContainText('已保存');
   await page.locator('button[data-editor-mode="rich"]').click();
+  await expect(page.locator('button[data-editor-mode="rich"]')).toHaveAttribute('aria-pressed', 'true');
   await expect(paragraph.locator('.wiki-link')).toBeVisible();
   await paragraph.locator('.wiki-link').click();
   await expect(panel(page)).toContainText('Beta 文档中的其他块');
   await page.evaluate(() => { window.watchReferencePanel = false; });
   await page.getByRole('button', { name: '反向链接', exact: true }).click();
   await page.evaluate(() => window.mockHost.updateSourceBlock('gamma', 'g1', 'updated preview'));
-  await expect(panel(page)).toContainText('updated preview');
+  await expect(panel(page)).toContainText('Beta 文档中的其他块');
+  await expect(panel(page)).not.toContainText('updated preview');
   await expect(page.locator('#backlinks-section')).toBeVisible();
   await expect(panel(page)).toBeHidden();
 });
