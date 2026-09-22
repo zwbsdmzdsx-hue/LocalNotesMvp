@@ -2282,12 +2282,18 @@ function applyRootMoveOrder(items: RootMoveItem[]) {
 
 function restoreColumnGroup(groupId: string) {
   if (!state) return;
-  const members = state.blocks.filter(block => block.properties.columnGroup === groupId)
-    .sort((a, b) => columnIndex(a) - columnIndex(b) || a.position.localeCompare(b.position));
+  const members = state.blocks.filter(block => block.properties.columnGroup === groupId);
+  // Restore in deterministic column-then-row order. Each column is sorted by
+  // its own vertical position before the next column is appended.
+  const columns = [...new Set(members.map(columnIndex))].sort((a, b) => a - b);
+  const byColumn = new Map<number, Block[]>();
+  columns.forEach(column => byColumn.set(column, members.filter(block => columnIndex(block) === column)
+    .sort((a, b) => a.position.localeCompare(b.position) || a.id.localeCompare(b.id))));
+  const restoredMembers: Block[] = columns.flatMap(column => byColumn.get(column) ?? []);
   const items = rootMoveItems();
   const groupIndex = items.findIndex(item => item.key === `group:${groupId}`);
   if (groupIndex < 0) return;
-  const restored = members.map(block => {
+  const restored = restoredMembers.map(block => {
     const { columnGroup: _group, column: _column, columnWidths: _widths, ...properties } = block.properties;
     block.properties = properties;
     block.parentId = null;
@@ -2499,9 +2505,11 @@ function createEditableRow(block: Block) {
   } else {
     editable.classList.add("rich-editor");
     editable.contentEditable = "true";
-    editable.innerHTML = block.content.markdown !== undefined
-      ? markdownHtml(block.content.markdown, block.content.links)
-      : renderLinkedHtml(block.content.html || escapeText(block.content.text));
+    editable.innerHTML = block.content.html
+      ? renderLinkedHtml(block.content.html)
+      : block.content.markdown !== undefined
+        ? markdownHtml(block.content.markdown, block.content.links)
+        : escapeText(block.content.text);
     editable.dataset.originalHtml = editable.innerHTML;
   }
   editable.style.backgroundColor = block.properties.background ?? "";
@@ -2954,6 +2962,46 @@ function formatMediaSize(size: number) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function contentFromRichFragment(fragment: DocumentFragment, fallback: BlockContent): BlockContent {
+  const container = document.createElement("div");
+  container.append(fragment);
+  const content = contentFromRichEditable(container, fallback);
+  // A rich split must keep inline classes/styles in the HTML snapshot. The
+  // Markdown projection cannot represent arbitrary class names reliably.
+  delete content.markdown;
+  return content;
+}
+
+function selectionRangeInEditable(editable: HTMLElement) {
+  const selection = window.getSelection();
+  if (!selection?.rangeCount) return null;
+  const range = selection.getRangeAt(0);
+  if (!editable.contains(range.startContainer) || !editable.contains(range.endContainer)) return null;
+  return range;
+}
+
+function placeCaretAtStart(editable: HTMLElement) {
+  editable.focus();
+  const selection = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(editable);
+  range.collapse(true);
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
+function insertFirstBodyBlock() {
+  if (editorMode === "preview" || !state) return;
+  const block = createBlock("paragraph");
+  block.position = "00000000";
+  state.blocks.push(block);
+  const shell = renderOwnBlockShell(block);
+  const first = blockSurface.querySelector<HTMLElement>(":scope > [data-own-block], :scope > .columns-row");
+  blockSurface.insertBefore(shell, first ?? null);
+  placeCaretAtStart(shell.querySelector<HTMLElement>(".block-text")!);
+  scheduleDocumentSave(0);
+}
+
 function handleBlockKeydown(event: KeyboardEvent) {
   // Embedded reference blocks are nested inside their host editable. Resolve
   // the nearest editable so a bubbled key event cannot split the outer host.
@@ -2964,8 +3012,43 @@ function handleBlockKeydown(event: KeyboardEvent) {
   const current = (event.currentTarget as HTMLElement).closest<HTMLElement>("[data-own-block]")!;
   const currentBlock = state?.blocks.find(block => block.id === current.dataset.id);
   const next = createBlock("paragraph", current.dataset.parentId || null);
-  if (currentBlock?.properties.columnGroup) {
-    next.properties = { columnGroup: currentBlock.properties.columnGroup, column: columnIndex(currentBlock) };
+  if (currentBlock) {
+    next.properties = { ...currentBlock.properties };
+    delete next.properties.layout;
+    delete next.properties.columnCount;
+  }
+
+  const editable = event.currentTarget as HTMLElement;
+  if (currentBlock && editorMode === "source") {
+    const range = selectionRangeInEditable(editable);
+    const source = sourceText(editable);
+    const start = range ? (() => {
+      const before = range.cloneRange();
+      before.selectNodeContents(editable); before.setEnd(range.startContainer, range.startOffset);
+      return before.toString().length;
+    })() : source.length;
+    const end = range ? (() => {
+      const after = range.cloneRange();
+      after.selectNodeContents(editable); after.setStart(range.endContainer, range.endOffset);
+      return source.length - after.toString().length;
+    })() : start;
+    const beforeSource = source.slice(0, start);
+    const afterSource = source.slice(end);
+    currentBlock.content = contentFromMarkdown(beforeSource, currentBlock.content);
+    next.content = contentFromMarkdown(afterSource, currentBlock.content);
+    editable.textContent = beforeSource;
+  } else if (currentBlock && editorMode === "rich") {
+    const range = selectionRangeInEditable(editable);
+    if (range) {
+      const before = document.createRange();
+      before.selectNodeContents(editable); before.setEnd(range.startContainer, range.startOffset);
+      const after = document.createRange();
+      after.selectNodeContents(editable); after.setStart(range.endContainer, range.endOffset);
+      currentBlock.content = contentFromRichFragment(before.cloneContents(), currentBlock.content);
+      next.content = contentFromRichFragment(after.cloneContents(), currentBlock.content);
+      editable.replaceChildren(before.cloneContents());
+      editable.dataset.originalHtml = "";
+    }
   }
   // Keep the optimistic model in sync with the inserted DOM shell. A second
   // Enter before the save ACK must still see this block's parent/column data.
@@ -2981,7 +3064,7 @@ function handleBlockKeydown(event: KeyboardEvent) {
   shell.style.setProperty("--depth", String(Number(current.style.getPropertyValue("--depth")) || 0));
   shell.append(createEditableRow(next));
   current.after(shell);
-  shell.querySelector<HTMLElement>(".block-text")?.focus();
+  placeCaretAtStart(shell.querySelector<HTMLElement>(".block-text")!);
   scheduleDocumentSave(0);
 }
 
@@ -3208,9 +3291,11 @@ function renderReference(reference: ReferenceInstance, inSidebar = false) {
     } else {
       editable.classList.add("rich-editor");
       editable.contentEditable = "true";
-      editable.innerHTML = content.markdown !== undefined
-        ? markdownHtml(content.markdown, content.links)
-        : renderLinkedHtml(content.html || escapeText(content.text));
+      editable.innerHTML = content.html
+        ? renderLinkedHtml(content.html)
+        : content.markdown !== undefined
+          ? markdownHtml(content.markdown, content.links)
+          : escapeText(content.text);
       editable.dataset.originalHtml = editable.innerHTML;
     }
     editable.style.backgroundColor = properties.background ?? "";
@@ -4501,7 +4586,7 @@ titleInput.addEventListener("keydown", event => {
   if (event.key !== "Enter") return;
   event.preventDefault();
   if (editorMode === "preview") return;
-  focusFirstBodyBlock();
+  insertFirstBodyBlock();
 });
 document.querySelectorAll<HTMLButtonElement>(".icon-tools button").forEach((button) => button.addEventListener("mousedown", (event) => event.preventDefault()));
 updateEditorModeUi();
@@ -4784,6 +4869,7 @@ function handleDrop(event: DragEvent) {
   const targetBlock = targetId ? state.blocks.find(block => block.id === targetId) : undefined;
   if (!draggedBlock) { clearDropIndicator(); draggingBlockId = null; return; }
   if (targetBlock && draggedBlocks.some(block => block.id === targetBlock.id)) { clearDropIndicator(); draggingBlockId = null; draggingBlockIds = []; return; }
+  const rootItemsBeforeMove = rootMoveItems();
   if (draggingColumnGroup) {
     const groupId = draggingColumnGroup;
     const items = rootMoveItems();
@@ -4825,7 +4911,20 @@ function handleDrop(event: DragEvent) {
       const insertion = targetIndex + (position === "group-after" ? 1 : 0);
       items.splice(Math.min(items.length, insertion), 0, ...movedItems);
       applyRootMoveOrder(items);
-    } else draggedBlocks.forEach(block => { block.position = nextPosition(null); });
+    } else {
+      // The target group may have dissolved because the dragged block was its
+      // last member in one column. Reuse the old group's member positions so a
+      // drop above/below still lands at the visible group location.
+      const previousGroup = rootItemsBeforeMove.find(item => item.key === `group:${targetGroupId}`);
+      const remainingTargetIds = new Set((previousGroup?.blocks ?? []).map(block => block.id).filter(id => !movedIds.has(id)));
+      const targetIndices = items.flatMap((item, index) => item.blocks.some(block => remainingTargetIds.has(block.id)) ? [index] : []);
+      const insertion = targetIndices.length
+        ? (position === "group-after" ? Math.max(...targetIndices) + 1 : Math.min(...targetIndices))
+        : Math.min(items.length, rootItemsBeforeMove.findIndex(item => item.key === `group:${targetGroupId}`));
+      const movedItems = draggedBlocks.map(block => ({ key: block.id, blocks: [block] }));
+      items.splice(Math.max(0, insertion), 0, ...movedItems);
+      applyRootMoveOrder(items);
+    }
   } else if (!targetBlock) {
     draggedBlocks.forEach(block => { block.position = nextPosition(null); });
   } else if (position === "column-left" || position === "column-right") {
