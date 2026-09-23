@@ -1142,7 +1142,25 @@ body[data-workspace-mode="canvas"] .content .workspace { overflow: hidden; }
 .canvas-node-grip:active { cursor: grabbing; }
 .canvas-node-label { min-width: 0; flex: 1; overflow: hidden; color: #344054; font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .canvas-node-body { min-width: 0; min-height: 0; flex: 1; overflow: auto; padding: 12px 14px; color: #344054; font-size: 13px; line-height: 1.5; }
-.canvas-note-text { display: block; width: 100%; height: 100%; min-height: 0; resize: none; border: 0; outline: 0; background: transparent; color: #182230; font: 14px/1.55 Inter, "Segoe UI", sans-serif; }
+.canvas-note-text { display: none; width: 100%; height: 100%; min-height: 0; resize: none; border: 0; outline: 0; background: transparent; color: #182230; font: 14px/1.55 Inter, "Segoe UI", sans-serif; }
+.canvas-note-editing .canvas-note-text { display: block; }
+.canvas-note-preview { min-height: 100%; color: #344054; font-size: 13px; line-height: 1.55; }
+.canvas-note-preview[hidden] { display: none; }
+.canvas-note-preview p { margin: 0 0 7px; }
+.canvas-note-preview h1, .canvas-note-preview h2, .canvas-note-preview h3 { margin: 0 0 7px; color: #172b4d; line-height: 1.35; }
+.canvas-note-preview .wiki-link { color: #175cd3; cursor: pointer; text-decoration: underline; text-decoration-color: #b2ccff; text-underline-offset: 2px; }
+.canvas-link-suggestions { position: fixed; z-index: 360; width: min(340px, calc(100vw - 24px)); max-height: 290px; overflow: auto; padding: 5px; border: 1px solid #b2ccff; border-radius: 7px; background: #fff; box-shadow: 0 14px 34px rgba(16,24,40,.2); }
+.canvas-link-suggestions-head { padding: 5px 7px 6px; border-bottom: 1px solid #eaecf0; color: #344054; font-size: 11px; font-weight: 650; }
+.canvas-link-suggestion { display: grid; grid-template-columns: 20px minmax(0,1fr); gap: 5px; width: 100%; border: 0; border-radius: 4px; padding: 6px 7px; background: transparent; color: #344054; text-align: left; }
+.canvas-link-suggestion:hover { background: #eff6ff; color: #175cd3; }
+.canvas-link-suggestion span { grid-row: 1 / span 2; color: #175cd3; }
+.canvas-link-suggestion strong, .canvas-link-suggestion small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.canvas-link-suggestion strong { font-size: 12px; font-weight: 600; }
+.canvas-link-suggestion small { color: #98a2b3; font-size: 10px; }
+.canvas-link-empty { padding: 10px 7px; color: #98a2b3; font-size: 11px; }
+.canvas-context-menu { position: fixed; z-index: 350; width: 154px; padding: 4px; border: 1px solid #d0d5dd; border-radius: 6px; background: #fff; box-shadow: 0 12px 30px rgba(16,24,40,.18); }
+.canvas-context-menu button { display: grid; grid-template-columns: 22px 1fr; gap: 6px; align-items: center; width: 100%; border: 0; border-radius: 4px; padding: 8px 9px; background: transparent; color: #344054; text-align: left; font-size: 12px; }
+.canvas-context-menu button:hover { background: #eff6ff; color: #175cd3; }
 .canvas-document-line { overflow: hidden; margin: 0 0 7px; }
 .canvas-document-line > :first-child { margin-top: 0; }
 .canvas-document-line > :last-child { margin-bottom: 0; }

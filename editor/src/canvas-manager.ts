@@ -61,8 +61,86 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let saveTail = Promise.resolve();
   let libraryPoint: { x: number; y: number } | null = null;
+  let suggestionPopup: HTMLElement | null = null;
+  let suggestionInput: HTMLTextAreaElement | null = null;
+  let suggestionNode: CanvasNode | null = null;
 
   const item = (id: string | undefined) => workspace.snapshot().documents.find(entry => entry.id === id);
+
+  function closeSuggestions() {
+    suggestionPopup?.remove();
+    suggestionPopup = null;
+    suggestionInput = null;
+    suggestionNode = null;
+  }
+
+  function linkTargetSource(title: string, blockId?: string) {
+    const doc = workspace.snapshot().documents.find(entry => entry.title === title || entry.title.endsWith(title));
+    if (!doc) return null;
+    return blockId ? `[[${doc.title}#^${blockId}]]` : `[[${doc.title}]]`;
+  }
+
+  function showLinkSuggestions(input: HTMLTextAreaElement, node: CanvasNode) {
+    const source = input.value;
+    const marker = source.lastIndexOf("[[");
+    if (marker < 0 || source.indexOf("]]", marker) >= 0) { closeSuggestions(); return; }
+    const query = source.slice(marker + 2);
+    if (!query.trim() && !source.endsWith("[[")) { closeSuggestions(); return; }
+    const hits = workspace.search(query.replace(/^.*?\//, "").replace(/#\^.*$/, ""), 24);
+    const docs = workspace.snapshot().documents
+      .filter(entry => !query.trim() || entry.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()))
+      .map(entry => ({ id: entry.id, title: entry.title, blockId: undefined as string | undefined, excerpt: entry.kind === "canvas" ? "Canvas" : "整篇文档" }));
+    const merged = [...docs, ...hits.filter(hit => hit.kind === "block").map(hit => ({ id: hit.documentId, title: hit.documentTitle, blockId: hit.blockId ?? undefined, excerpt: hit.excerpt }))]
+      .filter((candidate, index, all) => all.findIndex(other => `${other.id}:${other.blockId ?? ""}` === `${candidate.id}:${candidate.blockId ?? ""}`) === index);
+    closeSuggestions();
+    const popup = document.createElement("div");
+    popup.className = "canvas-link-suggestions";
+    const rect = input.getBoundingClientRect();
+    popup.style.left = `${rect.left}px`;
+    popup.style.top = `${Math.min(window.innerHeight - 260, rect.bottom + 4)}px`;
+    const heading = document.createElement("div");
+    heading.className = "canvas-link-suggestions-head";
+    heading.textContent = "插入引用";
+    popup.append(heading);
+    if (!merged.length) {
+      const empty = document.createElement("div"); empty.className = "canvas-link-empty"; empty.textContent = "没有匹配的文档或块"; popup.append(empty);
+    }
+    merged.slice(0, 12).forEach(candidate => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "canvas-link-suggestion";
+      button.innerHTML = `<span aria-hidden="true">${candidate.blockId ? "¶" : candidate.id.startsWith("canvas-") ? "◇" : "▤"}</span><strong></strong><small></small>`;
+      button.querySelector("strong")!.textContent = candidate.title;
+      button.querySelector("small")!.textContent = candidate.blockId ? candidate.excerpt : "整篇文档";
+      button.onmousedown = event => {
+        event.preventDefault();
+        const replacement = linkTargetSource(candidate.title, candidate.blockId);
+        if (!replacement) return;
+        const marker = input.value.lastIndexOf("[[");
+        input.value = `${input.value.slice(0, marker)}${replacement}`;
+        node.content = input.value;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        closeSuggestions();
+      };
+      popup.append(button);
+    });
+    document.body.append(popup);
+    suggestionPopup = popup;
+    suggestionInput = input;
+    suggestionNode = node;
+  }
+
+  function renderInlineLinks(container: HTMLElement, source: string) {
+    container.innerHTML = renderMarkdown(source);
+    container.querySelectorAll<HTMLElement>(".wiki-link").forEach(link => {
+      const title = link.dataset.targetTitle ?? link.textContent?.trim() ?? "";
+      const target = workspace.snapshot().documents.find(entry => entry.title === title || entry.title.endsWith(title));
+      if (!target) return;
+      link.dataset.targetId = target.id;
+      link.title = `打开 ${target.title}`;
+      link.onclick = event => { event.preventDefault(); event.stopPropagation(); target.kind === "canvas" ? callbacks.onOpenCanvas(target.id) : callbacks.onOpenDocument(target.id); };
+    });
+  }
 
   function applyViewport() {
     if (!current) return;
@@ -336,10 +414,27 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       if (node.kind === "text") {
         const textarea = document.createElement("textarea");
         textarea.className = "canvas-note-text";
-        textarea.placeholder = "写下想法...";
+        textarea.placeholder = "写下想法，输入 [[ 插入引用...";
         textarea.value = node.content ?? "";
-        textarea.oninput = () => { node.content = textarea.value; scheduleSave(450); };
-        body.append(textarea);
+        const preview = document.createElement("div");
+        preview.className = "canvas-note-preview";
+        body.classList.add("canvas-note-editing");
+        const syncPreview = () => {
+          node.content = textarea.value;
+          renderInlineLinks(preview, node.content);
+          preview.hidden = document.activeElement === textarea && !textarea.value.trim();
+          scheduleSave(450);
+        };
+        textarea.oninput = () => {
+          syncPreview();
+          showLinkSuggestions(textarea, node);
+        };
+        textarea.onfocus = () => { body.classList.add("canvas-note-editing"); preview.hidden = true; };
+        textarea.onblur = () => { window.setTimeout(() => { closeSuggestions(); body.classList.remove("canvas-note-editing"); preview.hidden = false; }, 120); };
+        preview.onclick = () => textarea.focus();
+        renderInlineLinks(preview, node.content ?? "");
+        preview.hidden = !!(node.content ?? "").trim() && document.activeElement === textarea;
+        body.append(textarea, preview);
       } else if (node.kind === "document" && target) {
         void renderDocumentPreview(body, target.id, token);
       } else if (node.kind === "canvas" && target) {
@@ -440,6 +535,49 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     search.focus();
   }
 
+  function showCanvasContextMenu(event: MouseEvent) {
+    if (!current || (event.target as Element).closest(".canvas-node,.canvas-bar,.canvas-library")) return;
+    event.preventDefault();
+    document.querySelector(".canvas-context-menu")?.remove();
+    const menu = document.createElement("div");
+    menu.className = "canvas-context-menu";
+    const point = worldPoint(event.clientX, event.clientY);
+    const actions = [
+      { label: "新建块", icon: "＋", run: () => addText(point) },
+      { label: "插入文档", icon: "▤", run: () => showLibrary(point) },
+      { label: "插入引用", icon: "↗", run: () => openReferenceComposer(point) }
+    ];
+    actions.forEach(action => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.innerHTML = `<span aria-hidden="true">${action.icon}</span><span>${action.label}</span>`;
+      button.onclick = () => { menu.remove(); action.run(); };
+      menu.append(button);
+    });
+    document.body.append(menu);
+    menu.style.left = `${Math.min(window.innerWidth - 190, event.clientX)}px`;
+    menu.style.top = `${Math.min(window.innerHeight - 150, event.clientY)}px`;
+    const close = (next: MouseEvent) => {
+      if (!menu.contains(next.target as Node)) { menu.remove(); document.removeEventListener("mousedown", close); }
+    };
+    setTimeout(() => document.addEventListener("mousedown", close), 0);
+  }
+
+  function openReferenceComposer(point = nextPosition()) {
+    if (!current) return;
+    const node: CanvasNode = { id: uid("canvas-reference"), kind: "text", x: Math.round(point.x), y: Math.round(point.y), width: 320, height: 150, zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, content: "[[" };
+    current.nodes.push(node);
+    selected = new Set([node.id]);
+    renderNodes();
+    scheduleSave();
+    requestAnimationFrame(() => {
+      const input = stage.querySelector<HTMLTextAreaElement>(`[data-node-id="${CSS.escape(node.id)}"] .canvas-note-text`);
+      input?.focus();
+      input?.setSelectionRange(input.value.length, input.value.length);
+      if (input) showLinkSuggestions(input, node);
+    });
+  }
+
   async function moveHistory(direction: "undo" | "redo") {
     if (!current) return;
     try {
@@ -490,6 +628,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   viewport.onclick = event => {
     if (event.target === viewport || event.target === stage) { selected.clear(); library.hidden = true; renderNodes(); }
   };
+  viewport.addEventListener("contextmenu", showCanvasContextMenu);
   viewport.ondblclick = event => {
     if ((event.target as Element).closest(".canvas-node,.canvas-library,.canvas-bar")) return;
     addText(worldPoint(event.clientX, event.clientY));
