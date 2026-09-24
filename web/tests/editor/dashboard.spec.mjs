@@ -26,3 +26,14 @@ test("creates a Dashboard, renders widget blocks, and persists layout changes", 
   await expect(page.locator(".dashboard-view")).toBeVisible();
   await expect(page.locator('.dashboard-widget[data-widget-id]').filter({ hasText: "history" })).toHaveCount(0);
 });
+
+test("a failed Dashboard save blocks navigation and keeps the current layout", async ({ page }) => {
+  page.once("dialog", dialog => dialog.accept("失败恢复面板"));
+  await page.locator(".bk-strip.active .bookmark-add-document").click();
+  await page.getByRole("button", { name: "新建 Dashboard" }).click();
+  await page.locator("#dev-fail").click();
+  await page.locator('.dashboard-widget').first().locator(".dashboard-widget-controls button").first().click();
+  await page.locator('.doc-item .list-label', { hasText: "Alpha" }).click();
+  await expect(page.locator(".dashboard-view")).toBeVisible();
+  await expect(page.locator(".dashboard-save-state")).toHaveText("保存失败");
+});

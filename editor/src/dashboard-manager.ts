@@ -78,6 +78,7 @@ export function mountDashboardManager(host: EditorHostApi, _workspace: Workspace
   let current: EditorState | null = null;
   let saveTail = Promise.resolve();
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastSaveError: unknown = null;
   const renderers = new Map<string, DashboardWidgetRenderer>(defaultRenderers().map(renderer => [renderer.kind, renderer]));
 
   function setSaveState(text: string, error = false) { saveState.textContent = text; saveState.classList.toggle("is-error", error); }
@@ -136,7 +137,17 @@ export function mountDashboardManager(host: EditorHostApi, _workspace: Workspace
     const block: Block = { id: uid(), parentId: null, position: String((current.blocks.length + 1) * 1000).padStart(8, "0"), type: "dashboard_widget", content: { text: "", html: "" }, properties: { dashboardWidget: { kind, title: kind, scope: "activeDocument", layout: { x: 32 + (index % 3) * 344, y: 32 + Math.floor(index / 3) * 244, width: 320, height: 220 } } }, revision: 1 };
     current.blocks.push(block); render(); scheduleSave();
   }
-  function scheduleSave() { if (saveTimer) clearTimeout(saveTimer); saveState.textContent = "未保存"; saveTimer = setTimeout(() => { saveTimer = null; saveTail = saveTail.then(save).catch(callbacks.onError); }, 350); }
+  function scheduleSave() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveState.textContent = "未保存";
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      saveTail = saveTail.catch(() => undefined).then(async () => {
+        try { await save(); lastSaveError = null; }
+        catch (error) { lastSaveError = error; setSaveState("保存失败", true); callbacks.onError(error); }
+      });
+    }, 350);
+  }
   async function save() {
     if (!current) return;
     setSaveState("保存中");
@@ -158,5 +169,5 @@ export function mountDashboardManager(host: EditorHostApi, _workspace: Workspace
   setupAddMenu();
   function open(state: EditorState) { current = structuredClone(state); view.hidden = false; render(); }
   function close() { view.hidden = true; current = null; stage.replaceChildren(); }
-  return { open, close, isOpen: () => !view.hidden, applyState: state => { if (!current || current.note.id !== state.note.id) return; current = structuredClone(state); render(); }, register: renderer => { renderers.set(renderer.kind, renderer); if (current) render(); }, flush: async () => { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveTail = saveTail.then(save).catch(callbacks.onError); } await saveTail; } };
+  return { open, close, isOpen: () => !view.hidden, applyState: state => { if (!current || current.note.id !== state.note.id) return; current = structuredClone(state); render(); }, register: renderer => { renderers.set(renderer.kind, renderer); if (current) render(); }, flush: async () => { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveTail = saveTail.catch(() => undefined).then(async () => { try { await save(); lastSaveError = null; } catch (error) { lastSaveError = error; setSaveState("保存失败", true); callbacks.onError(error); } }); } await saveTail; if (lastSaveError) throw lastSaveError; } };
 }

@@ -33,19 +33,19 @@ const shell = mountShell(workspace, {
   onError: error => editor.showError(error),
   onRestoreHistory: entryId => void (canvasManager?.isOpen() ? canvasManager.restoreHistory(entryId) : editor.restoreHistory(entryId)),
   onOpenDocument: (id, blockId) => {
-    void canvasManager.flush().then(() => editor.flush()).then(() => host.openDocument(id, blockId)).catch(editor.showError);
+    void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.openDocument(id, blockId)).catch(editor.showError);
   },
   onOpenCanvas: id => {
-    void canvasManager.flush().then(() => editor.flush()).then(() => host.openDocument(id)).catch(editor.showError);
+    void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.openDocument(id)).catch(editor.showError);
   },
   onOpenDashboard: id => {
     void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.openDocument(id)).catch(editor.showError);
   },
   onNavigateBack: () => {
-    void canvasManager.flush().then(() => editor.flush()).then(() => host.navigateBack()).catch(editor.showError);
+    void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.navigateBack()).catch(editor.showError);
   },
   onNavigateForward: () => {
-    void canvasManager.flush().then(() => editor.flush()).then(() => host.navigateForward()).catch(editor.showError);
+    void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.navigateForward()).catch(editor.showError);
   },
   onOpenSticky: () => {
     alert("便签窗口：浏览器模式下是占位提示。桌面端请从主窗口新建便签。");
