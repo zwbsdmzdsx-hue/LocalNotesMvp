@@ -21,6 +21,12 @@ export type CanvasCurve = {
   color: string;
   width: number;
   dash: "solid" | "dashed" | "dotted";
+  /** Arrowhead placement for the main path. Older curves default to none. */
+  arrow?: "none" | "end" | "both";
+  /** Additional points inserted between the legacy cubic handles. */
+  controlPoints?: CanvasPoint[];
+  /** Extra endpoints that branch from the same start node. */
+  branches?: CanvasCurveEndpoint[];
   label?: string;
 };
 export type CanvasDisplayMode = "preview" | "icon";

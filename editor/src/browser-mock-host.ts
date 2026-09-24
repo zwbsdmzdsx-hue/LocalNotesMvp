@@ -45,6 +45,7 @@ export class BrowserMockHost implements HostTransport {
   private canvases = new Map<string, Omit<CanvasDocument, "canUndo" | "canRedo" | "references">>();
   private canvasMutations = new Set<string>();
   private canvasHistories = new Map<string, { entries: Array<{ id: string; timestamp: number; label: string; title: string; nodes: CanvasNode[]; viewport: CanvasViewport; references: EditorState["references"] }>; cursor: number }>();
+  private canvasTextGroups = new Map<string, { blockId: string; baselineLength: number; lastTimestamp: number }>();
   private canvasHistoryModel(id: string): HistoryModel {
     const history = this.canvasHistories.get(id);
     if (!history) return { documentId: id, entries: [], currentId: "", canUndo: false, canRedo: false };
@@ -580,8 +581,10 @@ export class BrowserMockHost implements HostTransport {
       if ((node.kind === "document" || node.kind === "canvas") && (!node.targetId || !this.titleByDocument.has(node.targetId))) throw new Error("Canvas 引用目标不存在");
       if (node.kind === "draw" && (!node.strokes?.length || node.strokes.some(stroke => stroke.points.length < 2))) throw new Error("Canvas 手绘内容无效");
       if (node.kind === "curve" && (!node.curve || !node.curve.start?.nodeId || !node.curve.end?.nodeId)) throw new Error("Canvas 曲线端点无效");
+      if (node.kind === "curve" && node.curve && (!(["none", "end", "both", undefined] as unknown[]).includes(node.curve.arrow) || node.curve.controlPoints?.some(point => !Number.isFinite(point.x) || !Number.isFinite(point.y)))) throw new Error("Canvas 曲线控制点无效");
       if (node.kind === "media" && !node.media?.url) throw new Error("Canvas 媒体地址无效");
       if (node.kind === "curve" && node.curve && (!canonicalNodes.some(item => item.id === node.curve!.start.nodeId && item.kind !== "curve" && item.kind !== "draw") || !canonicalNodes.some(item => item.id === node.curve!.end.nodeId && item.kind !== "curve" && item.kind !== "draw"))) throw new Error("Canvas 曲线必须连接到块");
+      if (node.kind === "curve" && node.curve?.branches?.some(branch => !canonicalNodes.some(item => item.id === branch.nodeId && item.kind !== "curve" && item.kind !== "draw"))) throw new Error("Canvas 曲线分支端点无效");
       if (node.kind === "canvas" && node.targetId && !this.canLinkCanvas(canvasId, node.targetId, nodes)) throw new Error("Canvas 不能形成直接或间接循环引用");
     }
     canvas.nodes = structuredClone(canonicalNodes);
@@ -609,6 +612,44 @@ export class BrowserMockHost implements HostTransport {
     const snapshot = { id: `canvas-history-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`, timestamp: Date.now(), label: "编辑 Canvas", title: canvas.title, nodes: structuredClone(canvas.nodes), viewport: structuredClone(canvas.viewport), references };
     const current = history.entries[history.cursor];
     const same = current && JSON.stringify({ title: current.title, nodes: current.nodes, viewport: current.viewport, references: current.references }) === JSON.stringify({ title: snapshot.title, nodes: snapshot.nodes, viewport: snapshot.viewport, references: snapshot.references });
+    if (!same && current) {
+      const withoutTextRevision = (node: CanvasNode) => {
+        const copy = structuredClone(node);
+        if (copy.block) {
+          const { content: _content, revision: _revision, ...blockLayout } = copy.block;
+          copy.block = blockLayout as CanvasNode["block"];
+        }
+        return copy;
+      };
+      const previousNodes = current.nodes.map(withoutTextRevision);
+      const nextNodes = snapshot.nodes.map(withoutTextRevision);
+      const changedTextNodes = snapshot.nodes.filter((node, index) => JSON.stringify(node.block?.content) !== JSON.stringify(current.nodes[index]?.block?.content));
+      const textOnly = snapshot.title === current.title
+        && JSON.stringify(previousNodes) === JSON.stringify(nextNodes)
+        && snapshot.viewport.x === current.viewport.x && snapshot.viewport.y === current.viewport.y && snapshot.viewport.zoom === current.viewport.zoom
+        && snapshot.references.length === current.references.length
+        && changedTextNodes.length === 1;
+      // Canvas text is saved after a short debounce. Keep a continuous edit of
+      // one block as one history entry while still recording layout/media/curve
+      // changes immediately.
+      if (textOnly) {
+        const changed = changedTextNodes[0];
+        const blockId = changed.block?.id ?? "";
+        const previousBlock = current.nodes.find(node => node.block?.id === blockId)?.block;
+        const nextLength = changed.block?.content.text?.length ?? changed.block?.content.markdown?.length ?? 0;
+        const previousLength = previousBlock?.content.text?.length ?? previousBlock?.content.markdown?.length ?? 0;
+        const group = this.canvasTextGroups.get(canvasId);
+        const withinGroup = group && group.blockId === blockId && snapshot.timestamp - group.lastTimestamp < 5000 && Math.abs(nextLength - group.baselineLength) < 50;
+        if (withinGroup) {
+          history.entries[history.cursor] = snapshot;
+          group.lastTimestamp = snapshot.timestamp;
+          return;
+        }
+        this.canvasTextGroups.set(canvasId, { blockId, baselineLength: previousLength, lastTimestamp: snapshot.timestamp });
+      } else {
+        this.canvasTextGroups.delete(canvasId);
+      }
+    }
     if (!same) {
       history.entries.splice(history.cursor + 1);
       history.entries.push(snapshot);

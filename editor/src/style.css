@@ -1243,7 +1243,9 @@ body[data-workspace-mode="canvas"] .content .workspace { overflow: hidden; }
 .canvas-node.icon-mode .canvas-node-label { display: none; }
 .canvas-node.icon-mode .canvas-node-body { padding: 0; overflow: hidden; }
 .canvas-link-icon { width: 100%; height: 100%; display: grid; grid-template-rows: 1fr auto; place-items: center; gap: 3px; padding: 18px 8px 10px; border: 0; background: #fff; color: #344054; }
-.canvas-link-icon > span { font-size: 38px; color: #175cd3; }
+.canvas-link-icon > span { font-size: 38px; color: #175cd3; display: grid; place-items: center; min-height: 42px; }
+.canvas-custom-icon-image { display: block; width: 48px; height: 48px; object-fit: contain; }
+.canvas-reference-icon .canvas-custom-icon-image { width: 56px; height: 56px; }
 .canvas-link-icon > strong { display: block; max-width: 92px; overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .canvas-node.reference-icon-mode { width: 112px !important; height: 112px !important; border-radius: 12px; }
 .canvas-reference-icon { width: 100%; height: 100%; display: grid; grid-template-rows: 1fr auto; place-items: center; gap: 3px; padding: 17px 8px 10px; border: 0; border-radius: 10px; background: #fff; color: #344054; cursor: pointer; }
@@ -1279,6 +1281,11 @@ body[data-workspace-mode="canvas"] .content .workspace { overflow: hidden; }
 .canvas-icon-hover-content .canvas-document-line { margin-bottom: 5px; }
 .canvas-media-file { display: block; overflow-wrap: anywhere; color: #175cd3; }
 .canvas-media-caption { margin-top: 6px; color: #667085; font-size: 11px; overflow-wrap: anywhere; }
+.canvas-document-media { margin: 0; width: 100%; }
+.canvas-document-media .canvas-media-player { display: block; max-width: 100%; max-height: 180px; object-fit: contain; }
+.canvas-document-media iframe { width: 100%; height: 180px; border: 0; }
+.canvas-document-media audio { width: 100%; }
+.canvas-document-media figcaption { color: #667085; font-size: 10px; margin-top: 3px; }
 .canvas-viewport.draw-mode { cursor: crosshair; }
 .canvas-viewport.curve-mode { cursor: crosshair; }
 .doc-item .list-icon.canvas-item-icon { color: #175cd3; font-size: 17px; }

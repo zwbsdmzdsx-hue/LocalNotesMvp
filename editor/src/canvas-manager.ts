@@ -62,6 +62,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       <button type="button" data-canvas-action="add" title="新建自由卡片" aria-label="新建自由卡片">＋</button>
       <button type="button" data-canvas-action="insert" title="插入文档或 Canvas" aria-label="插入文档或 Canvas">⌘</button>
       <button type="button" data-canvas-action="media" title="插入媒体" aria-label="插入媒体">▧</button>
+      <button type="button" data-canvas-action="media-url" title="插入网络媒体" aria-label="插入网络媒体">◎</button>
       <button type="button" data-canvas-action="draw" title="手绘" aria-label="手绘">✎</button>
       <button type="button" data-canvas-action="curve" title="绘制曲线" aria-label="绘制曲线">⌁</button>
       <button type="button" data-canvas-action="undo" title="撤销" aria-label="撤销">↶</button>
@@ -105,6 +106,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   let drawing: { pointerId: number; points: CanvasPoint[]; node: CanvasNode } | null = null;
   let curveMode = false;
   let pendingCurveEndpoint: { nodeId: string; side: CanvasCurve["start"]["side"] } | null = null;
+  let branchCurveNode: CanvasNode | null = null;
   let curveStylePopup: HTMLElement | null = null;
   let curveStyleDismiss: ((event: PointerEvent) => void) | null = null;
   let nodeMenuPopup: HTMLElement | null = null;
@@ -685,7 +687,12 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           line.append(toggle);
         }
         const content = document.createElement("span");
-        content.innerHTML = renderMarkdown(markdownFromContent(block.content));
+        if (block.type === "media" && block.content.media) {
+          content.className = "canvas-document-media-line";
+          content.append(renderCanvasMedia(block.content.media, block.content.caption));
+        } else {
+          content.innerHTML = renderMarkdown(markdownFromContent(block.content));
+        }
         line.append(content);
         fragment.append(line);
       }
@@ -695,6 +702,52 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     } catch {
       if (token === renderToken && container.isConnected) container.textContent = "无法载入文档预览";
     }
+  }
+
+  function renderCanvasMedia(asset: MediaAsset, caption?: string): HTMLElement {
+    const wrapper = document.createElement("figure");
+    wrapper.className = "canvas-media-preview canvas-document-media";
+    let media: HTMLElement;
+    if (asset.kind === "image") {
+      const image = document.createElement("img");
+      image.src = asset.url;
+      image.alt = caption || asset.name;
+      image.loading = "lazy";
+      media = image;
+    } else if (asset.kind === "video") {
+      const video = document.createElement("video");
+      video.src = asset.url;
+      video.controls = true;
+      video.preload = "metadata";
+      video.playsInline = true;
+      media = video;
+    } else if (asset.kind === "audio") {
+      const audio = document.createElement("audio");
+      audio.src = asset.url;
+      audio.controls = true;
+      audio.preload = "metadata";
+      media = audio;
+    } else if (asset.kind === "pdf") {
+      const frame = document.createElement("iframe");
+      frame.src = asset.url;
+      frame.title = asset.name;
+      frame.loading = "lazy";
+      media = frame;
+    } else {
+      const link = document.createElement("a");
+      link.href = asset.url;
+      link.download = asset.name;
+      link.textContent = `下载 ${asset.name}`;
+      media = link;
+    }
+    media.classList.add("canvas-media-player");
+    wrapper.append(media);
+    if (caption) {
+      const figcaption = document.createElement("figcaption");
+      figcaption.textContent = caption;
+      wrapper.append(figcaption);
+    }
+    return wrapper;
   }
 
   function applyCanvasPreviewHeadingCollapse(container: HTMLElement, blocks: import("../../protocol/types").Block[], collapsed: Set<string>) {
@@ -825,7 +878,12 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   function removeNode(nodeId: string) {
     if (!current) return;
     closeNodeMenu();
-    current.nodes = current.nodes.filter(node => node.id !== nodeId);
+    current.nodes = current.nodes
+      .filter(node => node.id !== nodeId)
+      .filter(node => node.kind !== "curve" || !node.curve || (node.curve.start.nodeId !== nodeId && node.curve.end.nodeId !== nodeId))
+      .map(node => node.kind === "curve" && node.curve
+        ? { ...node, curve: { ...node.curve, branches: node.curve.branches?.filter(branch => branch.nodeId !== nodeId) } }
+        : node);
     selected.delete(nodeId);
     renderNodes();
     scheduleSave();
@@ -889,6 +947,50 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     scheduleSave();
   }
 
+  function appendIconVisual(container: HTMLElement, value: string, label: string) {
+    if (/^(?:data:image\/|https?:\/\/|blob:|file:\/\/)/i.test(value)) {
+      const image = document.createElement("img");
+      image.src = value;
+      image.alt = label;
+      image.className = "canvas-custom-icon-image";
+      container.append(image);
+    } else {
+      const glyph = document.createElement("span");
+      glyph.setAttribute("aria-hidden", "true");
+      glyph.textContent = value || "↗";
+      container.append(glyph);
+    }
+  }
+
+  async function uploadNodeIcon(node: CanvasNode) {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*,.svg";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      input.remove();
+      if (!file) return;
+      try {
+        const value = callbacks.storeMedia
+          ? (await callbacks.storeMedia(file)).url
+          : await new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onerror = () => reject(reader.error ?? new Error("图标读取失败"));
+              reader.onload = () => resolve(String(reader.result));
+              reader.readAsDataURL(file);
+            });
+        node.referenceIcon = value;
+        if (node.kind === "block") node.referenceDisplay = "icon";
+        if (node.kind === "document" || node.kind === "canvas") node.displayMode = "icon";
+        closeNodeMenu();
+        renderNodes();
+        scheduleSave();
+      } catch (error) { callbacks.onError(error); }
+    };
+    document.body.append(input);
+    input.click();
+  }
+
   function showNodeMenu(anchor: HTMLElement, node: CanvasNode) {
     closeNodeMenu();
     const popup = document.createElement("div");
@@ -921,11 +1023,13 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           node.referenceIcon = value.trim() || "↗";
           setReferenceDisplay(node, "icon");
         });
+        add("上传引用 Icon", "▧", () => { void uploadNodeIcon(node); });
       }
     }
     if ((node.kind === "document" || node.kind === "canvas") && item(node.targetId)) {
       add("打开目标", "↗", () => { closeNodeMenu(); openTarget(item(node.targetId)); });
       add(node.displayMode === "icon" ? "显示内容缩略图" : "显示为 Icon", "▣", () => toggleCanvasMode(node));
+      add("上传自定义 Icon", "▧", () => { void uploadNodeIcon(node); });
     }
     if (node.kind === "media") {
       add("编辑说明", "✎", () => {
@@ -993,6 +1097,18 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     };
   }
 
+  function curvePathData(start: CanvasPoint, end: CanvasPoint, curve: CanvasCurve) {
+    const points = curve.controlPoints ?? [];
+    if (!points.length) return `M${start.x.toFixed(1)} ${start.y.toFixed(1)} C${curve.control1.x.toFixed(1)} ${curve.control1.y.toFixed(1)} ${curve.control2.x.toFixed(1)} ${curve.control2.y.toFixed(1)} ${end.x.toFixed(1)} ${end.y.toFixed(1)}`;
+    const controls = [curve.control1, ...points, curve.control2];
+    let path = `M${start.x.toFixed(1)} ${start.y.toFixed(1)}`;
+    controls.forEach((control, index) => {
+      const next = index === controls.length - 1 ? end : { x: (control.x + controls[index + 1].x) / 2, y: (control.y + controls[index + 1].y) / 2 };
+      path += ` Q${control.x.toFixed(1)} ${control.y.toFixed(1)} ${next.x.toFixed(1)} ${next.y.toFixed(1)}`;
+    });
+    return path;
+  }
+
   function renderConnections() {
     if (!current) return;
     stage.querySelector("svg.canvas-connections")?.remove();
@@ -1005,10 +1121,14 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
     marker.id = "canvas-arrow"; marker.setAttribute("markerWidth", "8"); marker.setAttribute("markerHeight", "8"); marker.setAttribute("refX", "7"); marker.setAttribute("refY", "4"); marker.setAttribute("orient", "auto");
     const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path"); arrow.setAttribute("d", "M0,0 L8,4 L0,8 z"); arrow.setAttribute("fill", "context-stroke"); marker.append(arrow); defs.append(marker); svg.append(defs);
-    const addPath = (node: CanvasNode, pathData: string, stroke: string, width: number, dash: string, hit = false) => {
+    const addPath = (node: CanvasNode, pathData: string, stroke: string, width: number, dash: string, hit = false, arrow: "start" | "end" | "both" | "none" = "none") => {
       const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
       path.setAttribute("d", pathData); path.setAttribute("fill", "none"); path.setAttribute("stroke", hit ? "transparent" : stroke); path.setAttribute("stroke-width", String(hit ? Math.max(16, width + 12) : width));
       path.setAttribute("stroke-linecap", "round"); path.setAttribute("stroke-linejoin", "round"); if (dash !== "none") path.setAttribute("stroke-dasharray", dash);
+      if (!hit && arrow !== "none") {
+        if (arrow === "end" || arrow === "both") path.setAttribute("marker-end", "url(#canvas-arrow)");
+        if (arrow === "start" || arrow === "both") path.setAttribute("marker-start", "url(#canvas-arrow)");
+      }
       path.dataset.nodeId = node.id; path.style.pointerEvents = hit ? "stroke" : "none";
       if (!hit) path.classList.add("canvas-connection-visible");
       path.addEventListener("click", event => { event.stopPropagation(); selectNode(node.id, (event as MouseEvent).shiftKey); if (node.kind === "curve" && node.curve) showCurveStyleEditor(node); });
@@ -1021,31 +1141,48 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         if (hit) addPath(node, pathForPoints(hit.points), "transparent", Math.max(8, hit.width), "none", true);
       }
       if (node.kind !== "curve" || !node.curve) continue;
-      const start = endpointPoint(node.curve.start); const end = endpointPoint(node.curve.end);
+      const curve = node.curve;
+      const start = endpointPoint(curve.start); const end = endpointPoint(curve.end);
       if (!start || !end) continue;
-      const pathData = `M${start.x.toFixed(1)} ${start.y.toFixed(1)} C${node.curve.control1.x.toFixed(1)} ${node.curve.control1.y.toFixed(1)} ${node.curve.control2.x.toFixed(1)} ${node.curve.control2.y.toFixed(1)} ${end.x.toFixed(1)} ${end.y.toFixed(1)}`;
-      addPath(node, pathData, node.curve.color, node.curve.width, curveDash(node.curve.dash));
-      addPath(node, pathData, "transparent", node.curve.width, "none", true);
-      if (node.curve.label?.trim()) {
-        const midpoint = curvePointAt(start, node.curve.control1, node.curve.control2, end);
+      const arrow = curve.arrow ?? "none";
+      const pathData = curvePathData(start, end, curve);
+      addPath(node, pathData, curve.color, curve.width, curveDash(curve.dash), false, arrow);
+      const hitPaths = [pathData];
+      for (const branch of curve.branches ?? []) {
+        const branchEnd = endpointPoint(branch);
+        if (!branchEnd) continue;
+        const branchPath = curvePathData(start, branchEnd, curve);
+        hitPaths.push(branchPath);
+        addPath(node, branchPath, curve.color, curve.width, curveDash(curve.dash), false, "end");
+      }
+      hitPaths.forEach(path => addPath(node, path, "transparent", curve.width, "none", true));
+      if (curve.label?.trim()) {
+        const midpoint = curvePointAt(start, curve.control1, curve.control2, end);
         const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
         label.setAttribute("x", String(midpoint.x));
         label.setAttribute("y", String(midpoint.y - 7));
         label.setAttribute("text-anchor", "middle");
         label.setAttribute("class", "canvas-curve-label");
-        label.textContent = node.curve.label;
-        label.setAttribute("aria-label", `曲线描述：${node.curve.label}`);
+        label.textContent = curve.label;
+        label.setAttribute("aria-label", `曲线描述：${curve.label}`);
         label.style.pointerEvents = "none";
         svg.append(label);
       }
       if (selected.has(node.id)) {
-        [node.curve.control1, node.curve.control2].forEach((point, index) => {
+        [curve.control1, curve.control2, ...(curve.controlPoints ?? [])].forEach((point, index) => {
           const handle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
           handle.setAttribute("cx", String(point.x)); handle.setAttribute("cy", String(point.y)); handle.setAttribute("r", "6"); handle.setAttribute("class", "canvas-curve-control"); handle.style.pointerEvents = "all";
           handle.addEventListener("pointerdown", event => {
             event.preventDefault(); event.stopPropagation();
             const pointerId = event.pointerId;
-            const move = (next: PointerEvent) => { if (next.pointerId !== pointerId || !current) return; const nextPoint = worldPoint(next.clientX, next.clientY); if (index === 0) node.curve!.control1 = nextPoint; else node.curve!.control2 = nextPoint; renderConnections(); };
+            const move = (next: PointerEvent) => {
+              if (next.pointerId !== pointerId || !current) return;
+              const nextPoint = worldPoint(next.clientX, next.clientY);
+              if (index === 0) curve.control1 = nextPoint;
+              else if (index === 1) curve.control2 = nextPoint;
+              else if (curve.controlPoints) curve.controlPoints[index - 2] = nextPoint;
+              renderConnections();
+            };
             const up = (next: PointerEvent) => { if (next.pointerId !== pointerId) return; window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); scheduleSave(); };
             window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
           });
@@ -1162,8 +1299,8 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         icon.className = "canvas-reference-icon";
         icon.title = "打开引用目标";
         icon.setAttribute("aria-label", "打开引用目标");
-        icon.innerHTML = `<span aria-hidden="true"></span><strong></strong>`;
-        icon.querySelector("span")!.textContent = node.referenceIcon || "↗";
+        icon.innerHTML = `<span class="canvas-icon-slot" aria-hidden="true"></span><strong></strong>`;
+        appendIconVisual(icon.querySelector(".canvas-icon-slot")!, node.referenceIcon || "↗", "引用 Icon");
         const token = node.block.content.links?.find(link => link.targetDocumentId);
         const targetDoc = token ? item(token.targetDocumentId) : undefined;
         icon.querySelector("strong")!.textContent = targetDoc?.title ?? "引用";
@@ -1334,7 +1471,8 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           icon.type = "button";
           icon.className = "canvas-link-icon";
           icon.title = `打开 ${target.title}`;
-          icon.innerHTML = `<span aria-hidden="true">▤</span><strong></strong>`;
+          icon.innerHTML = `<span class="canvas-icon-slot" aria-hidden="true"></span><strong></strong>`;
+          appendIconVisual(icon.querySelector(".canvas-icon-slot")!, node.referenceIcon || "▤", target.title);
           icon.querySelector("strong")!.textContent = target.title;
           icon.onclick = event => { event.stopPropagation(); openTarget(target); };
           icon.addEventListener("pointerenter", () => showIconPreview(icon, node, target));
@@ -1347,7 +1485,8 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           icon.type = "button";
           icon.className = "canvas-link-icon";
           icon.title = `打开 ${target.title}`;
-          icon.innerHTML = `<span aria-hidden="true">◇</span><strong></strong>`;
+          icon.innerHTML = `<span class="canvas-icon-slot" aria-hidden="true"></span><strong></strong>`;
+          appendIconVisual(icon.querySelector(".canvas-icon-slot")!, node.referenceIcon || "◇", target.title);
           icon.querySelector("strong")!.textContent = target.title;
           icon.onclick = event => { event.stopPropagation(); openTarget(target); };
           icon.addEventListener("pointerenter", () => showIconPreview(icon, node, target));
@@ -1400,7 +1539,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   function toggleDrawMode() {
     closeCurveStyleEditor();
     drawMode = !drawMode;
-    curveMode = false; pendingCurveEndpoint = null;
+    curveMode = false; pendingCurveEndpoint = null; branchCurveNode = null;
     viewport.classList.toggle("draw-mode", drawMode);
     viewport.classList.remove("curve-mode");
     updateCanvasModeButtons();
@@ -1410,7 +1549,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   function toggleCurveMode() {
     closeCurveStyleEditor();
     curveMode = !curveMode;
-    drawMode = false; pendingCurveEndpoint = null;
+    drawMode = false; pendingCurveEndpoint = null; branchCurveNode = null;
     viewport.classList.toggle("curve-mode", curveMode);
     viewport.classList.remove("draw-mode");
     library.hidden = true;
@@ -1429,6 +1568,20 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   function pickCurveEndpoint(node: CanvasNode, event: MouseEvent) {
     if (!current || node.kind === "curve" || node.kind === "draw") return;
     const endpoint = nearestEdge(node, worldPoint(event.clientX, event.clientY));
+    if (branchCurveNode?.curve) {
+      const curve = branchCurveNode.curve;
+      const duplicate = (curve.branches ?? []).some(item => item.nodeId === endpoint.nodeId);
+      if (!duplicate && endpoint.nodeId !== curve.start.nodeId && endpoint.nodeId !== curve.end.nodeId) {
+        curve.branches = [...(curve.branches ?? []), endpoint];
+        branchCurveNode = null;
+        curveMode = false;
+        viewport.classList.remove("curve-mode");
+        updateCanvasModeButtons();
+        renderNodes();
+        scheduleSave();
+      }
+      return;
+    }
     if (!pendingCurveEndpoint) {
       pendingCurveEndpoint = endpoint;
       selected = new Set([node.id]);
@@ -1476,11 +1629,32 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const dash = document.createElement("select");
     [["solid", "实线"], ["dashed", "虚线"], ["dotted", "点线"]].forEach(([value, label]) => { const option = document.createElement("option"); option.value = value; option.textContent = label; dash.append(option); });
     dash.value = node.curve.dash; dashLabel.append(dash);
+    const arrowLabel = document.createElement("label"); arrowLabel.textContent = "箭头 ";
+    const arrow = document.createElement("div"); arrow.className = "canvas-arrow-options";
+    let arrowValue: CanvasCurve["arrow"] = node.curve.arrow ?? "none";
+    [["none", "无箭头"], ["end", "终点箭头"], ["both", "双向箭头"]].forEach(([value, label]) => {
+      const option = document.createElement("button"); option.type = "button"; option.textContent = label; option.dataset.arrow = value; option.setAttribute("aria-pressed", String(value === arrowValue));
+      option.onclick = () => { arrowValue = value as CanvasCurve["arrow"]; arrow.querySelectorAll("button").forEach(item => item.setAttribute("aria-pressed", String(item === option))); update(); };
+      arrow.append(option);
+    });
+    arrowLabel.append(arrow);
     const description = document.createElement("label"); description.textContent = "描述 ";
     const descriptionInput = document.createElement("input"); descriptionInput.type = "text"; descriptionInput.value = node.curve.label ?? ""; descriptionInput.placeholder = "连接说明"; descriptionInput.maxLength = 120; description.append(descriptionInput);
-    popup.append(colorLabel, widthLabel, dashLabel, description);
-    const update = () => { node.curve!.color = color.value; node.curve!.width = Number(width.value); node.curve!.dash = dash.value as CanvasCurve["dash"]; node.curve!.label = descriptionInput.value.trim() || undefined; output.value = `${node.curve!.width}px`; renderConnections(); scheduleSave(120); };
+    popup.append(colorLabel, widthLabel, dashLabel, arrowLabel, description);
+    const update = () => { node.curve!.color = color.value; node.curve!.width = Number(width.value); node.curve!.dash = dash.value as CanvasCurve["dash"]; node.curve!.arrow = arrowValue; node.curve!.label = descriptionInput.value.trim() || undefined; output.value = `${node.curve!.width}px`; renderConnections(); scheduleSave(120); };
     color.oninput = width.oninput = dash.oninput = descriptionInput.oninput = update;
+    const control = document.createElement("button"); control.type = "button"; control.textContent = "插入控制点"; control.onclick = () => {
+      const start = endpointPoint(node.curve!.start); const end = endpointPoint(node.curve!.end);
+      if (!start || !end) return;
+      const point = curvePointAt(start, node.curve!.control1, node.curve!.control2, end);
+      node.curve!.controlPoints = [...(node.curve!.controlPoints ?? []), point];
+      renderConnections(); scheduleSave(0);
+    };
+    const branch = document.createElement("button"); branch.type = "button"; branch.textContent = "添加分支点"; branch.onclick = () => {
+      branchCurveNode = node; closeCurveStyleEditor(); curveMode = true; drawMode = false; pendingCurveEndpoint = null; viewport.classList.add("curve-mode"); updateCanvasModeButtons(); saveState.textContent = "分支模式：点击要连接的块";
+    };
+    const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger"; remove.textContent = "删除曲线"; remove.onclick = () => { removeNode(node.id); closeCurveStyleEditor(); };
+    popup.append(control, branch, remove);
     document.body.append(popup); curveStylePopup = popup;
     const dismiss = (event: PointerEvent) => {
       if (event.target instanceof Node && popup.contains(event.target)) return;
@@ -1508,6 +1682,34 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       }
       renderNodes(); scheduleSave();
     } catch (error) { callbacks.onError(error); }
+  }
+
+  function mediaKindFromUrl(url: string): MediaAsset["kind"] {
+    const path = (() => { try { return new URL(url).pathname.toLocaleLowerCase(); } catch { return url.toLocaleLowerCase(); } })();
+    if (/\.(?:png|jpe?g|gif|webp|svg|avif|bmp)(?:$|\?)/i.test(path)) return "image";
+    if (/\.(?:mp4|webm|mov|m4v|ogv)(?:$|\?)/i.test(path)) return "video";
+    if (/\.(?:mp3|wav|ogg|m4a|aac|flac)(?:$|\?)/i.test(path)) return "audio";
+    if (/\.pdf(?:$|\?)/i.test(path)) return "pdf";
+    return "file";
+  }
+
+  function insertMediaUrl(point = nextPosition()) {
+    if (!current) return;
+    const raw = window.prompt("输入媒体网络地址（http:// 或 https://）", "https://");
+    if (raw === null) return;
+    const url = raw.trim();
+    let parsed: URL;
+    try { parsed = new URL(url); } catch { callbacks.onError(new Error("媒体地址无效")); return; }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") { callbacks.onError(new Error("媒体地址必须使用 http 或 https")); return; }
+    const name = decodeURIComponent(parsed.pathname.split("/").pop() || "远程媒体");
+    const media: MediaAsset = { id: uid("remote-media"), kind: mediaKindFromUrl(url), name, mimeType: "application/octet-stream", size: 0, url };
+    const width = media.kind === "audio" ? 320 : 360;
+    const height = media.kind === "audio" ? 120 : media.kind === "pdf" ? 300 : 240;
+    const id = uid("canvas-media");
+    current.nodes.push({ id, kind: "media", x: Math.round(point.x), y: Math.round(point.y), width, height, zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, media });
+    selected = new Set([id]);
+    renderNodes();
+    scheduleSave();
   }
 
   function chooseMedia(point = nextPosition()) {
@@ -1585,6 +1787,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       { label: "插入文档", icon: "▤", run: () => showLibrary(point) },
       { label: "插入引用", icon: "↗", run: () => openReferenceComposer(point) },
       { label: "插入媒体", icon: "▧", run: () => chooseMedia(point) },
+      { label: "插入网络媒体", icon: "◎", run: () => insertMediaUrl(point) },
       { label: "开始手绘", icon: "✎", run: toggleDrawMode },
       { label: "绘制曲线", icon: "⌁", run: toggleCurveMode }
     ];
@@ -1673,6 +1876,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   view.querySelector<HTMLButtonElement>("[data-canvas-action=add]")!.onclick = () => addText();
   view.querySelector<HTMLButtonElement>("[data-canvas-action=insert]")!.onclick = () => library.hidden ? showLibrary() : library.hidden = true;
   view.querySelector<HTMLButtonElement>("[data-canvas-action=media]")!.onclick = () => chooseMedia();
+  view.querySelector<HTMLButtonElement>("[data-canvas-action=media-url]")!.onclick = () => insertMediaUrl();
   view.querySelector<HTMLButtonElement>("[data-canvas-action=draw]")!.onclick = toggleDrawMode;
   view.querySelector<HTMLButtonElement>("[data-canvas-action=curve]")!.onclick = toggleCurveMode;
   undo.onclick = () => void moveHistory("undo");
