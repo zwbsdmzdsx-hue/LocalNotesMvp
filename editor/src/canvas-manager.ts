@@ -34,6 +34,17 @@ export type CanvasManager = {
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const uid = (prefix: string) => `${prefix}-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
 
+function todayIsoDate() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+function todoStatus(checked: boolean, dueAt?: string, completedAt?: string) {
+  if (checked) return dueAt && (completedAt || todayIsoDate()) > dueAt ? "complete-late" : "complete-early";
+  if (dueAt && todayIsoDate() > dueAt) return "overdue";
+  return dueAt ? "pending" : "none";
+}
+
 export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCallbacks): CanvasManager {
   const host = document.querySelector<HTMLElement>(".workspace")!;
   const editor = host.querySelector<HTMLElement>(".editor")!;
@@ -489,6 +500,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
             emitState();
           }
           saveState.textContent = "已保存";
+          callbacks.onWorkspaceChanged();
         }
       }).catch(error => {
         saveError = error;
@@ -501,6 +513,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     if (!current) return;
     if (saveTimer) clearTimeout(saveTimer);
     saveState.textContent = "保存中";
+    // Publish the optimistic Canvas snapshot before the persistence debounce.
+    // The right rail reads the same snapshot, so a newly typed link or todo
+    // date is visible immediately and is then reconciled again by the ACK.
+    emitState();
     saveTimer = setTimeout(() => {
       saveTimer = null;
       if (!current) return;
@@ -1140,8 +1156,60 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           checkbox.className = "canvas-todo-check";
           checkbox.checked = !!node.block.content.checked;
           checkbox.setAttribute("aria-label", "完成待办");
-          checkbox.onchange = () => { node.block!.content.checked = checkbox.checked; syncPreview(); };
+          checkbox.onchange = () => {
+            node.block!.content.checked = checkbox.checked;
+            node.block!.properties.todoCompletedAt = checkbox.checked
+              ? (node.block!.properties.todoCompletedAt || todayIsoDate())
+              : undefined;
+            const completedInput = body.querySelector<HTMLInputElement>(".todo-completed-date");
+            if (completedInput) completedInput.value = node.block!.properties.todoCompletedAt ?? "";
+            const indicator = body.querySelector<HTMLElement>(".canvas-todo-status");
+            const status = todoStatus(checkbox.checked, node.block!.properties.todoDueAt, node.block!.properties.todoCompletedAt);
+            if (indicator) {
+              indicator.className = `canvas-todo-status todo-status-${status}`;
+              indicator.textContent = status === "complete-early" || status === "complete-late" ? "✓" : status === "overdue" ? "!" : status === "pending" ? "○" : "";
+            }
+            syncPreview();
+          };
           body.prepend(checkbox);
+          const dates = document.createElement("span");
+          dates.className = "canvas-todo-dates";
+          dates.setAttribute("aria-label", "待办日期");
+          const dateControl = (className: string, labelText: string, value: string | undefined, disabled = false) => {
+            const label = document.createElement("label");
+            label.title = labelText;
+            const caption = document.createElement("span"); caption.textContent = labelText;
+            const input = document.createElement("input");
+            input.type = "date"; input.className = className; input.setAttribute("aria-label", labelText); input.value = value ?? ""; input.disabled = disabled;
+            input.addEventListener("change", () => {
+              const property = className === "todo-created-date" ? "todoCreatedAt" : className === "todo-due-date" ? "todoDueAt" : "todoCompletedAt";
+              const next = input.value || undefined;
+              node.block!.properties[property] = next;
+              if (property === "todoCompletedAt") {
+                node.block!.content.checked = !!next;
+                checkbox.checked = !!next;
+              }
+              const indicator = body.querySelector<HTMLElement>(".canvas-todo-status");
+              const status = todoStatus(!!node.block!.content.checked, node.block!.properties.todoDueAt, node.block!.properties.todoCompletedAt);
+              if (indicator) {
+                indicator.className = `canvas-todo-status todo-status-${status}`;
+                indicator.textContent = status === "complete-early" || status === "complete-late" ? "✓" : status === "overdue" ? "!" : status === "pending" ? "○" : "";
+              }
+              if (property === "todoCompletedAt") syncPreview();
+              scheduleSave(0);
+            });
+            label.append(caption, input); dates.append(label);
+          };
+          dateControl("todo-created-date", "创建", node.block.properties.todoCreatedAt);
+          dateControl("todo-due-date", "应完成", node.block.properties.todoDueAt);
+          dateControl("todo-completed-date", "完成", node.block.properties.todoCompletedAt);
+          const status = document.createElement("span");
+          status.className = "canvas-todo-status";
+          const todoState = todoStatus(!!node.block.content.checked, node.block.properties.todoDueAt, node.block.properties.todoCompletedAt);
+          status.classList.add(`todo-status-${todoState}`);
+          status.textContent = todoState === "complete-early" || todoState === "complete-late" ? "✓" : todoState === "overdue" ? "!" : todoState === "pending" ? "○" : "";
+          dates.prepend(status);
+          body.append(dates);
         }
         body.append(textarea, preview);
       } else if (node.kind === "media" && node.media) {
@@ -1216,7 +1284,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const blockId = uid("canvas-block");
     const node: CanvasNode = {
       id: blockId, kind: "block", x: Math.round(point.x), y: Math.round(point.y), width: 280, height: 180, zIndex: maxZ + 1,
-      block: { id: blockId, parentId: null, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), type, content: { text: "", html: "", markdown: "", checked: type === "todo" ? false : undefined }, properties: type === "heading" ? { headingLevel: 1 } : {}, revision: 1 }
+      block: { id: blockId, parentId: null, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), type, content: { text: "", html: "", markdown: "", checked: type === "todo" ? false : undefined }, properties: type === "heading" ? { headingLevel: 1 } : type === "todo" ? { todoCreatedAt: todayIsoDate() } : {}, revision: 1 }
     };
     current.nodes.push(node);
     selected = new Set([node.id]);

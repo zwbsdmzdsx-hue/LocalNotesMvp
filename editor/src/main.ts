@@ -11,6 +11,7 @@ const transport = new BrowserMockHost();
 const host = new EditorHostApi(transport);
 let canvasManager: CanvasManager;
 let dashboardManager: DashboardManager;
+let lastSurfaceState: import("../../protocol/types").EditorState | null = null;
 
 function workspaceKind(id: string) {
   return workspace.snapshot().documents.find(item => item.id === id)?.kind;
@@ -77,7 +78,21 @@ const editor = mountEditor(host, {
   updateHistory: model => shell.updateHistory(model),
   canvasUndo: () => void canvasManager?.undo(),
   canvasRedo: () => void canvasManager?.redo(),
-  canvasStateChanged: (state, persist) => canvasManager?.applyEditorState(state, persist)
+  canvasStateChanged: (state, persist) => canvasManager?.applyEditorState(state, persist),
+  surfaceStateChanged: (state, surface) => {
+    // core also listens to documentLoaded for desktop compatibility. In the
+    // browser entrypoint the main router owns Dashboard/Canvas switching, so a
+    // transient render of a Dashboard document must never replace the last
+    // content source used by its widgets and right-side panels.
+    const kind = workspaceKind(state.note.id);
+    if (kind !== "dashboard") {
+      lastSurfaceState = structuredClone(state);
+      shell.setPanelContext({ surface, state: structuredClone(state) });
+      dashboardManager?.setSourceState(state);
+    } else {
+      shell.setPanelContext({ surface: "dashboard", state: structuredClone(state), sourceState: lastSurfaceState ? structuredClone(lastSurfaceState) : undefined });
+    }
+  }
 });
 canvasManager = mountCanvasManager(workspace, {
   onOpenDocument: (id, blockId) => {
@@ -101,13 +116,28 @@ dashboardManager = mountDashboardManager(host, workspace, {
   onStateChanged: state => { if (dashboardManager.isOpen()) dashboardManager.applyState(state); }
 });
 host.onEvent(event => {
-  if (event.kind === "documentChanged") canvasManager.refreshReferences();
+  if (event.kind === "documentChanged") {
+    canvasManager.refreshReferences();
+    dashboardManager?.refreshSources(event.payload.documentId);
+    if (lastSurfaceState?.note.id === event.payload.documentId) {
+      void host.loadDocument(event.payload.documentId).then(next => {
+        lastSurfaceState = structuredClone(next);
+        if (dashboardManager?.isOpen()) {
+          editor.load(next);
+          dashboardManager.setSourceState(next);
+          shell.setPanelContext({ surface: "dashboard", state: structuredClone(next), sourceState: structuredClone(next) });
+        }
+      }).catch(editor.showError);
+    }
+  }
   if (event.kind === "documentLoaded") {
     const id = event.payload.state.note.id;
     if (workspaceKind(id) === "dashboard") {
       canvasManager.close();
-      editor.clear();
-      dashboardManager.open(event.payload.state);
+      if (lastSurfaceState) editor.load(lastSurfaceState);
+      else editor.clear();
+      dashboardManager.open(event.payload.state, lastSurfaceState);
+      if (lastSurfaceState) shell.setPanelContext({ surface: "dashboard", state: structuredClone(event.payload.state), sourceState: structuredClone(lastSurfaceState) });
     } else if (workspace.canvas(id)) {
       dashboardManager.close();
       editor.loadCanvas(event.payload.state);

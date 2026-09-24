@@ -1187,6 +1187,15 @@ body[data-workspace-mode="canvas"] .content .workspace { overflow: hidden; }
 .canvas-link-suggestion:has(.link-suggestion-block-line) { display: block; height: 26px; padding: 3px 7px; overflow: hidden; }
 .canvas-note-preview { min-height: 100%; color: #344054; font-size: 13px; line-height: 1.55; }
 .canvas-note-preview[hidden] { display: none; }
+.canvas-todo-dates { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 7px; margin: 4px 0 7px; color: #667085; font-size: 10px; }
+.canvas-todo-dates label { display: inline-flex; align-items: center; gap: 3px; }
+.canvas-todo-dates input { width: 112px; min-height: 22px; box-sizing: border-box; padding: 2px 4px; border: 1px solid #d0d5dd; border-radius: 3px; color: #344054; background: #fff; font: inherit; font-size: 10px; }
+.canvas-todo-dates input:focus { border-color: #84adff; outline: 2px solid #dbeafe; }
+.canvas-todo-status { display: inline-grid; place-items: center; width: 15px; height: 15px; border-radius: 50%; font-size: 11px; font-weight: 700; }
+.canvas-todo-status.todo-status-pending { color: #b54708; background: #fffaeb; }
+.canvas-todo-status.todo-status-overdue { color: #b42318; background: #fef3f2; }
+.canvas-todo-status.todo-status-complete-early { color: #027a48; background: #ecfdf3; }
+.canvas-todo-status.todo-status-complete-late { color: #b42318; background: #fef3f2; }
 .canvas-note-preview p { margin: 0 0 7px; }
 .canvas-note-preview h1, .canvas-note-preview h2, .canvas-note-preview h3 { margin: 0 0 7px; color: #172b4d; line-height: 1.35; }
 .canvas-note-preview .wiki-link { color: #175cd3; cursor: pointer; text-decoration: underline; text-decoration-color: #b2ccff; text-underline-offset: 2px; }

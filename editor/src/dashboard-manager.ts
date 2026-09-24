@@ -57,15 +57,17 @@ function defaultRenderers(): DashboardWidgetRenderer[] {
 }
 
 export type DashboardManager = {
-  open(state: EditorState): void;
+  open(state: EditorState, sourceState?: EditorState | null): void;
   close(): void;
   flush(): Promise<void>;
   isOpen(): boolean;
   applyState(state: EditorState): void;
+  setSourceState(state: EditorState | null): void;
+  refreshSources(documentId?: string): void;
   register(renderer: DashboardWidgetRenderer): void;
 };
 
-export function mountDashboardManager(host: EditorHostApi, _workspace: WorkspaceApi, callbacks: DashboardCallbacks): DashboardManager {
+export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceApi, callbacks: DashboardCallbacks): DashboardManager {
   const container = document.querySelector<HTMLElement>(".workspace")!;
   const view = document.createElement("section");
   view.className = "dashboard-view";
@@ -75,7 +77,10 @@ export function mountDashboardManager(host: EditorHostApi, _workspace: Workspace
   const title = view.querySelector<HTMLInputElement>(".dashboard-title")!;
   const saveState = view.querySelector<HTMLElement>(".dashboard-save-state")!;
   const stage = view.querySelector<HTMLElement>(".dashboard-stage")!;
+  const editor = container.querySelector<HTMLElement>(".editor")!;
   let current: EditorState | null = null;
+  let sourceState: EditorState | null = null;
+  const sourceStates = new Map<string, EditorState>();
   let saveTail = Promise.resolve();
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let lastSaveError: unknown = null;
@@ -84,6 +89,32 @@ export function mountDashboardManager(host: EditorHostApi, _workspace: Workspace
   function setSaveState(text: string, error = false) { saveState.textContent = text; saveState.classList.toggle("is-error", error); }
   function widgets() { return current?.blocks.filter(block => block.type === "dashboard_widget" && widgetConfig(block)) ?? []; }
   function rendererFor(kind: string) { return renderers.get(kind); }
+  function aggregate(states: EditorState[]): EditorState | null {
+    const first = states[0];
+    if (!first) return null;
+    const result = structuredClone(first);
+    result.blocks = states.flatMap(state => state.blocks.map(block => structuredClone(block)));
+    result.references = states.flatMap(state => state.references.map(reference => structuredClone(reference)));
+    result.backlinks = states.flatMap(state => state.backlinks.map(backlink => structuredClone(backlink)));
+    result.overrideNotices = states.flatMap(state => state.overrideNotices.map(notice => structuredClone(notice)));
+    result.locations = [...new Map(states.flatMap(state => state.locations ?? []).map(location => [location.id, structuredClone(location)])).values()];
+    result.databases = [...new Map(states.flatMap(state => state.databases ?? []).map(database => [database.id, structuredClone(database)])).values()];
+    result.systemStyles = [...new Map(states.flatMap(state => state.systemStyles ?? []).map(style => [style.id, structuredClone(style)])).values()];
+    result.notebookStyles = [...new Map(states.flatMap(state => state.notebookStyles ?? []).map(style => [style.id, structuredClone(style)])).values()];
+    result.documentStyles = [...new Map(states.flatMap(state => state.documentStyles ?? []).map(style => [style.id, structuredClone(style)])).values()];
+    return result;
+  }
+  function dataStateFor(config: NonNullable<BlockProperties["dashboardWidget"]>) {
+    if (config.scope === "activeDocument") return sourceState ?? current!;
+    if (config.scope === "document") return sourceStates.get(config.sourceId ?? sourceState?.note.id ?? "") ?? sourceState ?? current!;
+    if (config.scope === "notebook") {
+      const notebookId = sourceState?.note.workspaceId;
+      const states = [...sourceStates.values()].filter(state => !notebookId || state.note.workspaceId === notebookId);
+      return aggregate(states) ?? sourceState ?? current!;
+    }
+    if (config.scope === "workspace") return aggregate([...sourceStates.values()]) ?? sourceState ?? current!;
+    return current!;
+  }
   function renderWidget(block: Block) {
     const config = widgetConfig(block)!;
     const card = document.createElement("article");
@@ -102,7 +133,7 @@ export function mountDashboardManager(host: EditorHostApi, _workspace: Workspace
     controls.append(smaller, larger, remove); head.append(label, kind, controls); card.append(head);
     const body = document.createElement("div"); body.className = "dashboard-widget-body";
     const custom = rendererFor(config.kind);
-    if (custom) body.append(custom.render(current!, block));
+    if (custom) body.append(custom.render(dataStateFor(config), block));
     else { body.append(countCard("自定义组件占位", 0)); const hint = document.createElement("p"); hint.className = "dashboard-empty"; hint.textContent = "此组件类型已预留，可通过 DashboardWidgetRenderer 注册。"; body.append(hint); }
     card.append(body);
     enableDrag(card, block);
@@ -115,6 +146,21 @@ export function mountDashboardManager(host: EditorHostApi, _workspace: Workspace
     const maxX = Math.max(900, ...widgets().map(block => (widgetConfig(block)!.layout.x + widgetConfig(block)!.layout.width + 40)));
     const maxY = Math.max(620, ...widgets().map(block => (widgetConfig(block)!.layout.y + widgetConfig(block)!.layout.height + 40)));
     stage.style.width = `${maxX}px`; stage.style.height = `${maxY}px`;
+  }
+  async function hydrateSources() {
+    if (!current) return;
+    const configs = widgets().map(widgetConfig).filter((config): config is NonNullable<BlockProperties["dashboardWidget"]> => Boolean(config));
+    const ids = new Set<string>();
+    const snapshot = workspace.snapshot();
+    configs.forEach(config => {
+      if (config.scope === "document" && config.sourceId) ids.add(config.sourceId);
+      if (config.scope === "notebook" || config.scope === "workspace") snapshot.documents.filter(item => item.kind !== "dashboard").forEach(item => ids.add(item.id));
+    });
+    if (sourceState) sourceStates.set(sourceState.note.id, structuredClone(sourceState));
+    await Promise.all([...ids].filter(id => !sourceStates.has(id)).map(async id => {
+      try { sourceStates.set(id, await host.loadDocument(id)); } catch { /* deleted source: renderer shows its empty state */ }
+    }));
+    if (current) render();
   }
   function resize(block: Block, dx: number, dy: number) {
     const layout = widgetConfig(block)!.layout;
@@ -167,7 +213,22 @@ export function mountDashboardManager(host: EditorHostApi, _workspace: Workspace
     title.addEventListener("change", () => { if (!current) return; current.note.title = title.value.trim() || "未命名 Dashboard"; scheduleSave(); });
   }
   setupAddMenu();
-  function open(state: EditorState) { current = structuredClone(state); view.hidden = false; render(); }
-  function close() { view.hidden = true; current = null; stage.replaceChildren(); }
-  return { open, close, isOpen: () => !view.hidden, applyState: state => { if (!current || current.note.id !== state.note.id) return; current = structuredClone(state); render(); }, register: renderer => { renderers.set(renderer.kind, renderer); if (current) render(); }, flush: async () => { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveTail = saveTail.catch(() => undefined).then(async () => { try { await save(); lastSaveError = null; } catch (error) { lastSaveError = error; setSaveState("保存失败", true); callbacks.onError(error); } }); } await saveTail; if (lastSaveError) throw lastSaveError; } };
+  function open(state: EditorState, nextSourceState?: EditorState | null) {
+    current = structuredClone(state);
+    sourceState = nextSourceState ? structuredClone(nextSourceState) : sourceState;
+    if (sourceState) sourceStates.set(sourceState.note.id, structuredClone(sourceState));
+    editor.hidden = true; view.hidden = false; render(); void hydrateSources();
+  }
+  function close() { view.hidden = true; current = null; sourceState = null; sourceStates.clear(); editor.hidden = false; stage.replaceChildren(); }
+  function setSourceState(state: EditorState | null) {
+    sourceState = state ? structuredClone(state) : null;
+    if (sourceState) sourceStates.set(sourceState.note.id, structuredClone(sourceState));
+    if (current) { render(); void hydrateSources(); }
+  }
+  function refreshSources(documentId?: string) {
+    if (documentId) sourceStates.delete(documentId);
+    if (sourceState && (!documentId || sourceState.note.id === documentId)) sourceStates.delete(sourceState.note.id);
+    if (current) void hydrateSources();
+  }
+  return { open, close, isOpen: () => !view.hidden, applyState: state => { if (!current || current.note.id !== state.note.id) return; current = structuredClone(state); render(); }, setSourceState, refreshSources, register: renderer => { renderers.set(renderer.kind, renderer); if (current) render(); }, flush: async () => { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveTail = saveTail.catch(() => undefined).then(async () => { try { await save(); lastSaveError = null; } catch (error) { lastSaveError = error; setSaveState("保存失败", true); callbacks.onError(error); } }); } await saveTail; if (lastSaveError) throw lastSaveError; } };
 }

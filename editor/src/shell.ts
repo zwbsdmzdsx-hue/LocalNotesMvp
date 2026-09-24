@@ -1,6 +1,8 @@
 import type { WorkspaceApi, WorkspaceCommand, WorkspaceDocument, CalendarTodo } from "./workspace-api";
 import type { HistoryModel } from "./history";
 import type { Block, EditorState } from "../../protocol/types";
+import type { PanelContext } from "./panel-context";
+import { mergeSurfaceTodos } from "./panel-context";
 import { markdownFromContent, renderMarkdown } from "./markdown";
 
 const STORAGE_KEY = "lnm-shell-layout-v1";
@@ -62,6 +64,7 @@ export interface ShellApi {
   showHistory(): void;
   setDatabaseContext(visible: boolean, activate?: boolean): void;
   updateHistory(model: HistoryModel): void;
+  setPanelContext(context: PanelContext | null): void;
 }
 
 function escapeHtml(s: string): string {
@@ -101,6 +104,7 @@ const BOOKMARK_COLORS = [
 export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellApi {
   const layout = loadLayout();
   let databaseContextVisible = false;
+  let panelContext: PanelContext | null = null;
   let rightTabBeforeDatabase = layout.rightActiveTab === "databases" ? "reference-sidebar" : layout.rightActiveTab;
   function execute(command: WorkspaceCommand) {
     const task = workspace.execute(command).then(() => renderAll());
@@ -875,7 +879,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
         if (date) diaryDates.add(date);
       });
     }
-    const todoDates = workspace.todoDates();
+    const todoDates = mergeSurfaceTodos(workspace.todoDates(), panelContext ?? undefined);
     const dueTodosByDate = new Map<string, CalendarTodo[]>();
     todoDates.forEach(todo => {
       if (!todo.dueAt) return;
@@ -891,9 +895,22 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       const dots = document.createElement("span"); dots.className = "calendar-dots";
       const appendDot = (className: string, title: string) => { const dot = document.createElement("span"); dot.className = `calendar-dot ${className}`; dot.title = title; dots.append(dot); };
       if (diaryDates.has(date)) appendDot("calendar-dot-diary", "有日记");
+      // A day can contain several todos, but the calendar communicates status
+      // at day level. Collapse duplicate markers of the same status while
+      // keeping every todo in the selected-day preview below.
+      const todosByStatus = new Map<ReturnType<typeof calendarTodoStatus>, CalendarTodo[]>();
       for (const todo of dueTodosByDate.get(date) ?? []) {
         const status = calendarTodoStatus(todo);
-        appendDot(status === "complete" ? "calendar-dot-todo-complete" : status === "overdue" ? "calendar-dot-todo-overdue" : "calendar-dot-todo-pending", `${calendarTodoStatusLabel(todo)}：${todo.text}`);
+        const list = todosByStatus.get(status) ?? [];
+        list.push(todo);
+        todosByStatus.set(status, list);
+      }
+      for (const [status, todos] of todosByStatus) {
+        const className = status === "complete" ? "calendar-dot-todo-complete" : status === "overdue" ? "calendar-dot-todo-overdue" : "calendar-dot-todo-pending";
+        const label = todos.length === 1
+          ? `${calendarTodoStatusLabel(todos[0])}：${todos[0].text}`
+          : `${calendarTodoStatusLabel(todos[0])}：${todos.length} 项待办`;
+        appendDot(className, label);
       }
       if (dots.childElementCount) cell.append(dots);
       if (diaryDates.has(date) || dueTodosByDate.has(date)) cell.classList.add("has-calendar-activity");
@@ -1064,6 +1081,11 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       saveLayout(layout);
     }
     applyRightTab("reference-sidebar");
+  }
+
+  function setPanelContext(context: PanelContext | null) {
+    panelContext = context;
+    renderCalendar();
   }
 
   function showLocations() {
@@ -1255,6 +1277,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     showHistory,
     setDatabaseContext,
     updateHistory,
+    setPanelContext,
     renderAll,
     renderOutline
   };
@@ -1266,6 +1289,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     showHistory,
     setDatabaseContext,
     updateHistory,
+    setPanelContext,
     highlightActiveDocument: (id: string) => renderAll(id)
   };
 }

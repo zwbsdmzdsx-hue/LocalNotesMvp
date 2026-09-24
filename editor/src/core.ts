@@ -7,6 +7,7 @@ import { orderBlockTree } from "./block-tree";
 import { markdownFromContent, markdownFromHtml, plainTextFromContent, renderMarkdown } from "./markdown";
 import { parseDql, executeDql } from "./database-query";
 import { LocationManager, renderLocationMap } from "./location-manager";
+import type { SurfaceKind } from "./panel-context";
 
 // The existing renderer and editing operations are shared by browser and desktop.
 export function mountEditor(host: EditorHostApi, ui: {
@@ -18,6 +19,7 @@ export function mountEditor(host: EditorHostApi, ui: {
   canvasUndo?(): void;
   canvasRedo?(): void;
   canvasStateChanged?(state: EditorState, persist: boolean): void;
+  surfaceStateChanged?(state: EditorState, surface: SurfaceKind): void;
 } = {}) {
 const titleInput = document.querySelector<HTMLInputElement>("#title")!;
 const blockSurface = document.querySelector<HTMLDivElement>("#blocks")!;
@@ -915,6 +917,7 @@ function renderAllPanels() {
   applyManagedStyles();
   if (openCommentBlockId) renderOpenCommentPopover();
   titleInput.value = state.note.title;
+  ui.surfaceStateChanged?.(state, canvasContext ? "canvas" : "document");
 }
 
 function isEmbeddedReferenceBlock(block: Block) {
@@ -1736,7 +1739,11 @@ function enqueueDocumentSave() {
   if (!state?.note.id) return;
   if (canvasContext) {
     state.blocks = readOwnBlocks();
-    renderRelations();
+    // Canvas edits are optimistic and live in the same EditorState as the
+    // document editor. Refresh every panel from that snapshot immediately so
+    // dates, references, comments, styles and database context do not wait for
+    // the Canvas save ACK before becoming visible in the right rail.
+    renderAllPanels();
     ui.canvasStateChanged?.(state, true);
     return;
   }
@@ -1758,7 +1765,10 @@ function enqueueDocumentSave() {
     blocks: readOwnBlocks()
   };
   state.blocks = mutation.blocks;
-  renderRelations();
+  // Keep the panel context ahead of the save ACK. The queued snapshot is the
+  // canonical optimistic state, so the calendar and the other right-side
+  // panels can render a just-entered date/link without waiting for transport.
+  renderAllPanels();
   queuedMutation = mutation;
   saveStatus.textContent = "正在保存...";
   pumpSaveQueue();
@@ -2799,6 +2809,8 @@ function createEditableRow(block: Block) {
     });
   }
   if (todoDueDate || todoCompletedDate) {
+    todoDueDate?.addEventListener("input", () => updateTodoStatus(row));
+    todoCompletedDate?.addEventListener("input", () => updateTodoStatus(row));
     todoDueDate?.addEventListener("change", () => { updateTodoStatus(row); scheduleDocumentSave(0); });
     todoCompletedDate?.addEventListener("change", () => { updateTodoStatus(row); scheduleDocumentSave(0); });
   }
@@ -3391,6 +3403,7 @@ function handleBlockKeydown(event: KeyboardEvent) {
   shell.dataset.id = next.id;
   shell.dataset.parentId = next.parentId ?? "";
   shell.dataset.type = next.type;
+  shell.dataset.editorMode = editorMode;
   shell.dataset.columnGroup = next.properties.columnGroup ?? "";
   shell.dataset.column = next.properties.column === undefined ? "" : String(next.properties.column);
   shell.style.setProperty("--depth", String(Number(current.style.getPropertyValue("--depth")) || 0));
@@ -3832,6 +3845,7 @@ function detachReferenceAsPlainText(reference: ReferenceInstance) {
     shell.dataset.id = b.id;
     shell.dataset.parentId = b.parentId ?? "";
     shell.dataset.type = b.type;
+    shell.dataset.editorMode = editorMode;
     shell.style.setProperty("--depth", String(blockDepth(b, state!.blocks)));
     shell.append(createEditableRow(b));
     fragment.append(shell);
