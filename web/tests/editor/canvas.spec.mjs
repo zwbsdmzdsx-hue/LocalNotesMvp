@@ -81,6 +81,44 @@ test("documents can be dragged into a Canvas as resizable live previews", async 
   await expect(page.locator("#title")).toHaveValue("Beta");
 });
 
+test("Canvas block grip opens a folded node menu and persists font size", async ({ page }) => {
+  await createCanvas(page, "节点菜单画布");
+  await page.locator('[data-canvas-action="add"]').click();
+  const card = page.locator(".canvas-node-text").first();
+  await card.locator("textarea").fill("菜单内容");
+  await card.locator(".canvas-node-grip").click();
+  const menu = page.getByRole("menu", { name: /正文块操作/ });
+  await expect(menu).toBeVisible();
+  await menu.getByRole("menuitem", { name: "增大字号" }).click();
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes[0]?.fontSize)).toBe(16);
+  await expect(card.locator(".canvas-node-body")).toHaveCSS("font-size", "16px");
+  await card.locator(".canvas-node-grip").click();
+  await expect(menu).toBeVisible();
+  await menu.getByRole("menuitem", { name: "重置字号" }).click();
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes[0]?.fontSize)).toBeUndefined();
+});
+
+test("Canvas reference blocks can switch to a custom Icon from the grip menu", async ({ page }) => {
+  await createCanvas(page, "引用 Icon 画布");
+  await page.locator('[data-canvas-action="add"]').click();
+  const card = page.locator(".canvas-node-text").first();
+  const input = card.locator("textarea");
+  await input.fill("[[Bet");
+  await page.locator(".canvas-link-suggestion").filter({ hasText: "Beta" }).first().click();
+  await page.getByRole("menu", { name: "引用显示方式" }).getByRole("button", { name: "仅标题链接", exact: true }).click();
+  await input.blur();
+  await card.locator(".canvas-node-grip").click();
+  const menu = page.getByRole("menu", { name: /正文块操作/ });
+  await menu.getByRole("menuitem", { name: "显示自定义 Icon" }).click();
+  await expect(card).toHaveClass(/reference-icon-mode/);
+  await expect(card.locator(".canvas-reference-icon")).toBeVisible();
+  await card.locator(".canvas-node-grip").click();
+  page.once("dialog", dialog => dialog.accept("★"));
+  await menu.locator("button").filter({ hasText: "设置引用 Icon" }).click();
+  await expect(card.locator(".canvas-reference-icon > span")).toHaveText("★");
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes[0]?.referenceIcon)).toBe("★");
+});
+
 test("nested Canvas links support preview and icon modes without recursive cycles", async ({ page }) => {
   await createCanvas(page, "Canvas A");
   await createCanvas(page, "Canvas B");
@@ -99,4 +137,108 @@ test("nested Canvas links support preview and icon modes without recursive cycle
   await expect(page.locator(".canvas-title")).toHaveValue("Canvas A");
   await page.dragAndDrop('.doc-item:has(.list-label:text-is("Canvas B"))', ".canvas-viewport", { targetPosition: { x: 360, y: 260 } });
   await expect(page.locator(".canvas-node-canvas")).toHaveCount(0);
+});
+
+test("Canvas shares the right sidebar history and toolbar undo/redo", async ({ page }) => {
+  await createCanvas(page, "历史画布");
+  await page.locator('[data-canvas-action="add"]').click();
+  await page.locator(".canvas-node-text textarea").fill("Canvas 历史内容");
+  await page.locator('[data-pane-btn="history"]').click();
+  await expect(page.locator("#history-list")).toContainText("Canvas");
+  await expect(page.locator('[data-canvas-action="undo"]')).toBeEnabled();
+  await page.locator('[data-canvas-action="undo"]').click();
+  await expect(page.locator(".canvas-node-text")).toHaveCount(0);
+  await page.locator('[data-canvas-action="redo"]').click();
+  await expect(page.locator(".canvas-node-text textarea")).toHaveValue("Canvas 历史内容");
+});
+
+test("Canvas participates in toolbar back and forward navigation", async ({ page }) => {
+  await createCanvas(page, "导航画布");
+  await page.locator('[data-canvas-action="add"]').click();
+  await page.locator(".canvas-node-text textarea").fill("可恢复的布局");
+  await page.locator('[data-doc="alpha"]').click();
+  await expect(page.locator("#title")).toHaveValue("Alpha");
+  await page.locator("#navigate-back").click();
+  await expect(page.locator(".canvas-title")).toHaveValue("导航画布");
+  await expect(page.locator(".canvas-node-text textarea")).toHaveValue("可恢复的布局");
+  await page.locator("#navigate-forward").click();
+  await expect(page.locator("#title")).toHaveValue("Alpha");
+});
+
+test("Canvas supports hand-drawn strokes and responsive block wrapping", async ({ page }) => {
+  await createCanvas(page, "手绘画布");
+  await page.locator('[data-canvas-action="draw"]').click();
+  const viewport = await page.locator(".canvas-viewport").boundingBox();
+  await page.mouse.move(viewport.x + 360, viewport.y + 260);
+  await page.mouse.down();
+  await page.mouse.move(viewport.x + 420, viewport.y + 300, { steps: 5 });
+  await page.mouse.up();
+  await expect(page.locator(".canvas-viewport")).toHaveClass(/draw-mode/);
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.filter(node => node.kind === "draw").length)).toBe(1);
+
+  await page.locator('[data-canvas-action="add"]').click();
+  const textarea = page.locator(".canvas-node-text textarea");
+  await textarea.fill("一段很长的文字用于验证 Canvas 块会根据当前宽度自动换行显示，而不是把内容横向撑出块边界。");
+  await expect.poll(() => textarea.evaluate(element => getComputedStyle(element).overflowWrap)).toBe("anywhere");
+});
+
+test("Canvas curves snap to block edge midpoints and expose Bezier styling", async ({ page }) => {
+  await createCanvas(page, "曲线画布");
+  await page.locator('[data-canvas-action="add"]').click();
+  await page.locator('[data-canvas-action="add"]').click();
+  const blocks = page.locator(".canvas-node-text");
+  await expect(blocks).toHaveCount(2);
+  await page.locator('[data-canvas-action="curve"]').click();
+  await expect(page.locator('[data-canvas-action="curve"]')).toHaveClass(/active/);
+  await blocks.nth(0).click();
+  await expect(page.locator(".canvas-save-state")).toHaveText("请选择曲线终点");
+  await blocks.nth(1).click();
+  await expect(page.locator(".canvas-curve-style")).toBeVisible();
+  await page.locator(".canvas-curve-style select").selectOption("dashed");
+  await page.locator(".canvas-curve-style input[type=text]").fill("流程说明");
+  await expect.poll(() => page.evaluate(() => {
+    const canvas = window.mockHost.canvas(window.mockHost.current);
+    return canvas?.nodes.find(node => node.kind === "curve")?.curve?.dash;
+  })).toBe("dashed");
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "curve")?.curve?.label)).toBe("流程说明");
+  await expect(page.locator(".canvas-curve-label")).toHaveText("流程说明");
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.filter(node => node.kind === "curve").length)).toBe(1);
+  await expect(page.locator(".canvas-connections path.canvas-connection-visible")).toHaveCount(1);
+  await page.locator(".canvas-viewport").click({ position: { x: 18, y: 500 } });
+  await expect(page.locator(".canvas-curve-style")).toHaveCount(0);
+});
+
+test("Canvas document nodes show hover previews", async ({ page }) => {
+  await createCanvas(page, "文档 Icon 预览画布");
+  await page.dragAndDrop('.doc-item:has(.list-label:text-is("Beta"))', ".canvas-viewport", { targetPosition: { x: 390, y: 280 } });
+  const documentNode = page.locator(".canvas-node-document");
+  await documentNode.locator(".canvas-node-grip").click();
+  await page.getByRole("menu", { name: /Beta操作/ }).getByRole("menuitem", { name: "显示为 Icon" }).click();
+  await documentNode.hover();
+  await expect(page.locator(".canvas-icon-hover-preview")).toBeVisible();
+  await expect(page.locator(".canvas-icon-hover-preview")).toContainText("Beta");
+});
+
+test("Canvas document previews support heading section folding", async ({ page }) => {
+  await createCanvas(page, "文档标题折叠画布");
+  await page.evaluate(() => {
+    const doc = window.mockHost.docs.get("beta");
+    const block = (id, type, markdown, position, headingLevel) => ({ id, type, parentId: null, position, revision: 1, content: { text: markdown, html: markdown, markdown }, properties: headingLevel ? { headingLevel } : {} });
+    doc.blocks = [block("h1", "heading", "# 第一节", "001", 1), block("p1", "paragraph", "第一节正文", "002"), block("h2", "heading", "# 第二节", "003", 1), block("p2", "paragraph", "第二节正文", "004")];
+  });
+  await page.dragAndDrop('.doc-item:has(.list-label:text-is("Beta"))', ".canvas-viewport", { targetPosition: { x: 390, y: 280 } });
+  const preview = page.locator(".canvas-node-document");
+  await expect(preview.locator(".canvas-document-line")).toHaveCount(4);
+  await preview.locator(".canvas-heading-collapse-toggle").first().click();
+  await expect(preview.locator(".canvas-document-line").nth(1)).toBeHidden();
+  await expect(preview.locator(".canvas-document-line").nth(2)).toBeVisible();
+});
+
+test("Canvas accepts dropped media and persists a unified preview node", async ({ page }) => {
+  await createCanvas(page, "媒体画布");
+  const chooser = page.waitForEvent("filechooser");
+  await page.locator('[data-canvas-action="media"]').click();
+  await (await chooser).setFiles({ name: "pixel.png", mimeType: "image/png", buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64") });
+  await expect(page.locator(".canvas-node-media img")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "media")?.media?.name)).toBe("pixel.png");
 });

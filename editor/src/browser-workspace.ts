@@ -23,12 +23,15 @@ export function createBrowserWorkspace(store: BrowserMockHost, session: {
       case "createBookmark": store.bookmarksPush(command.bookmark); break;
       case "createDocument": store.createDocument(command.document.title, command.document.id, command.bookmarkId, command.parentId ?? null); break;
       case "createCanvas": store.createCanvas(command.canvas.title, command.canvas.id, command.bookmarkId, command.parentId ?? null); break;
+      case "createDashboard": store.createDashboard(command.dashboard.title, command.dashboard.id, command.bookmarkId, command.parentId ?? null); break;
       case "moveDocument": store.moveDocument(command.id, command.bookmarkId, command.parentId, command.index); break;
+      case "transferBlock": store.transferBlock(command.sourceDocumentId, command.targetDocumentId, command.blockId, command.mode); break;
       case "moveBookmark": store.moveBookmark(command.id, command.index); break;
       case "recolorBookmark": store.recolorBookmark(command.id, command.color); break;
       case "saveCanvas": store.saveCanvas(command.canvasId, command.nodes, command.viewport, command.mutationId, command.expectedVersion); break;
       case "undoCanvas": store.moveCanvasHistory(command.canvasId, "undo", command.expectedVersion); break;
       case "redoCanvas": store.moveCanvasHistory(command.canvasId, "redo", command.expectedVersion); break;
+      case "restoreCanvas": store.restoreCanvasHistory(command.canvasId, command.entryId, command.expectedVersion); break;
     }
   }
   return {
@@ -43,7 +46,7 @@ export function createBrowserWorkspace(store: BrowserMockHost, session: {
       const task = tail.catch(() => undefined).then(async () => {
         await session.flush();
         apply(command);
-        if (command.type === "renameDocument" || command.type === "removeDocument") await session.reloadCurrent();
+        if (command.type === "renameDocument" || command.type === "removeDocument" || command.type === "transferBlock") await session.reloadCurrent();
       });
       tail = task;
       return task;

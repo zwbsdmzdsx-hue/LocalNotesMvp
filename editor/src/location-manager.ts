@@ -47,7 +47,16 @@ export function renderLocationMap(container: HTMLElement, location: Pick<GeoLoca
   container.classList.add("location-map-canvas");
   const map = L.map(container, { zoomControl: true, attributionControl: true, dragging: true, scrollWheelZoom: interactive });
   map.setView([location.latitude, location.longitude], interactive ? 13 : 14);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "&copy; OpenStreetMap contributors", maxZoom: 19 }).addTo(map);
+  // Defer remote tile images until the document has finished loading. Edge can
+  // defer dynamic images and hold the page's `load` event while the OSM tiles
+  // are unreachable, which otherwise makes the editor appear not to start.
+  const addTiles = () => {
+    if (!map.getPane("tilePane")?.querySelector(".leaflet-tile")) {
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "&copy; OpenStreetMap contributors", maxZoom: 19 }).addTo(map);
+    }
+  };
+  if (document.readyState === "complete") addTiles();
+  else window.addEventListener("load", addTiles, { once: true });
   const marker = L.marker([location.latitude, location.longitude], {
     draggable: interactive,
     icon: L.divIcon({ className: "location-map-pin", html: "📍", iconSize: [24, 24], iconAnchor: [12, 24] })
@@ -155,7 +164,13 @@ export class LocationManager {
     const save = document.createElement("button"); save.className = "primary"; save.textContent = "保存位置"; save.onclick = () => { draft.name = draft.name.trim() || "未命名位置"; draft.notebookId = draft.scope === "notebook" ? state.notebookId : undefined; void this.saveCommand(state.locations.some(location => location.id === draft.id) ? "update-location" : "create-location", { locationId: draft.id, location: { ...draft, updatedAt: nowIso() } }); };
     actions.append(cancel, save); form.append(actions); panel.append(form);
     this.map = L.map(mapCanvas, { zoomControl: true }).setView([draft.latitude, draft.longitude], 13);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "&copy; OpenStreetMap contributors", maxZoom: 19 }).addTo(this.map);
+    const addTiles = () => {
+      if (this.map && !this.map.getPane("tilePane")?.querySelector(".leaflet-tile")) {
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "&copy; OpenStreetMap contributors", maxZoom: 19 }).addTo(this.map);
+      }
+    };
+    if (document.readyState === "complete") addTiles();
+    else window.addEventListener("load", addTiles, { once: true });
     this.marker = L.marker([draft.latitude, draft.longitude], { draggable: true, icon: L.divIcon({ className: "location-map-pin", html: "📍", iconSize: [24, 24], iconAnchor: [12, 24] }) }).addTo(this.map);
     const updateDraftPoint = (lat: number, lng: number) => { draft.latitude = lat; draft.longitude = lng; draft.source = "map"; draft.precision = "unknown"; latitude.input.value = String(draft.latitude.toFixed(6)); longitude.input.value = String(draft.longitude.toFixed(6)); this.updateMapPoint(draft); this.scheduleReverse(draft, state); };
     this.map.on("click", (event: LeafletMouseEvent) => updateDraftPoint(event.latlng.lat, event.latlng.lng));

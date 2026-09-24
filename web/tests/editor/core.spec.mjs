@@ -154,3 +154,20 @@ test("editing the source document refreshes its live block reference", async ({ 
   await expect(reference.locator(".reference-row")).toContainText("Beta 源文档刚刚修改");
   await expect(reference.locator(".reference-row")).toHaveCount(1);
 });
+
+test("heading blocks collapse their section until the next same-level heading", async ({ page }) => {
+  await page.goto("/");
+  await page.locator('#add-heading').click();
+  const heading = page.locator('#blocks > [data-own-block][data-type="heading"]').last();
+  await heading.locator('.block-text').fill('第一节');
+  await page.locator('#add-paragraph').click();
+  const body = page.locator('#blocks > [data-own-block][data-type="paragraph"]').last();
+  await body.locator('.block-text').fill('第一节正文');
+  await expect(body).toBeVisible();
+  await heading.locator('.heading-collapse-toggle').click();
+  await expect(body).toBeHidden();
+  const headingId = await heading.getAttribute('data-id');
+  await expect.poll(() => page.evaluate(id => window.mockHost.state('alpha').blocks.find(block => block.id === id)?.properties.headingCollapsed, headingId)).toBe(true);
+  await heading.locator('.heading-collapse-toggle').click();
+  await expect(body).toBeVisible();
+});

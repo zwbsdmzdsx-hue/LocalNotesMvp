@@ -1,4 +1,4 @@
-import type { WorkspaceApi, WorkspaceCommand, WorkspaceDocument } from "./workspace-api";
+import type { WorkspaceApi, WorkspaceCommand, WorkspaceDocument, CalendarTodo } from "./workspace-api";
 import type { HistoryModel } from "./history";
 import type { Block, EditorState } from "../../protocol/types";
 import { markdownFromContent, renderMarkdown } from "./markdown";
@@ -41,6 +41,7 @@ function saveLayout(layout: Layout) {
 export interface ShellCallbacks {
   onOpenDocument: (documentId: string, blockId?: string) => void;
   onOpenCanvas: (canvasId: string) => void;
+  onOpenDashboard: (dashboardId: string) => void;
   onNavigateBack: () => void;
   onNavigateForward: () => void;
   onOpenSticky: () => void;
@@ -254,6 +255,38 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       tab.onclick = () => {
         execute({ type: "selectNotebook", id: nbId });
       };
+      tab.addEventListener("dragover", event => {
+        const types = event.dataTransfer?.types ?? [];
+        if (!types.includes("text/x-document-id") && !types.includes("text/x-block-id")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        tab.classList.add("drop-target");
+        if (event.dataTransfer) event.dataTransfer.dropEffect = types.includes("text/x-block-id") ? "copy" : "move";
+      });
+      tab.addEventListener("dragleave", () => tab.classList.remove("drop-target"));
+      tab.addEventListener("drop", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        tab.classList.remove("drop-target");
+        const blockId = event.dataTransfer?.getData("text/x-block-id");
+        const sourceDocumentId = event.dataTransfer?.getData("text/x-source-document-id");
+        if (blockId && sourceDocumentId) {
+          const targetBookmark = snap.bookmarks.find(bookmark => bookmark.notebookId === nbId);
+          const target = targetBookmark && snap.documents.find(item => item.bookmarkId === targetBookmark.id);
+          if (!target || target.id === sourceDocumentId) return;
+          const choice = prompt("将此块拖入目标笔记本：输入 1 作为引用，输入 2 复制一份", "1");
+          const mode = choice === "2" ? "copy" : choice === "1" ? "reference" : null;
+          if (mode) void execute({ type: "transferBlock", sourceDocumentId, targetDocumentId: target.id, blockId, mode }).then(() => cb.onOpenDocument(target.id));
+          return;
+        }
+        const dragged = event.dataTransfer?.getData("text/x-document-id");
+        if (!dragged) return;
+        const targetBookmark = snap.bookmarks.find(bookmark => bookmark.notebookId === nbId);
+        const source = snap.documents.find(item => item.id === dragged);
+        if (!source || !targetBookmark || source.bookmarkId === targetBookmark.id) return;
+        const roots = snap.documents.filter(item => item.bookmarkId === targetBookmark.id && !item.parentId);
+        execute({ type: "moveDocument", id: dragged, bookmarkId: targetBookmark.id, parentId: null, index: roots.length });
+      });
       tab.oncontextmenu = (e) => {
         e.preventDefault();
         showContextMenu(tab, [
@@ -376,8 +409,9 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       btn.draggable = true;
       btn.style.setProperty("--doc-depth", String(depth));
       const count = descendantCount(doc.id, snap.documents);
-      btn.innerHTML = `<span class="list-icon${doc.kind === "canvas" ? " canvas-item-icon" : ""}">${doc.kind === "canvas" ? "◇" : "&#128196;"}</span><span class="list-label">${escapeHtml(doc.title)}</span>${count ? `<span class="doc-count">${count}</span>` : ""}`;
-      btn.onclick = () => doc.kind === "canvas" ? cb.onOpenCanvas(doc.id) : cb.onOpenDocument(doc.id);
+      const itemIcon = doc.kind === "canvas" ? "◇" : doc.kind === "dashboard" ? "▦" : "&#128196;";
+      btn.innerHTML = `<span class="list-icon${doc.kind === "canvas" ? " canvas-item-icon" : doc.kind === "dashboard" ? " dashboard-item-icon" : ""}">${itemIcon}</span><span class="list-label">${escapeHtml(doc.title)}</span>${count ? `<span class="doc-count">${count}</span>` : ""}`;
+      btn.onclick = () => doc.kind === "canvas" ? cb.onOpenCanvas(doc.id) : doc.kind === "dashboard" ? cb.onOpenDashboard(doc.id) : cb.onOpenDocument(doc.id);
       btn.oncontextmenu = (e) => { e.preventDefault(); showDocumentMenu(btn, doc); };
       btn.addEventListener("dragstart", event => {
         event.stopPropagation();
@@ -399,7 +433,13 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
         node.appendChild(childList);
       }
       btn.addEventListener("dragover", event => {
-        if (!event.dataTransfer?.types.includes("text/x-document-id")) return;
+        const types = event.dataTransfer?.types ?? [];
+        if (types.includes("text/x-block-id")) {
+          const source = event.dataTransfer?.getData("text/x-source-document-id");
+          if (source !== doc.id) { event.preventDefault(); event.stopPropagation(); clearDocumentDropIndicators(); node.classList.add("drop-child"); if (event.dataTransfer) event.dataTransfer.dropEffect = "copy"; }
+          return;
+        }
+        if (!types.includes("text/x-document-id")) return;
         event.preventDefault();
         event.stopPropagation();
         clearDocumentDropIndicators();
@@ -421,6 +461,14 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       });
       btn.addEventListener("drop", event => {
         event.preventDefault(); event.stopPropagation(); clearDocumentDropIndicators();
+        const blockId = event.dataTransfer?.getData("text/x-block-id");
+        const sourceDocumentId = event.dataTransfer?.getData("text/x-source-document-id");
+        if (blockId && sourceDocumentId && sourceDocumentId !== doc.id) {
+          const choice = prompt("将此块拖入文档：输入 1 作为引用，输入 2 复制一份", "1");
+          const mode = choice === "2" ? "copy" : choice === "1" ? "reference" : null;
+          if (mode) void execute({ type: "transferBlock", sourceDocumentId, targetDocumentId: doc.id, blockId, mode }).then(() => cb.onOpenDocument(doc.id));
+          return;
+        }
         const dragged = event.dataTransfer?.getData("text/x-document-id");
         if (!dragged || dragged === doc.id) return;
         const rect = btn.getBoundingClientRect();
@@ -517,7 +565,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       return [{ block: b, level: match[1].length, text: match[2].trim() || b.content.text.trim() || "未命名" }];
     });
     if (headings.length === 0) {
-      list.innerHTML = `<div class="empty">没有可显示的标题</div>`;
+      list.innerHTML = `<div class="outline-empty-state">没有可显示的标题</div>`;
       return;
     }
     for (const h of headings) {
@@ -693,6 +741,21 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
   }
 
+  function todayCalendarDate() {
+    const current = new Date();
+    return formatCalendarDate(current.getFullYear(), current.getMonth() + 1, current.getDate());
+  }
+
+  function calendarTodoStatus(todo: CalendarTodo): "pending" | "overdue" | "complete" {
+    if (todo.checked) return "complete";
+    return todo.dueAt && todayCalendarDate() > todo.dueAt ? "overdue" : "pending";
+  }
+
+  function calendarTodoStatusLabel(todo: CalendarTodo) {
+    const status = calendarTodoStatus(todo);
+    return status === "complete" ? "已完成" : status === "overdue" ? "已逾期" : "待完成";
+  }
+
   async function loadCalendarPreview(date = calendarDate) {
     const token = ++calendarLoadToken;
     const [yearText, monthText] = date.split("-");
@@ -813,8 +876,13 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       });
     }
     const todoDates = workspace.todoDates();
-    const createdTodoDates = new Set(todoDates.map(item => item.createdAt).filter((value): value is string => !!value));
-    const dueTodoDates = new Set(todoDates.map(item => item.dueAt).filter((value): value is string => !!value));
+    const dueTodosByDate = new Map<string, CalendarTodo[]>();
+    todoDates.forEach(todo => {
+      if (!todo.dueAt) return;
+      const list = dueTodosByDate.get(todo.dueAt) ?? [];
+      list.push(todo);
+      dueTodosByDate.set(todo.dueAt, list);
+    });
     for (let index = 0; index < 42; index++) {
       const day = index - offset + 1; const cell = document.createElement("button"); cell.className = "calendar-day";
       if (day < 1 || day > count) { cell.disabled = true; grid.append(cell); continue; }
@@ -823,10 +891,12 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       const dots = document.createElement("span"); dots.className = "calendar-dots";
       const appendDot = (className: string, title: string) => { const dot = document.createElement("span"); dot.className = `calendar-dot ${className}`; dot.title = title; dots.append(dot); };
       if (diaryDates.has(date)) appendDot("calendar-dot-diary", "有日记");
-      if (createdTodoDates.has(date)) appendDot("calendar-dot-created", "有待办创建于此日");
-      if (dueTodoDates.has(date)) appendDot("calendar-dot-due", "有待办目标完成于此日");
+      for (const todo of dueTodosByDate.get(date) ?? []) {
+        const status = calendarTodoStatus(todo);
+        appendDot(status === "complete" ? "calendar-dot-todo-complete" : status === "overdue" ? "calendar-dot-todo-overdue" : "calendar-dot-todo-pending", `${calendarTodoStatusLabel(todo)}：${todo.text}`);
+      }
       if (dots.childElementCount) cell.append(dots);
-      if (diaryDates.has(date) || createdTodoDates.has(date) || dueTodoDates.has(date)) cell.classList.add("has-calendar-activity");
+      if (diaryDates.has(date) || dueTodosByDate.has(date)) cell.classList.add("has-calendar-activity");
       if (date === calendarDate) cell.classList.add("selected");
       if (diaryDates.has(date)) cell.classList.add("has-diary");
       cell.onclick = () => { calendarDate = date; renderCalendar(); void loadCalendarPreview(date); };
@@ -846,10 +916,11 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       cb.onInsertDiaryLink(calendarPreview.documentId, selected.id, heading?.level === 1 ? "heading" : "block", heading?.title || selected.content.text || calendarDate);
     };
     previewTitle.append(previewLabel, link); preview.append(previewTitle);
+    const selectedTodos = todoDates.filter(todo => todo.dueAt === calendarDate || todo.completedAt === calendarDate);
     if (calendarLoading) {
       const loading = document.createElement("p"); loading.className = "calendar-empty"; loading.textContent = "正在加载日记..."; preview.append(loading);
     } else if (!calendarPreview) {
-      const empty = document.createElement("p"); empty.className = "calendar-empty"; empty.textContent = hasMonth ? "选择有内容的日期查看日记" : "这一天还没有日记"; preview.append(empty);
+      const empty = document.createElement("p"); empty.className = "calendar-empty"; empty.textContent = hasMonth ? "这一天没有日记内容" : "这一天还没有日记"; preview.append(empty);
     } else if (!calendarPreview.blockIds.length) {
       const empty = document.createElement("p"); empty.className = "calendar-empty"; empty.textContent = "月份文档中没有这一天的 H1 标题"; preview.append(empty);
     } else {
@@ -860,6 +931,25 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
         button.append(content); button.onclick = () => { calendarPreview = { ...calendarPreview!, selectedBlockId: block.id }; renderCalendar(); };
         preview.append(button);
       });
+    }
+    if (selectedTodos.length) {
+      const todoSection = document.createElement("section"); todoSection.className = "calendar-todo-preview";
+      const todoTitle = document.createElement("div"); todoTitle.className = "calendar-todo-preview-head"; todoTitle.textContent = "待办"; todoSection.append(todoTitle);
+      selectedTodos.forEach(todo => {
+        const status = calendarTodoStatus(todo);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `calendar-todo-entry todo-${status}`;
+        button.dataset.documentId = todo.documentId;
+        button.dataset.blockId = todo.blockId;
+        const title = document.createElement("strong"); title.textContent = `${status === "complete" ? "✓" : status === "overdue" ? "!" : "○"} ${todo.text || "未命名待办"}`;
+        const dates = [todo.createdAt ? `创建 ${todo.createdAt}` : "", todo.dueAt ? `应完成 ${todo.dueAt}` : "", todo.completedAt ? `完成 ${todo.completedAt}` : ""].filter(Boolean).join(" · ");
+        const meta = document.createElement("small"); meta.textContent = `${calendarTodoStatusLabel(todo)}${dates ? ` · ${dates}` : ""}`;
+        button.append(title, meta);
+        button.onclick = () => { void cb.onOpenDocument(todo.documentId, todo.blockId); };
+        todoSection.append(button);
+      });
+      preview.append(todoSection);
     }
     panel.append(preview);
   }
@@ -1114,13 +1204,21 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     void execute({ type: "createCanvas", canvas: { id, title: title.trim() }, bookmarkId, parentId: null })
       .then(() => cb.onOpenCanvas(id));
   }
+  function createDashboard(bookmarkId: string) {
+    const title = prompt("Dashboard 名称：", "工作台 Dashboard");
+    if (!title || !title.trim()) return;
+    const id = "dashboard-" + uid();
+    void execute({ type: "createDashboard", dashboard: { id, title: title.trim() }, bookmarkId, parentId: null })
+      .then(() => cb.onOpenDashboard(id));
+  }
   function showWorkspaceCreateMenu(anchor: HTMLElement, bookmarkId: string) {
     document.querySelector(".workspace-create-menu")?.remove();
     const menu = document.createElement("div");
     menu.className = "workspace-create-menu";
     const options = [
       { icon: "▤", label: "新建文档", run: () => createDocument(bookmarkId) },
-      { icon: "◇", label: "新建 Canvas", run: () => createCanvas(bookmarkId) }
+      { icon: "◇", label: "新建 Canvas", run: () => createCanvas(bookmarkId) },
+      { icon: "▦", label: "新建 Dashboard", run: () => createDashboard(bookmarkId) }
     ];
     options.forEach(option => {
       const button = document.createElement("button");

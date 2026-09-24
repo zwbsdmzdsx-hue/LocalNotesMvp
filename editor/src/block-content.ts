@@ -40,9 +40,10 @@ export function editableContent(editable: HTMLElement, fallback: BlockContent = 
   const text = textOnly.textContent ?? "";
   const links: LinkToken[] = [];
   clean.querySelectorAll<HTMLElement>(".wiki-link").forEach((link) => {
-    const targetText = link.textContent ?? "";
-    const start = text.indexOf(targetText);
-    links.push({ targetDocumentId: link.dataset.targetId, targetBlockId: link.dataset.targetBlockId, targetScope: link.dataset.targetScope as "block" | "heading" | undefined, targetText, start: Math.max(0, start), end: Math.max(0, start) + targetText.length });
+    const label = link.textContent ?? "";
+    const targetText = link.dataset.targetTitle ?? label;
+    const start = text.indexOf(label);
+    links.push({ targetDocumentId: link.dataset.targetId, targetBlockId: link.dataset.targetBlockId, targetScope: link.dataset.targetScope as "block" | "heading" | undefined, targetText, start: Math.max(0, start), end: Math.max(0, start) + label.length });
   });
   return { ...fallback, text, html: sanitizeHtml(clean.innerHTML), links };
 }

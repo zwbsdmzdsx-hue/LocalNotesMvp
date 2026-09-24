@@ -1,12 +1,29 @@
+import { headingSection } from "./link-suggestions";
 import { EditorHistory } from "./history";
 import { orderBlockTree } from "./block-tree";
+import { normalizeCanvasNodes } from "./workspace-api";
 import type { Notebook, Bookmark, WorkspaceDocument, WorkspaceSnapshot, SearchHit, CalendarTodo, CanvasDocument, CanvasNode, CanvasViewport, WorkspaceItemKind } from "./workspace-api";
 import type { HostTransport } from "./editor-host-api";
 import { MockSaveStore } from "./mock-save-store";
-import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, StyleScope, MediaKind, DatabaseSource, DatabaseField, DatabaseRecord, GeoLocation } from "../../protocol/types";
+import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, StyleScope, MediaKind, DatabaseSource, DatabaseField, DatabaseRecord, GeoLocation, HistoryModel } from "../../protocol/types";
 import { parseDql, executeDql } from "./database-query";
 
 const block = (blockId: string, text: string) => ({ id: blockId, parentId: null, position: "00001000", type: "paragraph" as const, content: { text, html: text }, properties: {}, revision: 1 });
+
+function demoBlock(id: string, type: BlockType, markdown: string, position: string, properties: BlockProperties = {}, checked = false): Block {
+  const text = markdown.replace(/^\s*#{1,6}\s+/, "").replace(/^\s*[-*+]\s+\[[ xX]\]\s*/, "").replace(/[*_`]/g, "");
+  return {
+    id,
+    parentId: null,
+    position,
+    type,
+    content: { text, html: "", markdown, checked: type === "todo" ? checked : undefined },
+    properties,
+    revision: 1
+  };
+}
+
+const demoImageUrl = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='360' viewBox='0 0 640 360'%3E%3Crect width='640' height='360' fill='%23eef4ff'/%3E%3Cpath d='M0 285 150 145 240 220 375 75 640 285V360H0Z' fill='%2398b9ff'/%3E%3Ccircle cx='505' cy='92' r='38' fill='%23f7c873'/%3E%3Ctext x='32' y='48' font-family='sans-serif' font-size='24' fill='%23172b4d'%3ELocalNotes demo%3C/text%3E%3C/svg%3E";
 
 export class BrowserMockHost implements HostTransport {
   private listeners = new Set<(message: HostResponse | HostEvent) => void>();
@@ -25,9 +42,27 @@ export class BrowserMockHost implements HostTransport {
   private locationVersion = 0;
   private locationMutations = new Set<string>();
   private itemKinds = new Map<string, WorkspaceItemKind>();
-  private canvases = new Map<string, Omit<CanvasDocument, "canUndo" | "canRedo">>();
+  private canvases = new Map<string, Omit<CanvasDocument, "canUndo" | "canRedo" | "references">>();
   private canvasMutations = new Set<string>();
-  private canvasHistories = new Map<string, { entries: Array<{ nodes: CanvasNode[]; viewport: CanvasViewport }>; cursor: number }>();
+  private canvasHistories = new Map<string, { entries: Array<{ id: string; timestamp: number; label: string; title: string; nodes: CanvasNode[]; viewport: CanvasViewport; references: EditorState["references"] }>; cursor: number }>();
+  private canvasHistoryModel(id: string): HistoryModel {
+    const history = this.canvasHistories.get(id);
+    if (!history) return { documentId: id, entries: [], currentId: "", canUndo: false, canRedo: false };
+    return {
+      documentId: id,
+      entries: history.entries.map((entry, index) => ({
+        id: entry.id,
+        timestamp: entry.timestamp,
+        label: entry.label,
+        kind: "canvas",
+        title: entry.title,
+        preview: `${entry.nodes.length} 个画布元素${index === history.cursor ? " · 当前" : ""}`
+      })),
+      currentId: history.entries[history.cursor]?.id ?? "",
+      canUndo: history.cursor > 0,
+      canRedo: history.cursor < history.entries.length - 1
+    };
+  }
   private historySnapshot(id: string) {
     const state = structuredClone(this.docs.get(id)!);
     const workspaceId = state.note.workspaceId;
@@ -64,7 +99,7 @@ export class BrowserMockHost implements HostTransport {
   documentByBookmark = new Map<string, string[]>([
     ["bk-inbox",    ["alpha", "beta"]],
     ["bk-daily",    ["gamma", "delta"]],
-    ["bk-projects", ["epsilon"]],
+    ["bk-projects", ["epsilon", "showcase"]],
     ["bk-sources",  ["zeta"]],
     ["bk-notes",    ["eta"]],
     ["bk-life",     ["theta"]],
@@ -79,25 +114,26 @@ export class BrowserMockHost implements HostTransport {
   private parentByDocument = new Map<string, string | null>();
   titleByDocument = new Map<string, string>([
     ["alpha", "Alpha"], ["beta", "Beta"], ["gamma", "Gamma"], ["delta", "Delta"],
-    ["epsilon", "Epsilon"], ["zeta", "Zeta"], ["eta", "Eta"], ["theta", "Theta"]
+    ["epsilon", "Epsilon"], ["showcase", "演示中心"], ["zeta", "Zeta"], ["eta", "Eta"], ["theta", "Theta"]
   ]);
   constructor() {
     const all: Array<{ id: string; title: string; blocks: Array<{ id: string; text: string }> }> = [
-      { id: "alpha",   title: "Alpha",   blocks: [{ id: "a1", text: "浏览器编辑器核心" }] },
-      { id: "beta",    title: "Beta",    blocks: [{ id: "b1", text: "Beta 的内容" }, { id: "b2", text: "Beta 文档中的其他块" }] },
-      { id: "gamma",   title: "Gamma",   blocks: [{ id: "g1", text: "Gamma 日记" }, { id: "g2", text: "今日复盘" }] },
-      { id: "delta",   title: "Delta",   blocks: [{ id: "d1", text: "Delta 灵感收集" }] },
-      { id: "epsilon", title: "Epsilon", blocks: [{ id: "e1", text: "Epsilon 项目计划" }] },
-      { id: "zeta",    title: "Zeta",    blocks: [{ id: "z1", text: "Zeta 参考资料" }] },
-      { id: "eta",     title: "Eta",     blocks: [{ id: "h1", text: "Eta 研究笔记" }] },
-      { id: "theta",   title: "Theta",   blocks: [{ id: "t1", text: "Theta 日常" }] }
+      { id: "alpha",   title: "Alpha",   blocks: [{ id: "a1", text: "工作台总览" }] },
+      { id: "beta",    title: "Beta",    blocks: [{ id: "b1", text: "产品研究" }, { id: "b2", text: "用户访谈摘要" }] },
+      { id: "gamma",   title: "Gamma",   blocks: [{ id: "g1", text: "2026-09-24 日记" }, { id: "g2", text: "今日复盘" }] },
+      { id: "delta",   title: "Delta",   blocks: [{ id: "d1", text: "灵感收集" }] },
+      { id: "epsilon", title: "Epsilon", blocks: [{ id: "e1", text: "产品发布计划" }] },
+      { id: "showcase", title: "演示中心", blocks: [{ id: "s1", text: "LocalNotes 能力演示" }] },
+      { id: "zeta",    title: "Zeta",    blocks: [{ id: "z1", text: "参考资料" }] },
+      { id: "eta",     title: "Eta",     blocks: [{ id: "h1", text: "研究笔记" }] },
+      { id: "theta",   title: "Theta",   blocks: [{ id: "t1", text: "日常记录" }] }
     ];
     for (const d of all) {
       this.itemKinds.set(d.id, "document");
       this.parentByDocument.set(d.id, null);
        const state: EditorState = {
         note: { id: d.id, title: d.title, isSticky: false, clientVersion: 0, workspaceId: d.id === "zeta" || d.id === "eta" ? "nb-research" : d.id === "theta" ? "nb-life" : "nb-default" },
-        blocks: d.blocks.map(b => block(b.id, b.text)),
+        blocks: d.blocks.map((b, index) => demoBlock(b.id, "paragraph", b.text, String((index + 1) * 1000).padStart(8, "0"))),
         documents: [],
         backlinks: [],
         overrideNotices: [],
@@ -128,7 +164,139 @@ export class BrowserMockHost implements HostTransport {
       id: "loc-default-office", scope: "notebook", notebookId: "nb-default", name: "默认办公点", address: "默认笔记本示例位置",
       latitude: 23.1291, longitude: 113.2644, source: "map", precision: "unknown", createdAt: now, updatedAt: now
     });
+    this.seedDemoDocuments();
     this.saves = new MockSaveStore(this.docs);
+  }
+
+  /** Replace the tiny smoke-test fixtures with a usable showcase workspace.
+   * IDs remain stable because links and contract tests use them as anchors. */
+  private seedDemoDocuments() {
+    const setBlocks = (documentId: string, blocks: Block[]) => {
+      const document = this.docs.get(documentId);
+      if (!document) return;
+      document.blocks = blocks;
+    };
+    const heading = (id: string, level: 1 | 2 | 3, title: string, position: string, collapsed = false) =>
+      demoBlock(id, "heading", `${"#".repeat(level)} ${title}`, position, { headingLevel: level, headingCollapsed: collapsed });
+    const paragraph = (id: string, markdown: string, position: string, properties: BlockProperties = {}) =>
+      demoBlock(id, "paragraph", markdown, position, properties);
+    const todo = (id: string, markdown: string, position: string, createdAt: string, dueAt: string, checked = false, completedAt?: string) =>
+      demoBlock(id, "todo", markdown, position, { todoCreatedAt: createdAt, todoDueAt: dueAt, todoCompletedAt: completedAt }, checked);
+
+    const roadmapDatabaseId = "db-demo-roadmap";
+    const roadmapFields: DatabaseField[] = [
+      { id: "demo-field-name", databaseId: roadmapDatabaseId, key: "name", title: "事项", type: "text", position: "00001000" },
+      { id: "demo-field-status", databaseId: roadmapDatabaseId, key: "status", title: "状态", type: "text", position: "00002000" },
+      { id: "demo-field-effort", databaseId: roadmapDatabaseId, key: "effort", title: "工时", type: "number", position: "00003000" },
+      { id: "demo-field-score", databaseId: roadmapDatabaseId, key: "score", title: "优先级分", type: "formula", formula: 'prop("effort") * 2', position: "00004000" },
+      { id: "demo-field-url", databaseId: roadmapDatabaseId, key: "url", title: "资料链接", type: "url", position: "00005000" }
+    ];
+    this.databases.set(roadmapDatabaseId, {
+      source: { id: roadmapDatabaseId, title: "发布路线图", notebookId: "nb-default", fields: roadmapFields, recordCount: 3 },
+      records: [
+        { id: "demo-record-1", databaseId: roadmapDatabaseId, position: "00001000", sourceDocumentId: "showcase", values: { name: "引用体验", status: "进行中", effort: 3, url: "https://example.com/references" } },
+        { id: "demo-record-2", databaseId: roadmapDatabaseId, position: "00002000", sourceDocumentId: "epsilon", values: { name: "Canvas 白板", status: "规划中", effort: 5, url: "https://example.com/canvas" } },
+        { id: "demo-record-3", databaseId: roadmapDatabaseId, position: "00003000", sourceDocumentId: "beta", values: { name: "智能表格", status: "已完成", effort: 2, url: "https://example.com/database" } }
+      ]
+    });
+
+    setBlocks("alpha", [
+      // Keep Alpha as the minimal long-lived editing anchor. Rich examples
+      // are grouped in 演示中心 so ordinary editor workflows stay stable.
+      { ...block("a1", "浏览器编辑器核心"), position: "00001000" },
+      { ...block("ar1", ""), position: "00002000", type: "reference" }
+    ]);
+
+    const showcase = this.docs.get("showcase")!;
+    const showcaseComments = [{ id: "demo-comment-1", content: "这里演示块级注释与历史记录。", createdAt: "2026-09-20T09:00:00.000Z", updatedAt: "2026-09-20T09:00:00.000Z", history: [{ id: "demo-comment-history-1", action: "created" as const, content: "这里演示块级注释与历史记录。", timestamp: "2026-09-20T09:00:00.000Z" }] }];
+    setBlocks("showcase", [
+      heading("s1", 1, "LocalNotes 能力演示", "00001000"),
+      paragraph("s2", "这是一个可编辑的项目首页：[[默认笔记本/Beta#^b1]] 记录研究结论，[[默认笔记本/Epsilon#^e1]] 负责发布计划。", "00002000", { comments: showcaseComments }),
+      heading("s3", 2, "本周重点", "00003000"),
+      todo("s4", "完成实时引用的交互验收", "00004000", "2026-09-20", "2026-09-27"),
+      todo("s5", "整理数据库字段与 DQL 示例", "00005000", "2026-09-19", "2026-09-25", true, "2026-09-24"),
+      demoBlock("s6", "database_table", "", "00006000", { databaseId: roadmapDatabaseId, databaseSource: "database" }),
+      demoBlock("s7", "location", "", "00007000", { locationId: "loc-default-office" }),
+      { id: "s8", parentId: null, position: "00008000", type: "media", content: { text: "", html: "", caption: "项目首页视觉卡片", media: { id: "demo-asset-cover", kind: "image", name: "项目首页视觉卡片.svg", mimeType: "image/svg+xml", size: demoImageUrl.length, url: demoImageUrl } }, properties: {}, revision: 1 },
+      heading("s9", 2, "访谈洞察", "00009000"),
+      paragraph("s10", "用户反复提到：信息应该能够被引用、预览，并在原文更新时同步。", "00010000"),
+      todo("s11", "把三条洞察转成产品假设", "00011000", "2026-09-18", "2026-09-26")
+    ]);
+
+    setBlocks("beta", [
+      { ...block("b1", "Beta 的内容"), position: "00001000" },
+      { ...block("b2", "Beta 文档中的其他块"), position: "00002000" }
+    ]);
+    setBlocks("gamma", [
+      heading("g0", 1, "2026-09-24", "00001000"),
+      paragraph("g1", "Gamma 日记", "00002000"),
+      paragraph("g2", "今日复盘：把零散的灵感整理成可追踪的行动。", "00003000"),
+      heading("g3", 2, "明日计划", "00004000"),
+      todo("g4", "完成一小时深度阅读", "00005000", "2026-09-24", "2026-09-25")
+    ]);
+    setBlocks("delta", [
+      heading("d0", 1, "灵感收集", "00001000"),
+      paragraph("d1", "Delta 灵感收集", "00002000"),
+      paragraph("d2", "> 一个好工具应该让内容之间自然发生关系。\n\n- 先记录\n- 再连接\n- 最后回看", "00003000")
+    ]);
+    setBlocks("epsilon", [
+      heading("e0", 1, "产品发布计划", "00001000"),
+      paragraph("e1", "Epsilon 项目计划", "00002000"),
+      heading("e2", 2, "里程碑", "00003000"),
+      paragraph("e3", "第一阶段：编辑器基础；第二阶段：引用与数据库；第三阶段：Canvas 工作流。", "00004000"),
+      todo("e4", "发布体验验收", "00005000", "2026-09-15", "2026-10-01")
+    ]);
+    const zetaHeading = this.docs.get("zeta")!.blocks.find(block => block.id === "z2") ?? demoBlock("z2", "paragraph", "# 目标标题", "00003000");
+    setBlocks("zeta", [
+      heading("z0", 1, "参考资料", "00001000"),
+      paragraph("z1", "Zeta 参考资料", "00002000"),
+      { ...zetaHeading, position: "00003000" },
+      heading("z3", 2, "阅读摘录", "00004000"),
+      paragraph("z4", "<style>.reference-note { color: #175cd3; }</style>\n\n**可搜索正文** 与网页链接字段都可以被查询。", "00005000")
+    ]);
+    setBlocks("eta", [
+      heading("eta0", 1, "研究笔记", "00001000"),
+      paragraph("h1", "Eta 研究笔记", "00002000"),
+      paragraph("h2", "将来源文档、块引用和 DQL 查询放在同一条工作流里。", "00003000"),
+      todo("h3", "补充研究结论", "00004000", "2026-09-21", "2026-09-30")
+    ]);
+    setBlocks("theta", [
+      heading("t0", 1, "日常记录", "00001000"),
+      paragraph("t1", "Theta 日常", "00002000"),
+      paragraph("t2", "今天适合把日历、待办和位置记录串起来。", "00003000")
+    ]);
+    showcase.documentStyles = [{ id: "demo-showcase-style", title: "首页提示", description: "给项目首页的提示段落加一条蓝色边线。", css: ".demo-callout { border-left: 3px solid #175cd3; padding-left: 12px; color: #344054; }", enabled: true, position: "00001000", scope: "document" }];
+    showcase.notebookStyles = [{ id: "demo-notebook-style", title: "演示笔记本强调色", description: "为演示笔记本提供克制的链接颜色。", css: ".wiki-link { text-decoration-thickness: 1px; }", enabled: true, position: "00001000", scope: "notebook" }];
+
+    const now = new Date().toISOString();
+    this.locations.set("loc-demo-studio", { id: "loc-demo-studio", scope: "notebook", notebookId: "nb-research", name: "演示工作室", address: "广东省广州市越秀区示例路 18 号", latitude: 23.1295, longitude: 113.2648, source: "map", precision: "street", createdAt: now, updatedAt: now });
+
+    const makeCanvas = (id: string, title: string, bookmarkId: string, nodes: CanvasNode[]) => {
+      this.createCanvas(title, id, bookmarkId);
+      const canvas = this.canvases.get(id)!;
+      canvas.nodes = nodes;
+      const document = this.docs.get(id)!;
+      document.blocks = nodes.flatMap(node => node.block ? [node.block] : []);
+      this.recordCanvasHistory(id);
+    };
+    const roadmapBlock = demoBlock("canvas-roadmap-note", "paragraph", "把研究结论、发布计划和实时引用放在一起。", "00001000");
+    const roadmapHeading = demoBlock("canvas-roadmap-heading", "heading", "# 项目路线图", "00002000", { headingLevel: 1 });
+    makeCanvas("canvas-roadmap", "项目路线图", "bk-projects", [
+      { id: roadmapHeading.id, kind: "block", x: 120, y: 90, width: 300, height: 150, zIndex: 2, block: roadmapHeading },
+      { id: roadmapBlock.id, kind: "block", x: 150, y: 310, width: 320, height: 170, zIndex: 3, block: roadmapBlock },
+      { id: "canvas-roadmap-beta", kind: "document", x: 560, y: 100, width: 340, height: 260, zIndex: 2, targetId: "beta", displayMode: "preview" },
+      { id: "canvas-roadmap-epsilon", kind: "document", x: 980, y: 100, width: 112, height: 112, zIndex: 3, targetId: "epsilon", displayMode: "icon" },
+      { id: "canvas-roadmap-cover", kind: "media", x: 560, y: 430, width: 360, height: 230, zIndex: 2, caption: "路线图视觉卡片", media: { id: "demo-asset-canvas", kind: "image", name: "路线图视觉卡片.svg", mimeType: "image/svg+xml", size: demoImageUrl.length, url: demoImageUrl } },
+      { id: "canvas-roadmap-curve", kind: "curve", x: 0, y: 0, width: 1, height: 1, zIndex: 1, curve: { start: { nodeId: roadmapHeading.id, side: "right" }, end: { nodeId: "canvas-roadmap-beta", side: "left" }, control1: { x: 500, y: 150 }, control2: { x: 500, y: 250 }, color: "#175cd3", width: 2, dash: "dashed", label: "研究 → 交付" } }
+    ]);
+    const researchHeading = demoBlock("canvas-research-heading", "heading", "# 研究白板", "00001000", { headingLevel: 1 });
+    makeCanvas("canvas-research", "研究白板", "bk-sources", [
+      { id: researchHeading.id, kind: "block", x: 120, y: 120, width: 300, height: 150, zIndex: 2, block: researchHeading },
+      { id: "canvas-research-zeta", kind: "document", x: 520, y: 100, width: 112, height: 112, zIndex: 2, targetId: "zeta", displayMode: "icon" },
+      { id: "canvas-research-eta", kind: "document", x: 760, y: 100, width: 320, height: 220, zIndex: 2, targetId: "eta", displayMode: "preview" },
+      { id: "canvas-research-roadmap", kind: "canvas", x: 520, y: 390, width: 112, height: 112, zIndex: 2, targetId: "canvas-roadmap", displayMode: "icon" },
+      { id: "canvas-research-curve", kind: "curve", x: 0, y: 0, width: 1, height: 1, zIndex: 1, curve: { start: { nodeId: researchHeading.id, side: "right" }, end: { nodeId: "canvas-research-zeta", side: "left" }, control1: { x: 470, y: 170 }, control2: { x: 470, y: 170 }, color: "#ea580c", width: 3, dash: "solid", label: "来源" } }
+    ]);
   }
   private allDocuments() {
     return [...this.titleByDocument.entries()].filter(([id]) => this.itemKinds.get(id) !== "canvas").map(([id, title]) => ({ id, title }));
@@ -268,7 +436,7 @@ export class BrowserMockHost implements HostTransport {
   renameDocument(id: string, title: string) {
     this.setDocumentTitle(id, title);
     const canvas = this.canvases.get(id);
-    if (canvas) canvas.title = title;
+    if (canvas) { canvas.title = title; this.recordCanvasHistory(id); }
   }
   removeDocument(id: string) {
     const oldParent = this.parentByDocument.get(id) ?? null;
@@ -335,22 +503,44 @@ export class BrowserMockHost implements HostTransport {
 
   createCanvas(title: string, requestedId: string, bookmarkId = this.activeBookmarkId, parentId: string | null = null) {
     if (this.titleByDocument.has(requestedId)) throw new Error("工作区项目 ID 已存在");
+    this.createDocument(title, requestedId, bookmarkId, parentId);
     const canvas = { id: requestedId, title, nodes: [] as CanvasNode[], viewport: { x: 0, y: 0, zoom: 1 }, version: 0 };
     this.itemKinds.set(requestedId, "canvas");
     this.titleByDocument.set(requestedId, title);
     this.canvases.set(requestedId, canvas);
-    this.canvasHistories.set(requestedId, { entries: [{ nodes: [], viewport: structuredClone(canvas.viewport) }], cursor: 0 });
+    this.canvasHistories.set(requestedId, { entries: [{ id: `canvas-history-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`, timestamp: Date.now(), label: "创建 Canvas", title, nodes: [], viewport: structuredClone(canvas.viewport), references: [] }], cursor: 0 });
     this.parentByDocument.set(requestedId, parentId);
     const list = this.documentByBookmark.get(bookmarkId) ?? [];
-    list.push(requestedId);
+    if (!list.includes(requestedId)) list.push(requestedId);
     this.documentByBookmark.set(bookmarkId, list);
   }
 
+  createDashboard(title: string, requestedId: string, bookmarkId = this.activeBookmarkId, parentId: string | null = null) {
+    if (this.titleByDocument.has(requestedId)) throw new Error("工作区项目 ID 已存在");
+    this.createDocument(title, requestedId, bookmarkId, parentId);
+    this.itemKinds.set(requestedId, "dashboard");
+    const state = this.docs.get(requestedId)!;
+    const widget = (id: string, kind: string, titleText: string, x: number, y: number, width = 320, height = 220): Block => ({
+      id, parentId: null, position: String((state.blocks.length + 1) * 1000).padStart(8, "0"), type: "dashboard_widget",
+      content: { text: "", html: "" }, properties: { dashboardWidget: { kind, title: titleText, scope: "activeDocument", layout: { x, y, width, height } } }, revision: 1
+    });
+    state.blocks = [
+      widget(`${requestedId}-widget-references`, "references", "实时引用", 32, 32),
+      widget(`${requestedId}-widget-backlinks`, "backlinks", "反向链接", 376, 32),
+      widget(`${requestedId}-widget-calendar`, "calendar", "日历", 32, 276, 320, 190)
+    ];
+  }
+
   canvas(id: string): CanvasDocument | undefined {
+    this.refreshReferenceSnapshots();
     const canvas = this.canvases.get(id);
     const history = this.canvasHistories.get(id);
     if (!canvas || !history) return undefined;
-    return structuredClone({ ...canvas, canUndo: history.cursor > 0, canRedo: history.cursor < history.entries.length - 1 });
+    const normalized = normalizeCanvasNodes(canvas.nodes);
+    // Migrate legacy `text/content` nodes as they cross the workspace API.
+    // The returned object is detached, so this does not mutate the host until
+    // the next acknowledged save.
+    return structuredClone({ ...canvas, nodes: normalized, references: this.docs.get(id)?.references ?? [], canUndo: history.cursor > 0, canRedo: history.cursor < history.entries.length - 1, history: this.canvasHistoryModel(id) });
   }
 
   canLinkCanvas(sourceCanvasId: string, targetCanvasId: string, proposedNodes?: CanvasNode[]) {
@@ -363,7 +553,7 @@ export class BrowserMockHost implements HostTransport {
       if (visited.has(current)) continue;
       visited.add(current);
       const nodes = current === sourceCanvasId && proposedNodes ? proposedNodes : this.canvases.get(current)?.nodes ?? [];
-      for (const node of nodes) if (node.kind === "canvas" && node.targetId) pending.push(node.targetId);
+      for (const node of normalizeCanvasNodes(nodes)) if (node.kind === "canvas" && node.targetId) pending.push(node.targetId);
     }
     return true;
   }
@@ -371,26 +561,51 @@ export class BrowserMockHost implements HostTransport {
   saveCanvas(canvasId: string, nodes: CanvasNode[], viewport: CanvasViewport, mutationId: string, expectedVersion: number) {
     const canvas = this.canvases.get(canvasId);
     if (!canvas) throw new Error("Canvas 不存在");
+    if (this.failNextSave) { this.failNextSave = false; throw new Error("Mock 保存失败"); }
     const mutationKey = `${canvasId}:${mutationId}`;
     if (this.canvasMutations.has(mutationKey)) return;
     if (expectedVersion !== canvas.version) throw new Error("Canvas 已更新，请重新载入后再保存");
+    const canonicalNodes = normalizeCanvasNodes(nodes);
     const ids = new Set<string>();
-    for (const node of nodes) {
+    for (const node of canonicalNodes) {
       if (!node.id || ids.has(node.id)) throw new Error("Canvas 节点 ID 重复");
       ids.add(node.id);
       if (![node.x, node.y, node.width, node.height, node.zIndex].every(Number.isFinite)) throw new Error("Canvas 节点位置无效");
       if (node.width < 80 || node.height < 64) throw new Error("Canvas 节点尺寸无效");
-      if (node.kind !== "text" && (!node.targetId || !this.titleByDocument.has(node.targetId))) throw new Error("Canvas 引用目标不存在");
+      if (node.kind === "block" && (!node.block || node.block.id !== node.id)) throw new Error("Canvas 正文块无效");
+      if ((node.kind === "document" || node.kind === "canvas") && (!node.targetId || !this.titleByDocument.has(node.targetId))) throw new Error("Canvas 引用目标不存在");
+      if (node.kind === "draw" && (!node.strokes?.length || node.strokes.some(stroke => stroke.points.length < 2))) throw new Error("Canvas 手绘内容无效");
+      if (node.kind === "curve" && (!node.curve || !node.curve.start?.nodeId || !node.curve.end?.nodeId)) throw new Error("Canvas 曲线端点无效");
+      if (node.kind === "media" && !node.media?.url) throw new Error("Canvas 媒体地址无效");
+      if (node.kind === "curve" && node.curve && (!canonicalNodes.some(item => item.id === node.curve!.start.nodeId && item.kind !== "curve" && item.kind !== "draw") || !canonicalNodes.some(item => item.id === node.curve!.end.nodeId && item.kind !== "curve" && item.kind !== "draw"))) throw new Error("Canvas 曲线必须连接到块");
       if (node.kind === "canvas" && node.targetId && !this.canLinkCanvas(canvasId, node.targetId, nodes)) throw new Error("Canvas 不能形成直接或间接循环引用");
     }
-    canvas.nodes = structuredClone(nodes);
+    canvas.nodes = structuredClone(canonicalNodes);
+    const document = this.docs.get(canvasId)!;
+    // Layout owns the Block objects; the document index exposes those same objects
+    // to the existing reference commands and catalog, never another content copy.
+    document.blocks = canvas.nodes.flatMap(node => node.block ? [node.block] : []);
+    document.references = document.references.filter(ref => {
+      const block = document.blocks.find(block => block.id === ref.hostBlockId);
+      return block && (block.type === "reference" || block.content.links?.some(link =>
+        link.targetDocumentId === ref.targetDocumentId && link.targetBlockId === ref.targetBlockId && link.targetScope === ref.targetScope));
+    });
     canvas.viewport = { x: Number(viewport.x) || 0, y: Number(viewport.y) || 0, zoom: Math.max(.25, Math.min(2.5, Number(viewport.zoom) || 1)) };
     canvas.version += 1;
     this.canvasMutations.add(mutationKey);
+    this.recordCanvasHistory(canvasId);
+  }
+
+  private recordCanvasHistory(canvasId: string) {
+    const canvas = this.canvases.get(canvasId)!;
     const history = this.canvasHistories.get(canvasId)!;
-    const snapshot = { nodes: structuredClone(canvas.nodes), viewport: structuredClone(canvas.viewport) };
+    const references = structuredClone(this.docs.get(canvasId)?.references ?? []);
+    // Source projections are refreshed on read. Only instance state belongs to history.
+    references.forEach(ref => { ref.blocks = ref.blocks.filter(block => block.scopeType === "reference_instance"); });
+    const snapshot = { id: `canvas-history-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`, timestamp: Date.now(), label: "编辑 Canvas", title: canvas.title, nodes: structuredClone(canvas.nodes), viewport: structuredClone(canvas.viewport), references };
     const current = history.entries[history.cursor];
-    if (JSON.stringify(current) !== JSON.stringify(snapshot)) {
+    const same = current && JSON.stringify({ title: current.title, nodes: current.nodes, viewport: current.viewport, references: current.references }) === JSON.stringify({ title: snapshot.title, nodes: snapshot.nodes, viewport: snapshot.viewport, references: snapshot.references });
+    if (!same) {
       history.entries.splice(history.cursor + 1);
       history.entries.push(snapshot);
       history.cursor = history.entries.length - 1;
@@ -408,7 +623,31 @@ export class BrowserMockHost implements HostTransport {
     if (!snapshot) return;
     history.cursor = target;
     canvas.nodes = structuredClone(snapshot.nodes);
+    canvas.title = snapshot.title;
+    this.setDocumentTitle(canvasId, canvas.title);
+    const document = this.docs.get(canvasId)!;
+    document.blocks = canvas.nodes.flatMap(node => node.block ? [node.block] : []);
+    document.references = structuredClone(snapshot.references);
     canvas.viewport = structuredClone(snapshot.viewport);
+    canvas.version += 1;
+  }
+
+  restoreCanvasHistory(canvasId: string, entryId: string, expectedVersion: number) {
+    const canvas = this.canvases.get(canvasId);
+    const history = this.canvasHistories.get(canvasId);
+    if (!canvas || !history) throw new Error("Canvas 不存在");
+    if (expectedVersion !== canvas.version) throw new Error("Canvas 已更新，请重新载入后再恢复历史");
+    const target = history.entries.findIndex(entry => entry.id === entryId);
+    if (target < 0) throw new Error("Canvas 历史版本不存在");
+    history.cursor = target;
+    const snapshot = history.entries[target];
+    canvas.nodes = structuredClone(snapshot.nodes);
+    canvas.title = snapshot.title;
+    this.setDocumentTitle(canvasId, canvas.title);
+    canvas.viewport = structuredClone(snapshot.viewport);
+    const document = this.docs.get(canvasId)!;
+    document.blocks = canvas.nodes.flatMap(node => node.block ? [node.block] : []);
+    document.references = structuredClone(snapshot.references);
     canvas.version += 1;
   }
 
@@ -419,7 +658,18 @@ export class BrowserMockHost implements HostTransport {
         if (block.type !== "todo") return;
         const createdAt = block.properties.todoCreatedAt;
         const dueAt = block.properties.todoDueAt;
-        if (createdAt || dueAt) todos.push({ documentId, blockId: block.id, createdAt, dueAt });
+        const completedAt = block.properties.todoCompletedAt;
+        if (createdAt || dueAt || completedAt) {
+          todos.push({
+            documentId,
+            blockId: block.id,
+            createdAt,
+            dueAt,
+            completedAt,
+            checked: block.content.checked === true,
+            text: (block.content.text || block.content.markdown || "").replace(/^\s*[-*+]\s+\[[ xX]\]\s*/, "").trim()
+          });
+        }
       });
     }
     return todos;
@@ -474,6 +724,49 @@ export class BrowserMockHost implements HostTransport {
     const targetIndex = target ? this.bookmarks.findIndex(item => item.id === target.id) : this.bookmarks.length;
     this.bookmarks.splice(Math.max(0, targetIndex), 0, bookmark);
   }
+
+  transferBlock(sourceDocumentId: string, targetDocumentId: string, blockId: string, mode: "reference" | "copy", beforeBlockId?: string, insertAfter = false) {
+    if (sourceDocumentId === targetDocumentId) throw new Error("不能把块导入到同一文档");
+    const source = this.docs.get(sourceDocumentId);
+    const target = this.docs.get(targetDocumentId);
+    if (!source || !target) throw new Error("源文档或目标文档不存在");
+    const original = source.blocks.find(block => block.id === blockId);
+    if (!original) throw new Error("源块不存在");
+    const sourceHistory = this.documentHistory(sourceDocumentId);
+    const targetHistory = this.documentHistory(targetDocumentId);
+    const ordered = [...target.blocks].sort((a, b) => a.position.localeCompare(b.position));
+    const targetIndex = beforeBlockId ? ordered.findIndex(block => block.id === beforeBlockId) : -1;
+    const insertionIndex = targetIndex >= 0 ? targetIndex + (insertAfter ? 1 : 0) : ordered.length;
+    const position = String((insertionIndex + 1) * 1000).padStart(8, "0");
+    if (mode === "copy") {
+      const copied: Block = structuredClone(original);
+      copied.id = `block-${Math.random().toString(36).slice(2, 10)}`;
+      copied.parentId = null;
+      copied.position = position;
+      copied.scopeType = "canonical";
+      copied.revision = 1;
+      target.blocks.push(copied);
+    } else {
+      const hostBlockId = `reference-${Math.random().toString(36).slice(2, 10)}`;
+      const targetTitle = this.getDocumentTitle(sourceDocumentId);
+      target.blocks.push({ id: hostBlockId, parentId: null, position, type: "reference", content: { text: "", html: "" }, properties: {}, revision: 1 });
+      target.references.push({
+        id: `ref-${hostBlockId}`,
+        hostBlockId,
+        targetDocumentId: sourceDocumentId,
+        targetBlockId: original.id,
+        targetScope: "block",
+        targetTitle,
+        mode: "inline",
+        blocks: [structuredClone(original)],
+        overrides: [],
+        hiddenBlockIds: []
+      });
+    }
+    target.blocks = orderBlockTree(target.blocks.map((block, index) => ({ ...block, position: String((index + 1) * 1000).padStart(8, "0") })));
+    sourceHistory.record(this.historySnapshot(sourceDocumentId), "跨文档拖拽");
+    targetHistory.record(this.historySnapshot(targetDocumentId), mode === "reference" ? "插入块引用" : "复制块");
+  }
   subscribe(listener: (message: HostResponse | HostEvent) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private respond<K extends keyof RequestMap>(request: HostRequest<K>, payload: unknown, ok = true, error?: string) {
     const response: HostResponse = { protocolVersion: 1, requestId: request.requestId, kind: request.kind, ok, payload: payload as never, error: error ? { code: "mock_error", message: error } : undefined };
@@ -485,7 +778,7 @@ export class BrowserMockHost implements HostTransport {
     result.documents = this.linkCatalog();
     result.blocks = orderBlockTree(result.blocks);
     result.references.forEach(reference => reference.blocks = orderBlockTree(reference.blocks));
-    result.history = this.documentHistory(documentId).model(documentId);
+    result.history = this.canvases.has(documentId) ? this.canvasHistoryModel(documentId) : this.documentHistory(documentId).model(documentId);
     result.backlinks = this.computeBacklinks(documentId);
     result.overrideNotices = this.computeOverrideNotices(documentId);
     const workspaceId = result.note.workspaceId;
@@ -646,35 +939,14 @@ export class BrowserMockHost implements HostTransport {
     }
     return blocks.filter((candidate) => included.has(candidate.id));
   }
-  private headingInfo(block: Block) {
-    const source = block.content.markdown ?? block.content.text ?? "";
-    const line = source.split(/\r?\n/).find(value => value.trim()) ?? "";
-    const match = line.match(/^\s*(#{1,6})[ \u3000]+(.+?)\s*$/);
-    const title = (block.content.text ?? source).trim();
-    if (block.type === "heading" && block.properties.headingLevel && title)
-      return { level: block.properties.headingLevel, title };
-    return match ? { level: match[1].length as 1 | 2 | 3 | 4 | 5 | 6, title: match[2].trim() } :
-      (block.type === "heading" && title ? { level: 1 as const, title } : null);
-  }
-  private headingSection(blocks: EditorState["blocks"], headingId: string) {
-    const ordered = orderBlockTree(blocks);
-    const start = ordered.findIndex(block => block.id === headingId);
-    if (start < 0) return [];
-    const root = this.headingInfo(ordered[start]);
-    if (!root) return [ordered[start]];
-    const result: Block[] = [];
-    for (let index = start; index < ordered.length; index++) {
-      const info = this.headingInfo(ordered[index]);
-      if (index > start && info && info.level <= root.level) break;
-      result.push(ordered[index]);
-    }
-    return result;
-  }
+  private headingSection = headingSection;
   updateSourceBlock(documentId: string, blockId: string, text: string) {
     const source = this.docs.get(documentId);
     const target = source?.blocks.find((candidate) => candidate.id === blockId);
     if (!target) throw new Error("源块不存在");
-    target.content = { ...target.content, text, html: text };
+    // Keep all serialized representations in sync. Demo fixtures use Markdown
+    // for source review, and projections prefer that field when it exists.
+    target.content = { ...target.content, text, html: text, markdown: text };
     target.revision += 1;
     this.refreshReferenceSnapshots();
     const event: HostEvent = { protocolVersion: 1, kind: "documentChanged", payload: { documentId } };
@@ -873,6 +1145,17 @@ export class BrowserMockHost implements HostTransport {
               this.respond(request, { state: this.state(current.note.id) });
               break;
             }
+            if (payload.operation === "transfer-block") {
+              const sourceDocumentId = String((payload as { sourceDocumentId?: string }).sourceDocumentId ?? "");
+              const targetDocumentId = String(payload.targetDocumentId ?? current.note.id);
+              const blockId = String((payload as { blockId?: string }).blockId ?? "");
+              const mode = payload.mode === "copy" ? "copy" : payload.mode === "reference" ? "reference" : null;
+              if (!mode) throw new Error("无效的块导入方式");
+              const transfer = payload as { beforeBlockId?: string; insertAfter?: boolean };
+              this.transferBlock(sourceDocumentId, targetDocumentId, blockId, mode, transfer.beforeBlockId, transfer.insertAfter === true);
+              this.respond(request, { state: this.state(targetDocumentId) });
+              break;
+            }
             const supported = new Set(["create-reference", "set-reference-mode", "save-override", "reset-override", "reset-reference", "save-instance-block", "move-reference-block", "delete-instance-block", "hide-reference-block", "remove-reference"]);
             if (!supported.has(payload.operation ?? "")) throw new Error("未知操作");
             if (payload.operation !== "create-reference" && !current.references.some(r => r.id === payload.referenceInstanceId))
@@ -885,13 +1168,14 @@ export class BrowserMockHost implements HostTransport {
             if (payload.operation === "create-reference" && payload.hostBlockId && payload.targetDocumentId) {
               const target = this.docs.get(payload.targetDocumentId);
               const documentInfo = current.documents.find((item) => item.id === payload.targetDocumentId);
-              if (target) current.references.push({
-                id: `ref-${payload.hostBlockId}`,
+              if (target && !current.references.some(ref => ref.hostBlockId === payload.hostBlockId &&
+                  ref.targetDocumentId === payload.targetDocumentId && ref.targetBlockId === payload.targetBlockId && ref.targetScope === payload.targetScope)) current.references.push({
+                id: current.references.some(ref => ref.id === `ref-${payload.hostBlockId}`) ? `ref-${crypto.randomUUID()}` : `ref-${payload.hostBlockId}`,
                 hostBlockId: payload.hostBlockId,
                 targetDocumentId: payload.targetDocumentId,
                 targetBlockId: payload.targetBlockId,
                 targetScope: payload.targetScope as "block" | "heading" | undefined,
-                targetTitle: documentInfo?.title ?? "目标文档",
+                targetTitle: documentInfo?.title ?? target.note.title,
                 mode: "inline",
                 blocks: structuredClone(payload.targetBlockId
                   ? payload.targetScope === "heading"
@@ -965,6 +1249,10 @@ export class BrowserMockHost implements HostTransport {
               current.blocks = current.blocks.filter(b => b.id !== hostBlockId);
             }
             history.record(this.historySnapshot(current.note.id), "更新引用", (payload as { historyGroup?: string }).historyGroup);
+            if (this.canvases.has(current.note.id)) {
+              this.canvases.get(current.note.id)!.version += 1;
+              this.recordCanvasHistory(current.note.id);
+            }
             this.respond(request, { state: this.state(current.note.id) });
             break;
           }

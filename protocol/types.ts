@@ -19,7 +19,7 @@ export type GeoLocation = {
   updatedAt: string;
   deletedAt?: string;
 };
-export type BlockType = "paragraph" | "heading" | "todo" | "reference" | "media" | "location" | "database_table" | "data_view";
+export type BlockType = "paragraph" | "heading" | "todo" | "reference" | "media" | "location" | "database_table" | "data_view" | "dashboard_widget";
 export type ReferenceTargetScope = "block" | "heading";
 export type LinkToken = { targetDocumentId?: string; targetBlockId?: string; targetScope?: ReferenceTargetScope; targetText: string; alias?: string; start: number; end: number };
 export type BlockContent = { text: string; html: string; markdown?: string; checked?: boolean; targetDocumentId?: string; links?: LinkToken[]; media?: MediaAsset; caption?: string };
@@ -33,6 +33,8 @@ export type BlockProperties = {
   mediaWidth?: number;
   /** Explicit heading semantics. Markdown source is a serialization of this value. */
   headingLevel?: 1 | 2 | 3 | 4 | 5 | 6;
+  /** UI state for collapsing the section below a heading. */
+  headingCollapsed?: boolean;
   /** @deprecated Legacy column-container representation. Read only for migration. */
   layout?: "columns";
   /** @deprecated Legacy column-container representation. Read only for migration. */
@@ -60,6 +62,17 @@ export type BlockProperties = {
   todoCreatedAt?: string;
   /** ISO calendar date targeted for completing a todo block. */
   todoDueAt?: string;
+  /** ISO calendar date when a todo was actually completed. */
+  todoCompletedAt?: string;
+  /** Dashboard widget instance configuration. Result data is resolved at render time. */
+  dashboardWidget?: {
+    kind: string;
+    title?: string;
+    scope: "activeDocument" | "document" | "notebook" | "workspace" | "database";
+    sourceId?: string;
+    query?: Record<string, unknown>;
+    layout: { x: number; y: number; width: number; height: number; zIndex?: number };
+  };
 };
 export type Block = { id: string; parentId: string | null; position: string; type: BlockType; content: BlockContent; properties: BlockProperties; revision: number; scopeType?: "canonical" | "reference_instance" };
 export type Note = { id: string; title: string; isSticky: boolean; clientVersion: number };

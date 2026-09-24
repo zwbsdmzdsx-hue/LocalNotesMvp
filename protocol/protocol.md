@@ -53,7 +53,7 @@ CSS 样式资源也通过 `executeCommand` 保存：`save-style` 携带 `id/titl
 
 数据库字段类型包含 `text`、`number`、`url`、`media`、`formula`、`rule`、`document_relation`、`record_relation` 和 `rollup`。`media` 值复用 `MediaAsset` JSON；上传仍先走 `storeMedia`，再由 `upsert-database-record` 保存。公式和规则字段在编辑模式显示运算结果，用户点击单元格时才编辑字段表达式；源码模式显示声明里的 `formula`，预览模式只显示结果。
 
-Todo 块的 `todoCreatedAt`（记录创建日期）和 `todoDueAt`（目标完成日期）属于块的 `BlockProperties`，随普通 `saveDocument`、历史、撤销和重做保存；它们不会写入待办的 Markdown 文本。新版浏览器日历直接从工作区待办块读取这两个字段，以蓝色/红色圆点分别表示创建日和目标完成日，日记点仍使用绿色圆点，不建立第二套日历数据源。
+Todo 块的 `todoCreatedAt`（记录创建日期）、`todoDueAt`（目标完成日期）和 `todoCompletedAt`（实际完成日期）属于块的 `BlockProperties`，随普通 `saveDocument`、历史、撤销和重做保存；它们不会写入待办的 Markdown 文本。新版浏览器日历直接从工作区待办块读取这些字段，只在目标日期显示状态点：未到期为黄色、逾期未完成为红色、已完成为绿色；创建日期不单独显示，日记点仍使用绿色圆点，不建立第二套日历数据源。正文同时保留三类日期，并显示提前完成的绿色勾、逾期完成的红色勾和逾期未完成的红色感叹号。
 
 地理位置通过 `GeoLocation` 目录统一保存，支持 `global` 和 `notebook` 两种 scope。位置目录由 `list-locations` 读取，写入使用 `create-location`、`update-location` 和 `delete-location`，携带 `mutationId` 与 `expectedLocationVersion`；删除为软删除。正文位置块使用 `type: "location"`，只保存 `properties.locationId` 和可选的 `locationLabelOverride`，名称、地址与坐标不复制到块内。地图管理使用 Leaflet + OpenStreetMap；浏览器定位、IP 粗定位和 Nominatim 反向地理编码都由用户主动触发或由地图选点防抖触发，失败时保留手动坐标。
 
@@ -65,6 +65,10 @@ Canonical DTO 约束：标题块使用 `properties.headingLevel`（1 到 6），
 只在加载迁移时读取。
 
 媒体上传使用 `storeMedia` 请求。payload 为 `{ name, mimeType, size, data }`，其中 `data` 是不带 data URL 前缀的 base64 内容；宿主返回 `{ media: { id, kind, name, mimeType, size, url } }`。宿主将内容复制到应用数据库旁的 `media` 目录并返回持久 `file:///` 地址。浏览器 Mock 返回内存 data URL。正文媒体块使用 `type: "media"`，并在 `content.media` 保存该资源对象，随 `saveDocument` 快照持久化。`kind` 支持 `image`、`video`、`audio`、`pdf` 和普通 `file`；`content.caption` 保存用户编辑的说明文字，`properties.textAlign` 保存媒体对齐方式，`properties.mediaWidth` 保存图片预览宽度百分比。文件选择、拖放和剪贴板图片都必须先调用 `storeMedia`，再创建同一种媒体块；PDF 使用统一预览组件的内嵌阅读器，普通文件提供下载链接。
+
+Canvas 当前属于新版浏览器的 `WorkspaceApi` 能力，不是已落地的 C# Host 命令。Canvas 项目以 `kind: "canvas"` 区分，节点复用正文 `Block`、媒体和引用对象，并增加稳定节点 ID、坐标、尺寸、层级、视口、显示模式、Icon、字号、手绘笔画和 Bezier 曲线参数。曲线端点只能吸附到普通块四边中点，支持多个连接、颜色、粗细、实线/虚线/点线及中点描述；节点移动、调整尺寸、引用、手绘、曲线和视口进入浏览器 Canvas 历史。Canvas 文档/Canvas 节点是打开关系，不改变目录 `parentId`，并拒绝直接或间接循环。当前数据由 `BrowserMockHost` 内存保存，尚未写入 SQLite `views/placements/edges`，也没有新增桌面 `executeCommand`；后续接入必须先补齐正式 DTO、事务、版本和重启恢复契约。
+
+Dashboard 当前属于新版浏览器的 `WorkspaceApi` 能力，项目以 `kind: "dashboard"` 区分。组件使用 `Block.type: "dashboard_widget"`，其 `properties.dashboardWidget` 保存 `kind`、数据 `scope`、可选 `sourceId/query` 和 `layout`；组件渲染结果不进入快照。Dashboard 通过现有 `saveDocument` 保存标题和组件块，因此继续使用 `mutationId`、`clientVersion`、块 ID 归属和父树校验。浏览器端的 `DashboardWidgetRenderer` 注册表为后续组件扩展预留；当前内置右栏各能力的摘要组件。该能力尚未新增 C# Host 命令或 SQLite 专用表，Mock 数据仍为页面内存。
 
 `saveDocument` is a serialized transaction. Its payload includes the document
 ID, mutation ID, client version, title, and block snapshot. The response always

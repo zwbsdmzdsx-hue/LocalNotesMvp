@@ -1,3 +1,4 @@
+import { queryLinkSuggestions, headingInfo, headingSection, type LinkSuggestion } from "./link-suggestions";
 import { sanitizeHtml, editableContent } from "./block-content";
 import type { BlockType, BlockContent, BlockProperties, Block, BlockComment, LinkToken, Note, Backlink, OverrideNotice, ReferenceOverride, ReferenceMode, ReferenceInstance, ReferenceTargetScope, EditorState, SaveMutation, RequestMap, StyleSheet, MediaAsset, MediaKind, DatabaseField, DatabaseSource, DatabaseRecord, DatabaseValue } from "../../protocol/types";
 import type { EditorHostApi } from "./editor-host-api";
@@ -14,6 +15,9 @@ export function mountEditor(host: EditorHostApi, ui: {
   showHistory?(): void;
   setDatabaseContext?(visible: boolean, activate?: boolean): void;
   updateHistory?(model: HistoryModel): void;
+  canvasUndo?(): void;
+  canvasRedo?(): void;
+  canvasStateChanged?(state: EditorState, persist: boolean): void;
 } = {}) {
 const titleInput = document.querySelector<HTMLInputElement>("#title")!;
 const blockSurface = document.querySelector<HTMLDivElement>("#blocks")!;
@@ -44,6 +48,10 @@ if (!["rich", "source", "preview"].includes(editorMode)) editorMode = "rich";
 let stylePanelScope: "system" | "document" | "notebook" = "document";
 // The shell owns section visibility and tab selection. The core renders slot contents only.
 let state: EditorState | null = null;
+// Canvas reuses the document-shaped state for the right sidebar. Its layout
+// and history are persisted by CanvasManager, so shared document saves/history
+// must stay disabled while this context is active.
+let canvasContext = false;
 const locationManager = new LocationManager({
   panel: locationsPanel,
   getState: () => state ? { locations: state.locations ?? [], locationVersion: state.locationVersion ?? 0, notebookId: state.note.workspaceId } : null,
@@ -73,10 +81,6 @@ let activeBlock: HTMLElement | null = null;
 let styleSelection: { editable: HTMLElement; endEditable: HTMLElement; range: Range; blockId: string; endBlockId: string; start: TextSelectionEndpoint; end: TextSelectionEndpoint } | null = null;
 type TextSelectionEndpoint = { node: Node; offset: number; editable: HTMLElement };
 let crossBlockSelection: { start: TextSelectionEndpoint; end: TextSelectionEndpoint; pointerId: number; active: boolean } | null = null;
-type LinkSuggestion =
-  | { kind: "notebook"; notebookId: string; title: string; meta: string; preview?: string }
-  | { kind: "document"; id: string; notebookId: string; notebookName: string; title: string; meta: string; preview?: string }
-  | { kind: "target" | "heading"; id: string; blockId?: string; scope?: ReferenceTargetScope; title: string; meta: string; label: string; notebookName?: string; documentTitle?: string; preview?: string };
 let linkMenuItems: LinkSuggestion[] = [];
 let linkMenuIndex = 0;
 let linkMenuStage: "notebook" | "document" | "block" = "notebook";
@@ -157,6 +161,7 @@ function applyServerState(next: EditorState, sourceType: string) {
   if (sourceType.startsWith("history-")) { blockSurface.replaceChildren(); referenceSidebarPanel.replaceChildren(); activeEditable = null; activeBlock = null; }
   // Sync DOM. This rebuilds only what changed (rows added/moved/removed, cards added/removed).
   renderAllPanels();
+  if (canvasContext) ui.canvasStateChanged?.(state, false);
   // For text-edit commands, restore caret. For structural commands we don't restore —
   // structural changes inherently move focus and re-render is correct.
   if (sourceType === "saveOverride" || sourceType === "saveInstanceBlock") restoreCaret(caret);
@@ -167,6 +172,11 @@ function applyServerState(next: EditorState, sourceType: string) {
 function moveHistory(direction: "undo" | "redo") { return runHistory("history-" + direction); }
 function restoreHistory(id: string) { return runHistory("history-restore", id); }
 function runHistory(operation: string, entryId?: string) {
+  if (canvasContext) {
+    if (operation === "history-undo") ui.canvasUndo?.();
+    else if (operation === "history-redo") ui.canvasRedo?.();
+    return Promise.resolve();
+  }
   const owner = state?.note.id;
   historyTail = historyTail.then(async () => {
     if (!owner || state?.note.id !== owner) return;
@@ -1036,6 +1046,7 @@ function syncBlockSurface() {
   }
   syncColumnGroups();
   mountEmbeddedReferences();
+  applyHeadingCollapseVisibility();
 }
 
 /**
@@ -1070,8 +1081,8 @@ function locationSignature(block: Block) {
   return JSON.stringify([editorMode, block.properties.locationId ?? "", block.properties.locationLabelOverride ?? "", location?.updatedAt ?? "", location?.deletedAt ?? ""]);
 }
 
-function renderLocationCard(block: Block) {
-  const location = locationForBlock(block);
+function renderLocationCard(block: Block, context = state) {
+  const location = context?.locations?.find(location => location.id === block.properties.locationId);
   const card = document.createElement("figure");
   card.className = `location-card-body${location?.deletedAt ? " is-deleted" : ""}`;
   card.setAttribute("aria-label", location ? `位置：${location.name}` : "位置已删除");
@@ -1723,6 +1734,12 @@ function finishSaveDrain() {
 
 function enqueueDocumentSave() {
   if (!state?.note.id) return;
+  if (canvasContext) {
+    state.blocks = readOwnBlocks();
+    renderRelations();
+    ui.canvasStateChanged?.(state, true);
+    return;
+  }
   saveFailure = null;
   const documentId = state.note.id;
   // Coalesced edits replace the queued snapshot; they must keep its version.
@@ -1896,6 +1913,7 @@ function resolveWikiTargets(root: ParentNode, fallbackLinks: readonly LinkToken[
       candidate.title === title || candidate.title === leafTitle || candidate.path === title || candidate.path?.endsWith(`/${title}`));
     const documentId = retained?.targetDocumentId ?? document?.id;
     if (documentId) link.dataset.targetId = documentId;
+    if (retained?.targetBlockId) link.dataset.targetBlockId = retained.targetBlockId;
     if (!link.dataset.targetTitle) link.dataset.targetTitle = title;
   });
 }
@@ -2004,36 +2022,55 @@ function dismissPreview() {
   clearTimeout(previewTimer); previewSequence++;
   document.querySelector(".link-preview")?.remove();
 }
-function headingInfo(block: Block) {
-  const source = markdownFromContent(block.content);
-  const line = source.split(/\r?\n/).find(value => value.trim()) ?? "";
-  const match = line.match(/^\s*(#{1,6})[ \u3000]+(.+?)\s*$/);
-  const title = plainTextFromContent(block.content).trim();
-  if (block.type === "heading" && block.properties.headingLevel && title) {
-    return { level: block.properties.headingLevel, title };
-  }
-  if (match) return { level: match[1].length as 1 | 2 | 3 | 4 | 5 | 6, title: match[2].trim() };
-  return block.type === "heading" && title ? { level: 1, title } : null;
-}
 
 function headingLevelFromMarkdown(content: BlockContent) {
   const line = markdownFromContent(content).split(/\r?\n/).find(value => value.trim()) ?? "";
   const match = line.match(/^\s*(#{1,6})[ \u3000]+/);
   return match ? match[1].length as 1 | 2 | 3 | 4 | 5 | 6 : undefined;
 }
-function headingSection(blocks: Block[], headingId: string) {
-  const ordered = orderBlockTree(blocks);
-  const start = ordered.findIndex(block => block.id === headingId);
-  if (start < 0) return [];
-  const root = headingInfo(ordered[start]);
-  if (!root) return [ordered[start]];
-  const included: Block[] = [];
-  for (let index = start; index < ordered.length; index++) {
-    const info = headingInfo(ordered[index]);
-    if (index > start && info && info.level <= root.level) break;
-    included.push(ordered[index]);
-  }
-  return included;
+
+function headingLevel(block: Block) {
+  return block.type === "heading"
+    ? (block.properties.headingLevel ?? headingLevelFromMarkdown(block.content) ?? 1)
+    : undefined;
+}
+
+/** Apply Obsidian-style section folding to each ordinary block flow. A heading
+ * hides following blocks until the next heading at the same or shallower level. */
+function applyHeadingCollapseVisibility() {
+  if (!state) return;
+  const containers: HTMLElement[] = [blockSurface,
+    ...[...blockSurface.querySelectorAll<HTMLElement>(".column-track")]];
+  containers.forEach(container => {
+    let collapsedLevel: number | null = null;
+    [...container.children].filter((child): child is HTMLElement => child instanceof HTMLElement && child.matches("[data-own-block]"))
+      .forEach(shell => {
+        const block = state!.blocks.find(item => item.id === shell.dataset.id);
+        if (!block) return;
+        const level = headingLevel(block);
+        if (level !== undefined && collapsedLevel !== null && level <= collapsedLevel) collapsedLevel = null;
+        const hidden = collapsedLevel !== null;
+        shell.hidden = hidden;
+        shell.classList.toggle("heading-section-hidden", hidden);
+        const toggle = shell.querySelector<HTMLButtonElement>(":scope > .block-row > .heading-collapse-toggle");
+        if (toggle && level !== undefined) {
+          toggle.setAttribute("aria-expanded", String(!block.properties.headingCollapsed));
+          toggle.textContent = block.properties.headingCollapsed ? "▸" : "▾";
+          toggle.title = block.properties.headingCollapsed ? "展开标题内容" : "折叠标题内容";
+          toggle.setAttribute("aria-label", toggle.title);
+        }
+        if (level !== undefined && !hidden && block.properties.headingCollapsed) collapsedLevel = level;
+      });
+  });
+}
+
+function toggleHeadingCollapse(block: Block, button: HTMLButtonElement) {
+  if (block.type !== "heading") return;
+  block.properties.headingCollapsed = !block.properties.headingCollapsed;
+  button.setAttribute("aria-expanded", String(!block.properties.headingCollapsed));
+  button.textContent = block.properties.headingCollapsed ? "▸" : "▾";
+  applyHeadingCollapseVisibility();
+  scheduleDocumentSave(0);
 }
 async function targetProjection(target: LinkDestination): Promise<ReferenceInstance> {
   const instance = state?.references.find(item => item.id === target.referenceId);
@@ -2052,7 +2089,7 @@ async function targetProjection(target: LinkDestination): Promise<ReferenceInsta
   }
   return { id: "link-preview", hostBlockId: "", targetDocumentId: target.documentId, targetBlockId: target.blockId, targetScope: target.targetScope, targetTitle: source.note.title, mode: "link", blocks, overrides: [], hiddenBlockIds: [], broken: !!target.blockId && blocks.length === 0 };
 }
-function readOnlyProjection(reference: ReferenceInstance) {
+function readOnlyProjection(reference: ReferenceInstance, context = state) {
   const container = document.createElement("div");
   container.className = "link-preview-content";
   const hidden = new Set(reference.hiddenBlockIds);
@@ -2070,12 +2107,17 @@ function readOnlyProjection(reference: ReferenceInstance) {
     const content = override?.patch.content ?? block.content;
     const paragraph = document.createElement("div");
     paragraph.className = "preview-block";
+    paragraph.dataset.blockId = block.id;
     if (block.type === "location") {
-      paragraph.append(renderLocationCard(block));
+      paragraph.append(renderLocationCard(block, context));
     } else if (block.type === "database_table" || block.type === "data_view") {
-      paragraph.append(renderDatabaseTablePreview(block));
+      paragraph.append(renderDatabaseTablePreview(block, {}, context));
+    } else if (block.type === "media" && content.media) {
+      paragraph.append(renderMediaPreview({ ...block, content }, true));
     } else {
-      paragraph.innerHTML = content.markdown !== undefined
+      paragraph.innerHTML = block.type === "heading" && !/^\s*#{1,6}\s/.test(markdownFromContent(content))
+        ? renderMarkdown("#".repeat(block.properties.headingLevel ?? 1) + " " + markdownFromContent(content))
+        : content.markdown !== undefined
         ? markdownHtml(content.markdown, content.links)
         : renderLinkedHtml(content.html || escapeText(content.text));
     }
@@ -2485,6 +2527,7 @@ function restoreColumnGroup(groupId: string) {
   applyRootMoveOrder(items);
   state.blocks = orderBlockTree(state.blocks);
   renderAllPanels();
+  if (canvasContext) ui.canvasStateChanged?.(state, false);
   scheduleDocumentSave(0);
 }
 
@@ -2525,7 +2568,7 @@ function render(next: EditorState) {
   }
   else mutationVersion = Math.max(mutationVersion, next.note.clientVersion ?? 0);
   // Normalize blocks list: an empty doc still needs at least one shell to edit.
-  if (next.blocks.length === 0) next.blocks.push(createBlock());
+  if (next.blocks.length === 0 && !canvasContext) next.blocks.push(createBlock());
   titleInput.value = next.note.title;
   // Wipe and rebuild blockSurface for a doc switch (changed === true). For same-doc refreshes,
   // run a diff via renderAllPanels so focused contentEditables survive. We fall back to a full
@@ -2584,6 +2627,30 @@ function focusBlock(blockId: string) {
 function todayIsoDate() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+type TodoStatus = "pending" | "overdue" | "complete-early" | "complete-late" | "none";
+
+function todoStatus(checked: boolean, dueAt?: string, completedAt?: string, today = todayIsoDate()): TodoStatus {
+  if (checked) {
+    const completed = completedAt || today;
+    return dueAt && completed > dueAt ? "complete-late" : "complete-early";
+  }
+  if (dueAt && today > dueAt) return "overdue";
+  return dueAt ? "pending" : "none";
+}
+
+function updateTodoStatus(row: HTMLElement) {
+  const indicator = row.querySelector<HTMLElement>(".todo-status-indicator");
+  if (!indicator) return;
+  const checked = row.querySelector<HTMLInputElement>(".todo-check")?.checked ?? false;
+  const dueAt = row.querySelector<HTMLInputElement>(".todo-due-date")?.value || undefined;
+  const completedAt = row.querySelector<HTMLInputElement>(".todo-completed-date")?.value || undefined;
+  const status = todoStatus(checked, dueAt, completedAt);
+  indicator.className = `todo-status-indicator todo-status-${status}`;
+  indicator.textContent = status === "complete-early" ? "✓" : status === "complete-late" ? "✓" : status === "overdue" ? "!" : status === "pending" ? "○" : "";
+  indicator.title = status === "complete-early" ? "已在目标日期前完成" : status === "complete-late" ? "已完成，但晚于目标日期" : status === "overdue" ? "已逾期，尚未完成" : status === "pending" ? "等待完成" : "";
+  indicator.setAttribute("aria-label", indicator.title || "无日期状态");
 }
 
 function createBlock(type: BlockType = "paragraph", parentId: string | null = null): Block {
@@ -2685,22 +2752,57 @@ function createEditableRow(block: Block) {
   const todoDates = block.type === "todo"
     ? `<span class="todo-dates" aria-label="待办日期">
         <label title="记录创建日期"><span>创建</span><input class="todo-created-date" type="date" aria-label="记录创建日期"></label>
-        <label title="目标完成日期"><span>完成</span><input class="todo-due-date" type="date" aria-label="目标完成日期"></label>
+        <label title="目标完成日期"><span>应完成</span><input class="todo-due-date" type="date" aria-label="目标完成日期"></label>
+        <label title="实际完成日期"><span>完成</span><input class="todo-completed-date" type="date" aria-label="实际完成日期"></label>
       </span>`
     : "";
-  row.innerHTML = `<button type="button" class="grip" aria-label="块菜单" draggable="${editorMode !== "preview"}">⠿</button>${checkbox}<div class="block-text ${block.type === "heading" ? "heading" : ""}"></div>${todoDates}<button class="delete-block" title="删除块">×</button>`;
+  const todoStatusMarkup = block.type === "todo" ? `<span class="todo-status-indicator" aria-label="无日期状态"></span>` : "";
+  row.innerHTML = `<button type="button" class="grip" aria-label="块菜单" draggable="${editorMode !== "preview"}">⠿</button>${checkbox}${todoStatusMarkup}<div class="block-text ${block.type === "heading" ? "heading" : ""}"></div>${todoDates}<button class="delete-block" title="删除块">×</button>`;
+  if (block.type === "heading") {
+    const grip = row.querySelector<HTMLButtonElement>(".grip")!;
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "heading-collapse-toggle";
+    toggle.setAttribute("aria-expanded", String(!block.properties.headingCollapsed));
+    toggle.textContent = block.properties.headingCollapsed ? "▸" : "▾";
+    toggle.title = block.properties.headingCollapsed ? "展开标题内容" : "折叠标题内容";
+    toggle.setAttribute("aria-label", toggle.title);
+    toggle.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const latest = state?.blocks.find(item => item.id === block.id) ?? block;
+      toggleHeadingCollapse(latest, toggle);
+    });
+    grip.insertAdjacentElement("afterend", toggle);
+  }
   const editable = row.querySelector<HTMLElement>(".block-text")!;
   const todoCheckbox = row.querySelector<HTMLInputElement>(".todo-check");
   const todoCreatedDate = row.querySelector<HTMLInputElement>(".todo-created-date");
   const todoDueDate = row.querySelector<HTMLInputElement>(".todo-due-date");
+  const todoCompletedDate = row.querySelector<HTMLInputElement>(".todo-completed-date");
   if (todoCreatedDate) todoCreatedDate.value = block.properties.todoCreatedAt ?? "";
   if (todoDueDate) todoDueDate.value = block.properties.todoDueAt ?? "";
+  if (todoCompletedDate) todoCompletedDate.value = block.properties.todoCompletedAt ?? (block.content.checked ? todayIsoDate() : "");
   if (block.type === "todo" && editorMode === "source") row.querySelector<HTMLElement>(".todo-dates")!.hidden = true;
   if (editorMode === "preview") {
     todoCreatedDate?.setAttribute("disabled", "");
     todoDueDate?.setAttribute("disabled", "");
   }
   if (editorMode === "source" && todoCheckbox) todoCheckbox.hidden = true;
+  if (todoCheckbox) {
+    todoCheckbox.addEventListener("change", () => {
+      if (todoCheckbox.checked) {
+        if (todoCompletedDate && !todoCompletedDate.value) todoCompletedDate.value = todayIsoDate();
+      } else if (todoCompletedDate) todoCompletedDate.value = "";
+      updateTodoStatus(row);
+      scheduleDocumentSave(0);
+    });
+  }
+  if (todoDueDate || todoCompletedDate) {
+    todoDueDate?.addEventListener("change", () => { updateTodoStatus(row); scheduleDocumentSave(0); });
+    todoCompletedDate?.addEventListener("change", () => { updateTodoStatus(row); scheduleDocumentSave(0); });
+  }
+  updateTodoStatus(row);
   if (editorMode === "source") {
     editable.classList.add("markdown-source");
     editable.contentEditable = "plaintext-only";
@@ -2907,20 +3009,20 @@ function renderDataView(block: Block) {
 /** Render a database/query block as a compact, read-only snapshot for projections.
  * References, link popovers and suggestions must never expose the source table's
  * editing controls or mutate records while they are being inspected. */
-function renderDatabaseTablePreview(block: Block, limits: { rows?: number; columns?: number } = {}) {
+function renderDatabaseTablePreview(block: Block, limits: { rows?: number; columns?: number } = {}, context = state) {
   const wrapper = document.createElement("div");
   wrapper.className = "database-table database-table-preview";
   wrapper.dataset.databaseId = block.properties.databaseId ?? "";
-  const database = databaseForBlock(block);
+  const database = context?.databases?.find(database => database.id === block.properties.databaseId);
   if (!database) { wrapper.textContent = "数据库不存在"; return wrapper; }
-  const records = state?.databaseRecords?.[database.id] ?? [];
+  const records = context?.databaseRecords?.[database.id] ?? [];
   let result: ReturnType<typeof executeDql>;
   if (block.type === "data_view") {
     const parsed = parseDql(block.properties.dataQuery ?? "FROM current");
     if ("code" in parsed) { wrapper.textContent = parsed.message; wrapper.classList.add("database-query-error"); return wrapper; }
-    result = executeDql(parsed, database, records, { sources: state?.databases ?? [], records: state?.databaseRecords ?? {} });
+    result = executeDql(parsed, database, records, { sources: context?.databases ?? [], records: context?.databaseRecords ?? {} });
   } else {
-    result = executeDql({ from: "current" }, database, records, { sources: state?.databases ?? [], records: state?.databaseRecords ?? {} });
+    result = executeDql({ from: "current" }, database, records, { sources: context?.databases ?? [], records: context?.databaseRecords ?? {} });
   }
   const columns = result.columns.slice(0, limits.columns ?? 5);
   const rows = result.rows.slice(0, limits.rows ?? 5);
@@ -3060,7 +3162,7 @@ function boundedMediaWidth(value: number | undefined) {
   return Math.max(10, Math.min(100, Number.isFinite(value) ? value! : 100));
 }
 
-function renderMediaPreview(block: Block): HTMLElement {
+function renderMediaPreview(block: Block, readonly = false): HTMLElement {
   const asset = block.content.media!;
   const figure = document.createElement("figure");
   figure.className = "media-preview";
@@ -3105,7 +3207,7 @@ function renderMediaPreview(block: Block): HTMLElement {
   }
   media.classList.add("media-player");
   stage.append(media);
-  if (asset.kind === "image" && editorMode !== "preview") {
+  if (asset.kind === "image" && editorMode !== "preview" && !readonly) {
     const handle = document.createElement("button");
     handle.type = "button";
     handle.className = "media-resize-handle";
@@ -3120,7 +3222,7 @@ function renderMediaPreview(block: Block): HTMLElement {
   caption.className = "media-caption";
   const name = document.createElement("span");
   name.className = "media-name";
-  name.contentEditable = editorMode === "rich" ? "true" : "false";
+  name.contentEditable = editorMode === "rich" && !readonly ? "true" : "false";
   name.dataset.placeholder = `添加 caption（${asset.name}）`;
   name.textContent = block.content.caption ?? "";
   name.addEventListener("focus", () => { activeEditable = name; activeBlock = figure.closest<HTMLElement>("[data-own-block]"); });
@@ -3346,23 +3448,28 @@ function readOwnBlocks(): Block[] {
           ? contentFromTodoMarkdown(sourceText(editable), old?.content ?? { text: "", html: "", checked: false })
           : contentFromMarkdown(sourceText(editable), old?.content ?? { text: "", html: "" })
         : contentFromRichEditable(editable, old?.content ?? { text: "", html: "" });
+    const todoChecked = shell.dataset.type === "todo"
+      ? (editorMode === "source" ? content.checked ?? old?.content.checked ?? false : shell.querySelector<HTMLInputElement>(".todo-check")?.checked ?? old?.content.checked ?? false)
+      : false;
+    const completedInput = shell.querySelector<HTMLInputElement>(".todo-completed-date")?.value || undefined;
+    const todoDates: Partial<BlockProperties> = shell.dataset.type === "todo" ? {
+      todoCreatedAt: shell.querySelector<HTMLInputElement>(".todo-created-date")?.value || undefined,
+      todoDueAt: shell.querySelector<HTMLInputElement>(".todo-due-date")?.value || undefined,
+      todoCompletedAt: todoChecked ? (completedInput || old?.properties.todoCompletedAt || todayIsoDate()) : undefined
+    } : {};
     const properties: BlockProperties = editorMode === "rich"
       ? {
         ...(old?.properties ?? {}),
         background: editable.style.backgroundColor || undefined,
         textColor: editable.style.color || undefined,
         textAlign: editable.style.textAlign === "left" || editable.style.textAlign === "center" || editable.style.textAlign === "right" ? editable.style.textAlign : undefined,
-        ...(shell.dataset.type === "todo"
-          ? {
-            todoCreatedAt: shell.querySelector<HTMLInputElement>(".todo-created-date")?.value || undefined,
-            todoDueAt: shell.querySelector<HTMLInputElement>(".todo-due-date")?.value || undefined
-          }
-          : {}),
+        ...todoDates,
         ...(columnGroup ? { columnGroup, column } : shell.dataset.column === "" ? {} : { column: Number(shell.dataset.column) })
       }
       : {
         ...(old?.properties ?? {}),
         ...(old?.properties.textAlign ? { textAlign: old.properties.textAlign } : {}),
+        ...todoDates,
         ...(columnGroup ? { columnGroup, column } : shell.dataset.column === "" ? {} : { column: Number(shell.dataset.column) })
       };
     if (shell.dataset.type === "heading") {
@@ -3374,7 +3481,7 @@ function readOwnBlocks(): Block[] {
       content: {
         ...content,
         ...(shell.dataset.type === "todo"
-          ? { checked: editorMode === "source" ? content.checked ?? old?.content.checked ?? false : shell.querySelector<HTMLInputElement>(".todo-check")?.checked ?? old?.content.checked ?? false }
+          ? { checked: todoChecked }
           : {})
       },
       properties,
@@ -4033,29 +4140,6 @@ async function copyBlockLink(block: Block) {
   }
 }
 
-function normalizedSearch(value: string) { return value.trim().toLocaleLowerCase(); }
-
-function linkCatalogNotebooks() {
-  if (!state) return [];
-  const notebooks = new Map<string, { id: string; name: string; documents: typeof state.documents }>();
-  state.documents.forEach(document => {
-    const id = document.notebookId ?? (document.id === state?.note.id ? state.note.workspaceId : undefined) ?? "notebook-default";
-    const name = document.notebookName ?? document.path?.split("/")[0]?.trim() ?? "当前笔记本";
-    const notebook = notebooks.get(id) ?? { id, name, documents: [] };
-    notebook.documents.push(document);
-    notebooks.set(id, notebook);
-  });
-  return [...notebooks.values()];
-}
-
-function exactOrOnly<T>(items: T[], label: string, getLabel: (item: T) => string) {
-  const normalized = normalizedSearch(label);
-  return items.find(item => normalizedSearch(getLabel(item)) === normalized) ??
-    (items.filter(item => normalizedSearch(getLabel(item)).includes(normalized)).length === 1
-      ? items.filter(item => normalizedSearch(getLabel(item)).includes(normalized))[0]
-      : undefined);
-}
-
 function suggestionPreview(blocks: Block[]) {
   return blocks.slice(0, 6).map(block => {
     if (block.type === "database_table" || block.type === "data_view") return renderDatabaseTablePreview(block).outerHTML;
@@ -4064,90 +4148,12 @@ function suggestionPreview(blocks: Block[]) {
   }).filter(Boolean).join("<hr>");
 }
 
-function headingFilter(value: string) {
-  const hash = value.indexOf("#");
-  if (hash < 0) return null;
-  const suffix = value.slice(hash + 1);
-  const extraHashes = suffix.match(/^#{0,5}/)?.[0].length ?? 0;
-  const level = 1 + extraHashes;
-  const needle = normalizedSearch(suffix.slice(extraHashes));
-  return { hash, level, needle };
-}
-
 function suggestionItems(query: string): LinkSuggestion[] {
   if (!state) return [];
-  const parts = query.split("/");
-  const notebooks = linkCatalogNotebooks();
-  if (parts.length === 1) {
-    linkMenuStage = "notebook";
-    linkMenuTrail = [];
-    const needle = normalizedSearch(parts[0]);
-    return notebooks
-      .filter(notebook => !needle || normalizedSearch(notebook.name).includes(needle))
-      .map(notebook => ({ kind: "notebook", notebookId: notebook.id, title: notebook.name, meta: `${notebook.documents.length} 篇文档` }));
-  }
-
-  const notebook = exactOrOnly(notebooks, parts[0], item => item.name);
-  linkMenuStage = parts.length === 2 ? "document" : "block";
-  linkMenuTrail = notebook ? [notebook.name] : [parts[0].trim()].filter(Boolean);
-  if (!notebook) return [];
-  const documentPart = parts[1] ?? "";
-  const documentHeading = headingFilter(documentPart);
-  const documentNeedle = normalizedSearch(documentHeading ? documentPart.slice(0, documentHeading.hash) : documentPart);
-  if (parts.length === 2) {
-    const documentMatches = notebook.documents
-      .filter(document => !documentNeedle || normalizedSearch(document.title).includes(documentNeedle))
-      .slice(0, 12);
-    if (documentHeading) {
-      const document = exactOrOnly(documentMatches, documentNeedle, item => item.title);
-      if (!document) return [];
-      linkMenuStage = "block";
-      linkMenuTrail = [notebook.name, document.title];
-      return (document.blocks ?? []).flatMap(block => {
-        const heading = headingInfo(block);
-        if (!heading || heading.level !== documentHeading.level ||
-          (documentHeading.needle && !normalizedSearch(heading.title).includes(documentHeading.needle))) return [];
-        const section = headingSection(document.blocks ?? [], block.id);
-        return [{ kind: "heading" as const, id: document.id, blockId: block.id, scope: "heading" as const,
-          title: heading.title, label: heading.title, notebookName: notebook.name, documentTitle: document.title,
-          meta: `${document.title} · H${heading.level} · ${section.length} 个块`, preview: suggestionPreview(section) }];
-      }).slice(0, 12);
-    }
-    return documentMatches.map(document => ({
-        kind: "document", id: document.id, notebookId: notebook.id, notebookName: notebook.name,
-        title: document.title, meta: document.path || notebook.name, preview: suggestionPreview(document.blocks ?? [])
-      }));
-  }
-
-  const document = exactOrOnly(notebook.documents, documentNeedle || parts[1], item => item.title);
-  if (!document) return [];
-  linkMenuTrail = [notebook.name, document.title];
-  const blockQuery = parts.slice(2).join("/");
-  const blockHeading = headingFilter(blockQuery);
-  const blockNeedle = normalizedSearch(blockHeading ? blockQuery.slice(blockHeading.hash + 1 + (blockQuery.slice(blockHeading.hash + 1).match(/^#{0,5}/)?.[0].length ?? 0)) : blockQuery);
-  const items: LinkSuggestion[] = [];
-  if (!blockHeading && (!blockNeedle || "整篇文档".includes(blockNeedle))) {
-    items.push({ kind: "target", id: document.id, title: "整篇文档", meta: `${document.title} · 文档`, label: document.title,
-      notebookName: notebook.name, documentTitle: document.title });
-  }
-  (document.blocks ?? []).forEach(block => {
-    const heading = headingInfo(block);
-    if (blockHeading) {
-      if (heading && heading.level === blockHeading.level &&
-        (!blockHeading.needle || normalizedSearch(heading.title).includes(blockHeading.needle))) {
-        const section = headingSection(document.blocks ?? [], block.id);
-        items.push({ kind: "heading", id: document.id, blockId: block.id, scope: "heading", title: heading.title, label: heading.title,
-          notebookName: notebook.name, documentTitle: document.title, meta: `${document.title} · H${heading.level} · ${section.length} 个块`, preview: suggestionPreview(section) });
-      }
-      return;
-    }
-    const text = plainTextFromContent(block.content);
-    if (!text || (blockNeedle && !normalizedSearch(text).includes(blockNeedle))) return;
-    const label = text.slice(0, 56);
-    items.push({ kind: "target", id: document.id, blockId: block.id, title: label, meta: `${document.title} · 正文块`, label,
-      notebookName: notebook.name, documentTitle: document.title, preview: suggestionPreview([block]) });
-  });
-  return items.slice(0, 12);
+  const result = queryLinkSuggestions(query, state, suggestionPreview);
+  linkMenuStage = result.stage;
+  linkMenuTrail = result.trail;
+  return result.items;
 }
 
 function updateInlineLinkSuggestions(editable: HTMLElement) {
@@ -5028,6 +5034,8 @@ function handleDragStart(event: DragEvent) {
   // captures the element that initiated drag, so a multi-selection otherwise looks
   // like a single block even though all selected IDs will move together.
   if (event.dataTransfer) {
+    event.dataTransfer.setData("text/x-block-id", shell.dataset.id);
+    event.dataTransfer.setData("text/x-source-document-id", state?.note.id ?? "");
     const text = draggingBlockIds.map(id => {
       const item = blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(id)}"]`);
       return item?.querySelector<HTMLElement>(".block-text")?.textContent?.trim() || "空白块";
@@ -5065,6 +5073,17 @@ function handleDragOver(event: DragEvent) {
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
     blockSurface.classList.add("media-drop-active");
+    return;
+  }
+  const sourceDocumentId = event.dataTransfer?.getData("text/x-source-document-id");
+  // Same-document drags use the same payload for the native drag preview, but
+  // must continue through the ordering/column drop-zone logic. Only a block
+  // whose source document differs from the active document is an import.
+  const externalBlock = event.dataTransfer?.types.includes("text/x-block-id") && Boolean(sourceDocumentId) && sourceDocumentId !== state?.note.id;
+  if (externalBlock && state) {
+    event.preventDefault();
+    if (event.dataTransfer) { event.dataTransfer.dropEffect = "copy"; }
+    blockSurface.classList.add("external-block-drop-active");
     return;
   }
   if (!draggingBlockId) return;
@@ -5149,6 +5168,10 @@ function handleDragLeave(event: DragEvent) {
     if (!related || !blockSurface.contains(related)) blockSurface.classList.remove("media-drop-active");
     return;
   }
+  if (event.dataTransfer?.types.includes("text/x-block-id")) {
+    const related = event.relatedTarget as Node | null;
+    if (!related || !blockSurface.contains(related)) blockSurface.classList.remove("external-block-drop-active");
+  }
   const related = event.relatedTarget as HTMLElement | null;
   const shell = (event.target as HTMLElement).closest<HTMLElement>(".block-shell[data-own-block]");
   if (!shell || (related && shell.contains(related))) return;
@@ -5217,6 +5240,25 @@ function handleDrop(event: DragEvent) {
     draggingBlockId = null;
     draggingColumn = null;
     void insertMediaFiles(files, event.target as HTMLElement);
+    return;
+  }
+  const externalBlockId = event.dataTransfer?.getData("text/x-block-id");
+  const sourceDocumentId = event.dataTransfer?.getData("text/x-source-document-id");
+  if (externalBlockId && sourceDocumentId && state && sourceDocumentId !== state.note.id && !draggingBlockId) {
+    event.preventDefault();
+    const choice = window.prompt("将此块插入当前文档：输入 1 作为引用，输入 2 复制一份", "1");
+    const mode = choice === "2" ? "copy" : choice === "1" ? "reference" : null;
+    if (mode) {
+      const targetShell = (event.target as HTMLElement).closest<HTMLElement>(".block-shell[data-own-block]");
+      const targetBlockId = targetShell?.dataset.id;
+      const targetRect = targetShell?.getBoundingClientRect();
+      const insertAfter = !!targetRect && event.clientY > targetRect.top + targetRect.height / 2;
+      void host.executeCommand({ operation: "transfer-block", sourceDocumentId, targetDocumentId: state.note.id, blockId: externalBlockId, mode, beforeBlockId: targetBlockId, insertAfter }, state.note.id)
+        .then(result => applyServerState(result.state, "transfer-block"))
+        .catch(showError);
+    }
+    clearDropIndicator();
+    blockSurface.classList.remove("external-block-drop-active");
     return;
   }
   if (!draggingBlockId || !state) {
@@ -5334,6 +5376,7 @@ function handleDrop(event: DragEvent) {
 
 function handleDragEnd() {
   blockSurface.classList.remove("media-drop-active");
+  blockSurface.classList.remove("external-block-drop-active");
   clearDropIndicator();
   document.querySelectorAll(".column-grip").forEach(el => el.classList.remove("is-dragging"));
   draggingColumn = null;
@@ -5352,6 +5395,7 @@ blockSurface.addEventListener("dragend", handleDragEnd);
 
 void host.request("ready", {}).catch(showError);
 function clear() {
+  canvasContext = false;
   state = null;
   activeEditable = null;
   sidebarLink = null;
@@ -5396,7 +5440,17 @@ return {
   restoreHistory,
   createDiaryDocument,
   insertCalendarLink,
+  readOnlyProjection,
+  contentFromMarkdown,
   retry: () => { saveFailure = null; commandFailure = null; enqueueDocumentSave(); },
-  load: render
+  load: (next: EditorState) => { canvasContext = false; render(next); },
+  loadCanvas: (next: EditorState) => { canvasContext = true; render(next); },
+  setCanvasActiveBlock: (block?: Block) => {
+    activeBlock = block ? blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(block.id)}"]`) : null;
+    renderComments();
+    renderDatabases();
+    const isDatabase = block?.type === "database_table" || block?.type === "data_view";
+    ui.setDatabaseContext?.(!!isDatabase, !!isDatabase);
+  }
 };
 }

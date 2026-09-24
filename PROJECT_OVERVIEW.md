@@ -1,6 +1,6 @@
 # LocalNotesMvp 项目全景
 
-核对日期：2026-09-17，包含当前工作区修改。历史代码基准：`46ecbc1`。本文描述当前实现，后续设想单独标注；功能与文档不一致时，以实际入口、代码和测试为准。
+核对日期：2026-09-24，包含当前工作区修改。历史代码基准：`46ecbc1`。本文描述当前实现，后续设想单独标注；功能与文档不一致时，以实际入口、代码和测试为准。
 
 ## 1. 产品定位
 
@@ -43,9 +43,12 @@ flowchart LR
 - **分栏**：普通块通过 `properties.columnGroup`、`column` 和 `columnWidths` 组成列组；不存在独立的分栏容器块。旧的 `layout/columnCount/columnGap` 只允许在加载迁移时读取，保存不会再产生这些字段。
 - **数据库块**：`data_sources/data_fields/data_records/data_values` 是数据唯一来源；正文块只保存 `properties.databaseId`，视图配置由 `databaseViews` 按数据库 ID 关联。旧 `databaseViewId` 只为兼容读取保留，新代码不得写入。
 - **地理位置**：位置目录是 `GeoLocation` 的唯一事实来源，支持全局和笔记本 scope；正文 `type="location"` 块只保存 `properties.locationId` 与可选显示名称覆盖，地图管理负责坐标、地址和来源更新。
-- **Canvas**：工作区项目以唯一 `kind=document|canvas` 区分；Canvas 内的文档和 Canvas 节点只保存稳定目标 ID 与几何信息，是打开关系，不修改左侧目录 `parentId`。嵌套引用建立时必须拒绝直接和间接循环。
+- **Canvas**：工作区项目以唯一 `kind=document|canvas|dashboard` 区分；Canvas 内的文档和 Canvas 节点只保存稳定目标 ID 与几何信息，是打开关系，不修改左侧目录 `parentId`。Canvas 的自由内容节点使用与正文相同的 `Block`（旧版 `text/content` 节点只在工作区边界兼容迁移），Canvas 只额外保存位置、尺寸、层级、引用显示偏好/自定义 Icon 和节点字号。Canvas 文档预览沿用正文标题层级折叠，曲线支持中点描述和 Icon 悬浮预览。嵌套引用建立时必须拒绝直接和间接循环。
+- **Dashboard**：新版浏览器支持与文档、Canvas 平行的 `kind=dashboard` 工作区项目。Dashboard 使用专用视图；每个组件是 `Block.type="dashboard_widget"`，在 `properties.dashboardWidget` 中保存稳定组件实例 ID、组件类型、数据作用域、查询配置和布局，不保存渲染结果。组件通过 `DashboardWidgetRenderer` 注册表读取当前 `EditorState`，标题、移动、缩放、删除和新增均通过现有 `saveDocument` 版本/幂等保存路径完成。当前内置右栏引用、反向链接、覆写、注释、历史、日历、位置、样式和数据库的摘要组件；Mock 仍是内存实现，未接入桌面 SQLite。
 - **链接与引用**：默认新建关联统一使用正文 `[[笔记本/文档/块#^块ID]]` 双链。六点菜单只复制这个稳定链接；用户在右栏普通双链条目中明确选择显示方式时，才把该链接升级为同一宿主块下的 `reference_instance`。已有 `reference_instances` 仍可展示、切换模式和编辑兼容内容。
 - **作用域实现**：`editor/` 是当前新版网页入口，`web/` 是桌面兼容入口；两者不是同一运行时。新版先在 `BrowserMockHost` 验证交互，不能把 Mock 当成 SQLite 持久化实现，也不能为同一功能在两端各自发明一套模型。
+
+Canvas 引用修复：新版 Canvas 的自由块在 Mock 文档索引中暴露同一 Block 对象，引用使用现有 `ReferenceInstance` 及 `create-reference/set-reference-mode/save-override` 命令。引用实例修改进入 Canvas 历史，源投影在读取时刷新，不写入块正文。Canvas 与文档共享 `link-suggestions.ts` 的笔记本/文档/块筛选和标题区间算法，并调用正文只读预览组件渲染文本、媒体、表格及位置。Canvas 当前提供标题链接、正文直显、折叠三种呈现，文本投影可双击编辑局部覆写；Canvas 打开后通过同一份 `EditorState` 驱动实时引用、反向链接、覆写、注释、历史、日历、地图、CSS 和数据库右栏，激活 Canvas 数据块时数据库面板跟随切换。布局、节点、引用实例、标题和视口由 Canvas 历史快照统一撤销/重做，右栏历史恢复使用同一快照；顶部前进/后退通过宿主导航栈切换 Canvas 与普通文档。
 
 新增正文能力应先扩展上述 canonical DTO 和宿主命令，再接入渲染与 Mock；禁止把同一数据复制到正文内容、临时 UI 状态和另一张表中。兼容字段必须有明确的迁移入口和退役条件。
 
@@ -57,11 +60,12 @@ flowchart LR
 | --- | --- |
 | [editor/src/core.ts](editor/src/core.ts) | 渲染、输入、保存队列、联想、链接预览、就地引用、模式转换、覆写与结构操作；目前仍是大文件 |
 | [editor/src/main.ts](editor/src/main.ts) | 浏览器入口、Mock 初始化、开发导航栏、失败模拟和重试按钮 |
-| [editor/src/browser-mock-host.ts](editor/src/browser-mock-host.ts) | Alpha/Beta fixture、内存保存、导航和部分引用命令；新版侧栏文档树、最多三层嵌套及书签/文档拖拽排序也在此提供浏览器态实现；不是完整存储实现 |
+| [editor/src/browser-mock-host.ts](editor/src/browser-mock-host.ts) | Alpha/Beta 最小兼容锚点，以及 Gamma、Epsilon、演示中心、Zeta 等 Markdown/待办/数据库/位置/媒体 Demo；项目路线图与研究白板 Canvas 也在此提供浏览器态实现，另含内存保存、导航、侧栏树和引用命令；不是完整存储实现 |
 | [editor/src/editor-host-api.ts](editor/src/editor-host-api.ts) | 请求 ID、响应匹配、Promise、10 秒超时、宿主事件订阅 |
 | [editor/src/workspace-api.ts](editor/src/workspace-api.ts) | 侧栏只依赖类型化的快照、搜索、大纲和异步命令接口，不直接读写 Mock 或编辑器 DOM |
 | [editor/src/browser-workspace.ts](editor/src/browser-workspace.ts) | 浏览器工作区适配；命令串行执行，等待编辑保存后修改数据，重命名/删除后同步当前编辑器。原生工作区适配尚未接入 |
-| [editor/src/canvas-manager.ts](editor/src/canvas-manager.ts) | 新版无限画布视图；负责平移缩放、自由卡片、文档/Canvas 引用、移动缩放、预览/Icon 模式和画布历史交互 |
+| [editor/src/canvas-manager.ts](editor/src/canvas-manager.ts) | 新版无限画布视图；负责平移缩放、自由卡片、文档/Canvas 引用、节点六点菜单、字号与引用 Icon、移动缩放、预览/Icon 模式和画布历史交互 |
+| [editor/src/dashboard-manager.ts](editor/src/dashboard-manager.ts) | 新版 Dashboard 视图；负责 `dashboard_widget` 容器块、组件注册表、布局拖动/缩放、右栏能力摘要渲染和保存队列 |
 | [editor/src/mock-save-store.ts](editor/src/mock-save-store.ts) | Mock 保存幂等记录、版本规则和完整快照校验 |
 | [editor/src/block-content.ts](editor/src/block-content.ts) | 正文序列化与 HTML 清理；剥离引用投影、保留空锚点 |
 | [editor/src/markdown.ts](editor/src/markdown.ts) | 新版 Markdown 的安全渲染、旧 HTML 转源码、双链与引用锚点往返 |
@@ -136,7 +140,7 @@ flowchart LR
 
 ### 撤销、重做与版本历史
 
-新版浏览器与桌面兼容编辑器均支持 Ctrl+Z、Ctrl+Y、Ctrl+Shift+Z，以及工具栏撤销/重做按钮。连续输入按编辑目标与约 900ms 停顿合并；粘贴、选区替换和结构操作分组。历史面板按时间列出最近 80 个版本，点击只预览标题和正文文本，点击“恢复此版本”才写入；恢复本身可以撤销。撤销后新编辑清空重做路径，但被分叉的版本在保留上限内仍可从列表恢复。
+新版浏览器与桌面兼容编辑器均支持 Ctrl+Z、Ctrl+Y、Ctrl+Shift+Z，以及工具栏撤销/重做按钮。连续输入按编辑目标与约 900ms 停顿合并；粘贴、选区替换和结构操作分组。历史面板按时间列出最近 80 个版本，点击只预览标题和正文文本，点击“恢复此版本”才写入；恢复本身可以撤销。Canvas 在新版浏览器中使用独立的布局历史快照，但通过同一历史面板显示、恢复和按钮状态；快照包含节点、位置尺寸、视口、标题及引用实例。撤销后新编辑清空重做路径，但被分叉的版本在保留上限内仍可从列表恢复。
 
 桌面 `NoteStore.History.cs` 在正文/引用变更的同一 SQLite 事务中记录历史，历史与游标可跨进程重启保留。恢复只接收当前文档所属的版本 ID，校验当前 `expectedVersion`，保留文档/块/实例 ID、软删除，并使文档版本与恢复块的 revision 前进。快照不包含被引用源文档的正文，恢复实例覆写、隐藏、移动和专属块不会修改源文档。恢复后的继承部分仍读取最新源。
 
@@ -148,7 +152,7 @@ flowchart LR
 
 新版浏览器编辑器提供“编辑 / 源码 / 预览”三态。编辑态保留现有富文本与引用操作；源码态编辑逐块 Markdown 原文；预览态只读渲染 GFM 标题、强调、删除线、引用、列表、代码、表格及普通链接，并禁用正文结构操作。模式切换会先排空保存队列，正文的 `content_json` 同时保留无损 `markdown`、经 DOMPurify 清理的 `html`、搜索用 `text` 和稳定双链 `links`。旧块没有 `markdown` 时从已有安全 HTML 转换，不修改 SQLite 表结构。该三态目前只接入 4173 的新版编辑器，桌面 EXE 默认加载的兼容编辑器仍是独立入口。
 
-新版 4173 侧栏的书签支持拖拽重排，书签右侧悬浮“+”可选择创建文档或 Canvas；两类项目都可在目录中拖到其他项目下形成最多三层的树，并显示全部后代数量。Canvas 正文是可平移缩放的自由画布，可新建自由卡片，也可从左侧拖入文档或其他 Canvas。节点保存稳定目标 ID、坐标、尺寸和层次；文档以可调整大小的只读内容窗口显示，Canvas 可切换缩略图预览或固定圆角方形 Icon，双击或打开按钮进入源项目。Canvas 嵌套是跳转关系，不改目录层级，并阻止直接或间接循环。目录和画布数据目前都属于浏览器 Mock 的内存工作区快照，未扩展桌面 SQLite/原生工作区协议；刷新浏览器页面会按 fixture 重置。
+新版 4173 侧栏的书签支持拖拽重排，书签右侧悬浮“+”可选择创建文档或 Canvas；两类项目都可在目录中拖到其他项目下形成最多三层的树，并显示全部后代数量。文档拖到其他笔记本标签或书签会迁移目录归属。正文块可跨文档拖入目标正文、目标文档或目标笔记本；落点会询问创建实时引用还是复制一份独立块，并按落点前后插入。Canvas 正文是可平移缩放的自由画布，可新建正文 `Block`，也可从左侧拖入文档或其他 Canvas。自由块复用文档的 Markdown、引用、待办、媒体、位置、数据库和样式数据结构；Canvas 另外支持 `draw` 手绘节点、可连接块四边中点的 `curve` Bezier 节点，以及统一的 `media` 媒体节点。手绘和曲线参与普通节点保存、删除、撤销/重做，曲线可拖动控制点并设置颜色、粗细、实线/虚线/点线；媒体可通过文件选择或拖拽插入，使用与正文相同的持久化媒体地址。正文块和媒体预览会在节点宽度内自动换行/适配。Canvas 节点仅增加稳定的空间布局参数，以及节点菜单管理的引用预览/Icon、Icon 字符和字体大小。文档以可调整大小的只读内容窗口显示，Canvas 可切换缩略图预览或固定圆角方形 Icon，双击或打开按钮进入源项目。Canvas 嵌套是跳转关系，不改目录层级，并阻止直接或间接循环。目录和画布数据目前都属于浏览器 Mock 的内存工作区快照，未扩展桌面 SQLite/原生工作区协议；刷新浏览器页面会按 fixture 重置。
 
 正文分列使用普通块共享列组，而不是单独的布局容器：同一行的根块在 `properties.columnGroup` 中保存相同组 ID，以 `properties.column` 保存零基列号，并用 `properties.columnWidths` 保存相对列宽；所有列块保持 `parentId=null`，同一列可按普通 `position` 排列多行。工具栏创建两列；拖到块左右边缘会在原位置新增列，拖到上下区域会在对应列或普通正文流中插入，拖出列组会恢复普通块，列间分隔线悬浮后可拖拽调宽，恢复按钮会移除列组属性并保留块。旧的 `properties.layout=columns` 容器快照在加载时迁移，不再写回；该信息仍属于现有块 `properties` JSON，不需要 SQLite 表迁移，历史快照会还原列归属与宽度。Markdown/HTML/CSS 仍可用于列内内容和样式，不能取代列结构。
 
@@ -195,7 +199,7 @@ flowchart LR
 
 当前内容/样式覆写主要按整份 `content/properties` 保存，不是字符级协作或任意字段自动三方合并。需要词级格式锁定、选择性同步时应另行设计，不能声称现有 patch 已完整实现。
 
-新版右栏日历只作为日记索引和普通双链插入入口：日记使用特殊“日记”笔记本及书签，月份文档命名为 `YYYY-M月`，日期内容保存为该文档中的普通 H1 及后续正文块。Todo 块的记录创建日期和目标完成日期保存在同一块的 `BlockProperties.todoCreatedAt/todoDueAt` 中，日历用蓝色/红色点标记，日记仍用绿色点；这些标记直接读取工作区待办数据，不创建第二套日历表。日历年份标签、日期预览和 `📅` 链接均复用现有工作区、块和 `[[...]]` 双链结构，不创建新的引用实例、数据库或正文存储。
+新版右栏日历只作为日记索引和普通双链插入入口：日记使用特殊“日记”笔记本及书签，月份文档命名为 `YYYY-M月`，日期内容保存为该文档中的普通 H1 及后续正文块。Todo 块的记录创建、目标完成和实际完成日期保存在同一块的 `BlockProperties.todoCreatedAt/todoDueAt/todoCompletedAt` 中，日历只在目标完成日显示状态点：未到期黄色、逾期未完成红色、已完成绿色，创建日期不单独显示；日记仍用绿色点。选中日期后，日历下方同时显示对应待办消息及三类日期；正文保留三类日期并显示提前完成绿色勾、逾期完成红色勾和逾期未完成红色感叹号。这些标记直接读取工作区待办数据，不创建第二套日历表。日历年份标签、日期预览和 `📅` 链接均复用现有工作区、块和 `[[...]]` 双链结构，不创建新的引用实例、数据库或正文存储。
 
 新版在同页源保存 ACK 后刷新引用；Mock 的 `documentChanged` 测试事件也可触发刷新。旧桌面宿主尚没有完整的跨窗口变更广播。引用内再嵌套新的引用目前有明确限制，链接仍可预览，不要当成无限递归引用已经实现。
 
@@ -259,11 +263,13 @@ Remove-Item Env:LOCAL_NOTES_MVP_DB
 
 `Program.cs` 为 WebView2 设置 `--disable-gpu --remote-debugging-port=9222`；前者来自黑屏兼容处理，后者便于连接真实页面。端口固定、多个实例可能冲突，连接后先确认页面属于哪个进程。优先使用页面元素/CDP 定位，不依赖屏幕坐标。
 
-基准 `46ecbc1` 对应 14 项新版浏览器测试；兼容套件定义 6 项。数量是历史基准，不是每次运行通过的保证。视觉改动需要打开截图检查，不能只生成图片不看。
+历史基准 `46ecbc1` 对应 14 项新版浏览器测试；当前新版套件为 185 项，最近一次运行是 180 通过、5 项旧契约失败。失败集中在已删除的“嵌入为实时引用”六点菜单和已收敛掉的正文普通块父子级要求，详见 [HANDOFF.md](HANDOFF.md)；兼容套件定义 6 项。数量是验证记录，不是每次运行通过的保证。视觉改动需要打开截图检查，不能只生成图片不看。
 
 Playwright 新版配置默认独占 4273 端口（可通过 EDITOR_TEST_PORT 更改），拒绝复用已有服务；4173 保留为开发服务。出现“代码改了没变化”先确认服务进程、工作目录、入口和旧 bundle。不要按端口盲杀用户服务，也不要关闭所有浏览器或 Node 进程。`--diagnostics` 会调用 `Load()`，可能创建默认库与初始化数据，不是无副作用的只读诊断。
 
 ## 9. 迁移缺口与后续路线
+
+路线的唯一维护入口是 [DEVELOPMENT_ROADMAP.md](DEVELOPMENT_ROADMAP.md)。本节保留当前边界摘要，避免把浏览器 Mock 的完成状态误写成桌面落地。
 
 | 顺序 | 建议工作 | 完成条件 |
 | --- | --- | --- |
@@ -281,6 +287,9 @@ Playwright 新版配置默认独占 4273 端口（可通过 EDITOR_TEST_PORT 更
 - 人工快速启动：[README.md](README.md)。
 - AI 工作约束：[AGENTS.md](AGENTS.md)；小写入口：[agent.md](agent.md)。
 - 协议细节：[protocol/protocol.md](protocol/protocol.md)。
+- 技术说明：[TECHNICAL_GUIDE.md](TECHNICAL_GUIDE.md)，只解释运行时边界、数据归属和扩展规则。
+- 开发线路：[DEVELOPMENT_ROADMAP.md](DEVELOPMENT_ROADMAP.md)，只维护交付状态和后续顺序。
+- 接手说明：[HANDOFF.md](HANDOFF.md)，只维护接手、验证、风险和交付前检查。
 - 历史基线：`aadbdf8` 为解耦与引用修复阶段快照，`46ecbc1` 为就地引用与预览交互提交。
 
 功能、构建入口、持久化语义或验收覆盖发生变化时，同步更新本文件和必要的协议说明。不要把路线图直接改写成“已实现”。
