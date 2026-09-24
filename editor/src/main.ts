@@ -79,6 +79,8 @@ const editor = mountEditor(host, {
   canvasUndo: () => void canvasManager?.undo(),
   canvasRedo: () => void canvasManager?.redo(),
   canvasStateChanged: (state, persist) => canvasManager?.applyEditorState(state, persist),
+  canvasInsertCalendarLink: (documentId, blockId, scope, label) => canvasManager?.insertCalendarLink(documentId, blockId, scope, label) ?? false,
+  canvasInsertLocationBlock: locationId => canvasManager?.insertLocationBlock(locationId) ?? false,
   surfaceStateChanged: (state, surface) => {
     // core also listens to documentLoaded for desktop compatibility. In the
     // browser entrypoint the main router owns Dashboard/Canvas switching, so a

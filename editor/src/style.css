@@ -1164,6 +1164,10 @@ body[data-workspace-mode="canvas"] .content .workspace { overflow: hidden; }
 .canvas-node-grip:active { cursor: grabbing; }
 .canvas-node-label { min-width: 0; flex: 1; overflow: hidden; color: #344054; font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .canvas-node-body { min-width: 0; min-height: 0; flex: 1; overflow: auto; padding: 12px 14px; color: #344054; font-size: 13px; line-height: 1.5; }
+.canvas-location-preview { display: grid; gap: 6px; padding: 10px; border: 1px solid #e4e7ec; border-radius: 6px; background: #f8fafc; }
+.canvas-location-preview strong { color: #344054; }
+.canvas-location-preview p, .canvas-location-preview small { margin: 0; color: #667085; }
+.canvas-location-preview small { color: #98a2b3; font-family: "Cascadia Code", Consolas, monospace; font-size: 10px; }
 .canvas-note-text { display: none; width: 100%; height: 100%; min-height: 0; resize: none; border: 0; outline: 0; background: transparent; color: #182230; font: 14px/1.55 Inter, "Segoe UI", sans-serif; }
 .canvas-note-editing .canvas-note-text { display: block; }
 .canvas-note-editing .canvas-note-preview { display: none; }

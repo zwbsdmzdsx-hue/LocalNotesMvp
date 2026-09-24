@@ -571,7 +571,11 @@ export class BrowserMockHost implements HostTransport {
       if (!node.id || ids.has(node.id)) throw new Error("Canvas 节点 ID 重复");
       ids.add(node.id);
       if (![node.x, node.y, node.width, node.height, node.zIndex].every(Number.isFinite)) throw new Error("Canvas 节点位置无效");
-      if (node.width < 80 || node.height < 64) throw new Error("Canvas 节点尺寸无效");
+      // Curves keep their bounds as a lightweight geometry envelope; legacy
+      // canvases may store a 1×1 envelope even though the rendered path is
+      // fully defined by its endpoints and control points. Enforce the card
+      // minimum only for nodes whose frame is user-visible.
+      if (node.kind !== "curve" && (node.width < 80 || node.height < 64)) throw new Error("Canvas 节点尺寸无效");
       if (node.kind === "block" && (!node.block || node.block.id !== node.id)) throw new Error("Canvas 正文块无效");
       if ((node.kind === "document" || node.kind === "canvas") && (!node.targetId || !this.titleByDocument.has(node.targetId))) throw new Error("Canvas 引用目标不存在");
       if (node.kind === "draw" && (!node.strokes?.length || node.strokes.some(stroke => stroke.points.length < 2))) throw new Error("Canvas 手绘内容无效");

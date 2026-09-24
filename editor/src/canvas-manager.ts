@@ -29,6 +29,8 @@ export type CanvasManager = {
   redo(): Promise<void>;
   restoreHistory(entryId: string): Promise<void>;
   applyEditorState(state: EditorState, persist?: boolean): void;
+  insertCalendarLink(targetDocumentId: string, targetBlockId?: string, targetScope?: "block" | "heading", label?: string): boolean;
+  insertLocationBlock(locationId: string): boolean;
 };
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
@@ -109,6 +111,9 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   let nodeMenuDismiss: ((event: PointerEvent) => void) | null = null;
   let iconPreviewPopup: HTMLElement | null = null;
   let iconPreviewTimer: ReturnType<typeof setTimeout> | null = null;
+  // The right rail takes focus when an insert action is clicked. Keep the last
+  // textarea selection so inserts still land at the user's Canvas caret.
+  let lastTextSelection: { nodeId: string; start: number; end: number } | null = null;
 
   function emitState() {
     if (!current || !catalog) return;
@@ -171,6 +176,86 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   }
 
   const item = (id: string | undefined) => workspace.snapshot().documents.find(entry => entry.id === id);
+
+  function displayedText(block: NonNullable<CanvasNode["block"]>) {
+    const source = block.content.markdown ?? block.content.text ?? "";
+    if (block.type === "heading") return source.replace(/^#{1,6}\s+/, "");
+    if (block.type === "todo") return source.replace(/^[-*+]\s+\[[ xX]\]\s+/, "");
+    return source;
+  }
+
+  function insertionNode() {
+    if (!current) return null;
+    const remembered = lastTextSelection && current.nodes.find(node => node.id === lastTextSelection!.nodeId && node.kind === "block" && node.block);
+    if (remembered) return remembered;
+    const selectedBlock = [...selected].map(id => current!.nodes.find(node => node.id === id)).find(node => node?.kind === "block" && node.block);
+    if (selectedBlock) return selectedBlock;
+    return current.nodes.find(node => node.kind === "block" && node.block) ?? null;
+  }
+
+  function rememberTextSelection(node: CanvasNode, textarea: HTMLTextAreaElement) {
+    if (!node.block) return;
+    lastTextSelection = { nodeId: node.id, start: textarea.selectionStart, end: textarea.selectionEnd };
+    if (!selected.has(node.id)) {
+      selected = new Set([node.id]);
+      callbacks.onActiveBlockChanged?.(node.block);
+    }
+  }
+
+  function insertCalendarLink(targetDocumentId: string, targetBlockId?: string, targetScope?: "block" | "heading", label = "日记") {
+    if (!current || !catalog) return false;
+    const target = catalog.documents.find(document => document.id === targetDocumentId);
+    if (!target) return false;
+    let node = insertionNode();
+    if (!node) {
+      const blockId = uid("canvas-block");
+      node = { id: blockId, kind: "block", x: nextPosition().x, y: nextPosition().y, width: 280, height: 180,
+        zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1,
+        block: { id: blockId, parentId: null, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), type: "paragraph", content: { text: "", html: "", markdown: "" }, properties: {}, revision: 1 } };
+      current.nodes.push(node);
+      selected = new Set([node.id]);
+    }
+    const block = node.block!;
+    const textarea = stage.querySelector<HTMLTextAreaElement>(`[data-node-id="${CSS.escape(node.id)}"] .canvas-note-text`);
+    const value = textarea?.value ?? displayedText(block);
+    const remembered = lastTextSelection?.nodeId === node.id ? lastTextSelection : null;
+    const start = Math.max(0, Math.min(value.length, remembered?.start ?? value.length));
+    const end = Math.max(start, Math.min(value.length, remembered?.end ?? start));
+    const notebook = target.notebookName ? `${target.notebookName}/` : "";
+    const sourceTarget = `${notebook}${target.title}${targetBlockId ? targetScope === "heading" ? `#${label}` : `#^${targetBlockId}` : ""}`;
+    const replacement = `[[${sourceTarget}|📅 ${label}]]`;
+    const nextValue = value.slice(0, start) + replacement + value.slice(end);
+    const prefix = block.type === "heading" ? `${"#".repeat(block.properties.headingLevel ?? 1)} ` : block.type === "todo" ? `- [${block.content.checked ? "x" : " "}] ` : "";
+    block.content = callbacks.contentFromMarkdown(`${prefix}${nextValue}`, block.content);
+    block.content.links = [...(block.content.links ?? []), { targetDocumentId, targetBlockId, targetScope, targetText: `${notebook}${target.title}`, alias: `📅 ${label}`, start, end: start + replacement.length }];
+    block.revision += 1;
+    lastTextSelection = { nodeId: node.id, start: start + replacement.length, end: start + replacement.length };
+    renderNodes();
+    callbacks.onActiveBlockChanged?.(block);
+    scheduleSave();
+    requestAnimationFrame(() => {
+      const nextTextarea = stage.querySelector<HTMLTextAreaElement>(`[data-node-id="${CSS.escape(node!.id)}"] .canvas-note-text`);
+      if (nextTextarea) { nextTextarea.focus(); nextTextarea.setSelectionRange(start + replacement.length, start + replacement.length); }
+    });
+    return true;
+  }
+
+  function insertLocationBlock(locationId: string) {
+    if (!current || !catalog?.locations?.some(location => location.id === locationId && !location.deletedAt)) return false;
+    const anchor = insertionNode();
+    const point = anchor ? { x: anchor.x + anchor.width + 36, y: anchor.y } : nextPosition();
+    const id = uid("canvas-location");
+    const block = { id, parentId: null, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), type: "location" as const,
+      content: { text: "", html: "", markdown: "" }, properties: { locationId }, revision: 1 };
+    current.nodes.push({ id, kind: "block", x: Math.round(point.x), y: Math.round(point.y), width: 320, height: 220,
+      zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, block });
+    selected = new Set([id]);
+    lastTextSelection = null;
+    renderNodes();
+    callbacks.onActiveBlockChanged?.(block);
+    scheduleSave();
+    return true;
+  }
 
   function closeSuggestions() {
     suggestionPopup?.remove();
@@ -534,7 +619,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   }
 
   function nodeLabel(node: CanvasNode, target?: WorkspaceDocument) {
-    if (node.kind === "block") return node.block?.type === "heading" ? "标题块" : node.block?.type === "todo" ? "待办块" : "正文块";
+    if (node.kind === "block") return node.block?.type === "heading" ? "标题块" : node.block?.type === "todo" ? "待办块" : node.block?.type === "location" ? "位置块" : "正文块";
     if (node.kind === "draw") return "手绘";
     if (node.kind === "curve") return "曲线";
     if (node.kind === "media") return node.media?.name || "媒体";
@@ -1089,6 +1174,19 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           if (targetDoc) callbacks.onOpenDocument(targetDoc.id, token?.targetBlockId);
         };
         body.append(icon);
+      } else if (node.kind === "block" && node.block?.type === "location") {
+        const location = catalog?.locations?.find(candidate => candidate.id === node.block!.properties.locationId);
+        const card = document.createElement("div");
+        card.className = "canvas-location-preview";
+        const heading = document.createElement("strong"); heading.textContent = location?.name ?? "位置已删除";
+        card.append(heading);
+        const address = document.createElement("p"); address.textContent = location?.address || "未填写地址"; card.append(address);
+        if (location) {
+          const coordinates = document.createElement("small");
+          coordinates.textContent = `${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`;
+          card.append(coordinates);
+        }
+        body.append(card);
       } else if (node.kind === "block" && node.block) {
         const textarea = document.createElement("textarea");
         textarea.className = "canvas-note-text";
@@ -1114,15 +1212,19 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           preview.hidden = body.classList.contains("canvas-note-editing");
           scheduleSave(450);
         };
+        const rememberCaret = () => rememberTextSelection(node, textarea);
         textarea.oninput = () => {
+          rememberCaret();
           syncPreview();
           if (!composing) { modePopup?.remove(); modePopup = null; showLinkSuggestions(textarea, node); }
         };
-        textarea.onfocus = () => { body.classList.add("canvas-note-editing"); preview.hidden = true; };
+        textarea.onfocus = () => { body.classList.add("canvas-note-editing"); preview.hidden = true; rememberCaret(); };
+        textarea.onkeyup = rememberCaret;
+        textarea.onselect = rememberCaret;
         textarea.onblur = () => { closeSuggestions(); body.classList.remove("canvas-note-editing"); preview.hidden = false; };
         textarea.addEventListener("compositionstart", () => { composing = true; closeSuggestions(); });
         textarea.addEventListener("compositionend", () => { composing = false; syncPreview(); showLinkSuggestions(textarea, node); });
-        textarea.addEventListener("click", () => showLinkSuggestions(textarea, node));
+        textarea.addEventListener("click", () => { rememberCaret(); showLinkSuggestions(textarea, node); });
         textarea.addEventListener("keydown", event => {
           if (event.isComposing || composing || event.keyCode === 229) return;
           if (event.key === "Escape") { event.preventDefault(); closeSuggestions(); modePopup?.remove(); modePopup = null; return; }
@@ -1725,6 +1827,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       refreshReferences();
     }).catch(callbacks.onError);
     selected.clear();
+    lastTextSelection = null;
     title.value = canvas.title;
     editor.hidden = true;
     view.hidden = false;
@@ -1743,11 +1846,12 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     }
     current = null;
     selected.clear();
+    lastTextSelection = null;
     library.hidden = true;
     view.hidden = true;
     editor.hidden = false;
     document.body.dataset.workspaceMode = "document";
   }
 
-  return { open, close, flush: async () => { await flush(); await referenceTail; await flush(); }, refreshReferences, undo: () => moveHistory("undo"), redo: () => moveHistory("redo"), restoreHistory, applyEditorState, isOpen: () => !view.hidden, activeId: () => current?.id ?? null };
+  return { open, close, flush: async () => { await flush(); await referenceTail; await flush(); }, refreshReferences, undo: () => moveHistory("undo"), redo: () => moveHistory("redo"), restoreHistory, applyEditorState, insertCalendarLink, insertLocationBlock, isOpen: () => !view.hidden, activeId: () => current?.id ?? null };
 }

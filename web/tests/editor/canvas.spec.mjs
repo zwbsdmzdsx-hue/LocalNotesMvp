@@ -242,3 +242,15 @@ test("Canvas accepts dropped media and persists a unified preview node", async (
   await expect(page.locator(".canvas-node-media img")).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "media")?.media?.name)).toBe("pixel.png");
 });
+
+test("editing a seeded Canvas with a legacy curve envelope saves and navigates", async ({ page }) => {
+  await page.locator(".bk-strip").filter({ hasText: "项目" }).click();
+  await page.locator('[data-document-id="canvas-roadmap"] > .doc-item').click();
+  await expect(page.locator(".canvas-view")).toBeVisible();
+  await page.locator(".canvas-node-block").first().getByRole("button", { name: "编辑块源码" }).click();
+  await page.locator(".canvas-note-text:visible").first().fill("更新路线图内容");
+  await expect(page.locator(".canvas-save-state")).toHaveText("已保存");
+  await page.locator(".bk-strip").filter({ hasText: "收集" }).click();
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  await expect(page.locator("#title")).toHaveValue("Alpha");
+});

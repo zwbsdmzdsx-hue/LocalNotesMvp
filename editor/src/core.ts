@@ -19,6 +19,8 @@ export function mountEditor(host: EditorHostApi, ui: {
   canvasUndo?(): void;
   canvasRedo?(): void;
   canvasStateChanged?(state: EditorState, persist: boolean): void;
+  canvasInsertCalendarLink?(targetDocumentId: string, targetBlockId?: string, targetScope?: ReferenceTargetScope, label?: string): boolean;
+  canvasInsertLocationBlock?(locationId: string): boolean;
   surfaceStateChanged?(state: EditorState, surface: SurfaceKind): void;
 } = {}) {
 const titleInput = document.querySelector<HTMLInputElement>("#title")!;
@@ -4327,6 +4329,10 @@ function insertInlineSuggestion(item: LinkSuggestion) {
 }
 
 function insertCalendarLink(targetDocumentId: string, targetBlockId?: string, targetScope?: ReferenceTargetScope, label = "日记") {
+  if (canvasContext) {
+    if (!ui.canvasInsertCalendarLink?.(targetDocumentId, targetBlockId, targetScope, label)) showError(new Error("请先在 Canvas 中选择一个内容块"));
+    return;
+  }
   if (editorMode === "preview") return;
   const editable = lastEditorCaret?.editable?.isConnected ? lastEditorCaret.editable : activeEditable;
   if (!editable) { saveStatus.textContent = "请先把光标放在正文中"; return; }
@@ -4385,6 +4391,10 @@ function addBlock(type: BlockType, options: { focusFirst?: boolean } = {}) {
 }
 
 function insertLocationBlock(locationId: string) {
+  if (canvasContext) {
+    if (!ui.canvasInsertLocationBlock?.(locationId)) showError(new Error("位置不存在或未选择 Canvas 内容块"));
+    return;
+  }
   if (editorMode === "preview" || !state) return;
   const location = state.locations?.find(item => item.id === locationId && !item.deletedAt);
   if (!location) { showError(new Error("位置不存在或已删除")); return; }
@@ -5426,6 +5436,28 @@ function clear() {
   saveStatus.textContent = "请选择或新建笔记";
 }
 async function createDiaryDocument(documentId: string, headingTitle: string) {
+  // A Canvas reuses the document-shaped state for its panels, but its layout
+  // owns persistence. Saving a diary heading through render()/enqueueDocumentSave
+  // here would therefore try to send the diary blocks to the active Canvas.
+  // Write the diary document directly while keeping the Canvas state mounted.
+  if (canvasContext) {
+    await flush();
+    const loaded = await host.loadDocument(documentId);
+    const exists = loaded.blocks.some(block => {
+      const source = markdownFromContent(block.content).split(/\r?\n/).find(value => value.trim()) ?? "";
+      return /^\s*#(?:[ \u3000]+|$)/.test(source) && source.replace(/^\s*#[ \u3000]*/, "").trim() === headingTitle;
+    });
+    if (!exists) {
+      const position = String((loaded.blocks.length + 1) * 1000).padStart(8, "0");
+      loaded.blocks.push({
+        id: newId(), parentId: null, position, type: "heading",
+        content: { text: headingTitle, html: `<h1>${escapeText(headingTitle)}</h1>`, markdown: `# ${headingTitle}` },
+        properties: { headingLevel: 1 }, revision: 1
+      });
+      await host.saveDocument({ documentId, mutationId: newId(), clientVersion: (loaded.note.clientVersion ?? 0) + 1, title: loaded.note.title, blocks: loaded.blocks });
+    }
+    return;
+  }
   await flush();
   const loaded = await host.loadDocument(documentId);
   const exists = loaded.blocks.some(block => {
