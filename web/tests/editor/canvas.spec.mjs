@@ -52,7 +52,7 @@ test("bookmark plus creates a Canvas with movable resizable cards and history", 
   expect(moved.x).toBeGreaterThan(before.x + 70);
   expect(moved.y).toBeGreaterThan(before.y + 40);
 
-  const handle = card.locator(".canvas-resize-handle");
+  const handle = card.locator(".canvas-resize-right");
   const handleBox = await handle.boundingBox();
   await page.mouse.move(handleBox.x + 5, handleBox.y + 5);
   await page.mouse.down();
@@ -81,7 +81,7 @@ test("documents can be dragged into a Canvas as resizable live previews", async 
   await expect(preview).toContainText("Beta 文档中的其他块");
 
   const before = await preview.boundingBox();
-  const handleBox = await preview.locator(".canvas-resize-handle").boundingBox();
+  const handleBox = await preview.locator(".canvas-resize-right").boundingBox();
   await page.mouse.move(handleBox.x + 4, handleBox.y + 4);
   await page.mouse.down();
   await page.mouse.move(handleBox.x + 75, handleBox.y + 55, { steps: 5 });
@@ -207,12 +207,16 @@ test("Canvas curves snap to block edge midpoints and expose Bezier styling", asy
   await expect(page.locator(".canvas-save-state")).toHaveText("请选择曲线终点");
   await blocks.nth(1).click();
   await expect(page.locator(".canvas-curve-style")).toBeVisible();
-  await page.locator(".canvas-curve-style select").selectOption("dashed");
+  await expect(page.locator('[data-panel="canvas-config"]')).toBeVisible();
+  await page.locator('.canvas-curve-style select[data-endpoint="start"]').selectOption("left");
+  await page.locator('.canvas-curve-style select[data-endpoint="end"]').selectOption("right");
+  await page.locator(".canvas-curve-style select:not([data-endpoint])").selectOption("dashed");
   await page.locator(".canvas-curve-style input[type=text]").fill("流程说明");
   await expect.poll(() => page.evaluate(() => {
     const canvas = window.mockHost.canvas(window.mockHost.current);
-    return canvas?.nodes.find(node => node.kind === "curve")?.curve?.dash;
-  })).toBe("dashed");
+    const curve = canvas?.nodes.find(node => node.kind === "curve")?.curve;
+    return { dash: curve?.dash, start: curve?.start.side, end: curve?.end.side };
+  })).toEqual({ dash: "dashed", start: "left", end: "right" });
   await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "curve")?.curve?.label)).toBe("流程说明");
   await expect(page.locator(".canvas-curve-label")).toHaveText("流程说明");
   await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.filter(node => node.kind === "curve").length)).toBe(1);

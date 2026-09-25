@@ -46,12 +46,6 @@ const shell = mountShell(workspace, {
   onOpenDocument: (id, blockId) => {
     navigate(() => host.openDocument(id, blockId));
   },
-  onOpenCanvas: id => {
-    navigate(() => host.openDocument(id));
-  },
-  onOpenDashboard: id => {
-    navigate(() => host.openDocument(id));
-  },
   onNavigateBack: () => {
     navigate(() => host.navigateBack());
   },
@@ -122,7 +116,8 @@ canvasManager = mountCanvasManager(workspace, {
   storeMedia: async file => host.storeMedia({ name: file.name, mimeType: file.type || "application/octet-stream", size: file.size, data: await fileToBase64(file) }).then(result => result.media),
   onStateChanged: state => editor.loadCanvas(state),
   onHistoryChanged: model => shell.updateHistory(model),
-  onActiveBlockChanged: block => editor.setCanvasActiveBlock(block)
+  onActiveBlockChanged: block => editor.setCanvasActiveBlock(block),
+  onObjectSelection: (selected, activate) => shell.setCanvasObjectContext(selected, activate)
 });
 dashboardManager = mountDashboardManager(host, workspace, {
   onOpenDocument: (id, blockId) => navigate(() => host.openDocument(id, blockId)),

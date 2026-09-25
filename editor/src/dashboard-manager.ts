@@ -11,6 +11,7 @@ export type DashboardWidgetKind =
 
 export type DashboardWidgetRenderer = {
   kind: DashboardWidgetKind;
+  icon?: string;
   render(state: EditorState, widget: Block): HTMLElement;
 };
 
@@ -25,13 +26,16 @@ type DashboardConfig = NonNullable<BlockProperties["dashboardWidget"]>;
 type DashboardSaveSnapshot = { documentId: string; title: string; blocks: Block[] };
 
 const uid = () => `dashboard-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
-const escapeText = (value: unknown) => String(value ?? "");
+const widgetIcons: Record<string, string> = {
+  metric: "∑", references: "↗", backlinks: "↙", overrides: "!", comments: "◌",
+  history: "↶", calendar: "▦", locations: "⌖", styles: "◧", databases: "▤"
+};
 
 function widgetConfig(block: Block): DashboardConfig | undefined {
   return block.properties.dashboardWidget as DashboardConfig | undefined;
 }
 
-function list(title: string, values: string[], empty = "暂无内容") {
+function list(values: string[], empty = "暂无内容") {
   const section = document.createElement("div");
   section.className = "dashboard-widget-list";
   if (!values.length) {
@@ -51,15 +55,15 @@ function countCard(label: string, count: number) {
 
 function defaultRenderers(): DashboardWidgetRenderer[] {
   return [
-    { kind: "references", render: state => list("references", state.references.map(ref => `${ref.targetTitle} · ${ref.mode}`)) },
-    { kind: "backlinks", render: state => list("backlinks", state.backlinks.map(link => `${link.sourceTitle} · ${link.excerpt}`)) },
+    { kind: "references", render: state => list(state.references.map(ref => `${ref.targetTitle} · ${ref.mode}`)) },
+    { kind: "backlinks", render: state => list(state.backlinks.map(link => `${link.sourceTitle} · ${link.excerpt}`)) },
     { kind: "overrides", render: state => countCard("条外部覆写通知", state.overrideNotices.length) },
     { kind: "comments", render: state => countCard("条正文注释", state.blocks.reduce((total, block) => total + (block.properties.comments?.length ?? 0), 0)) },
-    { kind: "history", render: state => list("history", (state.history?.entries ?? []).map(entry => `${entry.label} · ${entry.preview}`)) },
-    { kind: "calendar", render: state => list("calendar", state.blocks.filter(block => block.type === "todo").map(block => block.content.text || "未命名待办"), "当前文档没有待办") },
-    { kind: "locations", render: state => list("locations", (state.locations ?? []).filter(location => !location.deletedAt).map(location => `${location.name} · ${location.address}`)) },
-    { kind: "styles", render: state => list("styles", [...(state.systemStyles ?? []), ...(state.notebookStyles ?? []), ...(state.documentStyles ?? [])].map(style => `${style.title}${style.enabled ? "" : " · 已停用"}`)) },
-    { kind: "databases", render: state => list("databases", (state.databases ?? []).map(database => `${database.title} · ${database.recordCount} 条记录`)) }
+    { kind: "history", render: state => list((state.history?.entries ?? []).map(entry => `${entry.label} · ${entry.preview}`)) },
+    { kind: "calendar", render: state => list(state.blocks.filter(block => block.type === "todo").map(block => block.content.text || "未命名待办"), "当前文档没有待办") },
+    { kind: "locations", render: state => list((state.locations ?? []).filter(location => !location.deletedAt).map(location => `${location.name} · ${location.address}`)) },
+    { kind: "styles", render: state => list([...(state.systemStyles ?? []), ...(state.notebookStyles ?? []), ...(state.documentStyles ?? [])].map(style => `${style.title}${style.enabled ? "" : " · 已停用"}`)) },
+    { kind: "databases", render: state => list((state.databases ?? []).map(database => `${database.title} · ${database.recordCount} 条记录`)) }
   ];
 }
 
@@ -172,13 +176,16 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     if (config.style?.accent) card.style.borderColor = config.style.accent;
     if (config.style?.fontSize) card.style.setProperty("--dashboard-widget-font-size", `${config.style.fontSize}px`);
     const head = document.createElement("header"); head.className = "dashboard-widget-head";
+    const icon = document.createElement("span"); icon.className = "dashboard-widget-icon";
+    icon.textContent = rendererFor(config.kind)?.icon || widgetIcons[config.kind] || "◇";
+    icon.title = config.kind;
     const label = document.createElement("strong"); label.textContent = config.title || config.kind;
     const kind = document.createElement("small"); kind.textContent = config.kind;
     const controls = document.createElement("span"); controls.className = "dashboard-widget-controls";
     const smaller = document.createElement("button"); smaller.type = "button"; smaller.textContent = "−"; smaller.title = "缩小组件"; smaller.onclick = () => resize(block, -24, -16);
     const larger = document.createElement("button"); larger.type = "button"; larger.textContent = "+"; larger.title = "放大组件"; larger.onclick = () => resize(block, 24, 16);
     const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "×"; remove.title = "移除组件"; remove.onclick = () => { current!.blocks = current!.blocks.filter(item => item.id !== block.id); if (selectedWidgetId === block.id) selectWidget(null); render(); scheduleSave(); };
-    controls.append(smaller, larger, remove); head.append(label, kind, controls); card.append(head);
+    controls.append(smaller, larger, remove); head.append(icon, label, kind, controls); card.append(head);
     const body = document.createElement("div"); body.className = "dashboard-widget-body";
     const custom = rendererFor(config.kind);
     if (config.kind === "metric") body.append(renderQueryWidget(config));

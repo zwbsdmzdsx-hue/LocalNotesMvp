@@ -7,6 +7,10 @@ export type LinkSuggestion =
   | { kind: "document"; id: string; notebookId: string; notebookName: string; title: string; meta: string; preview?: string }
   | { kind: "target" | "heading"; id: string; blockId?: string; scope?: ReferenceTargetScope; title: string; meta: string; label: string; notebookName?: string; documentTitle?: string; preview?: string };
 
+export function blockWikiLink(notebook: string, title: string, blockId: string) {
+  return `[[${notebook}/${title}#^${blockId}]]`;
+}
+
 export function headingInfo(block: Block) {
   const source = markdownFromContent(block.content);
   const line = source.split(/\r?\n/).find(value => value.trim()) ?? "";

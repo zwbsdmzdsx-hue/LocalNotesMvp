@@ -1,4 +1,5 @@
 import type { WorkspaceApi, WorkspaceCommand, WorkspaceDocument, WorkspaceItemKind, CalendarTodo } from "./workspace-api";
+import { workspaceItemMeta } from "./workspace-item-meta";
 import type { HistoryModel } from "./history";
 import type { Block, EditorState } from "../../protocol/types";
 import type { PanelContext } from "./panel-context";
@@ -42,8 +43,6 @@ function saveLayout(layout: Layout) {
 
 export interface ShellCallbacks {
   onOpenDocument: (documentId: string, blockId?: string) => void;
-  onOpenCanvas: (canvasId: string) => void;
-  onOpenDashboard: (dashboardId: string) => void;
   onNavigateBack: () => void;
   onNavigateForward: () => void;
   onOpenSticky: () => void;
@@ -64,6 +63,7 @@ export interface ShellApi {
   showHistory(): void;
   setDatabaseContext(visible: boolean, activate?: boolean): void;
   setDashboardWidgetContext(visible: boolean, activate?: boolean): void;
+  setCanvasObjectContext(visible: boolean, activate?: boolean): void;
   updateHistory(model: HistoryModel): void;
   setPanelContext(context: PanelContext | null): void;
 }
@@ -106,6 +106,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
   const layout = loadLayout();
   let databaseContextVisible = false;
   let dashboardWidgetContextVisible = false;
+  let canvasObjectContextVisible = false;
   let panelContext: PanelContext | null = null;
   let rightTabBeforeDatabase = layout.rightActiveTab === "databases" ? "reference-sidebar" : layout.rightActiveTab;
   function execute(command: WorkspaceCommand) {
@@ -144,6 +145,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       { tab: "locations", label: "地图管理", slot: "locations" },
       { tab: "styles", label: "CSS 管理", slot: "styles" },
       { tab: "databases", label: "数据表属性", slot: "databases" },
+      { tab: "canvas-config", label: "对象设置", slot: "canvas-config" },
       { tab: "dashboard-config", label: "组件设置", slot: "dashboard-config" }
     ];
     for (const s of sections) {
@@ -166,11 +168,13 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     let active = tab ?? layout.rightActiveTab;
     if (active === "databases" && !databaseContextVisible) active = rightTabBeforeDatabase || "reference-sidebar";
     if (active === "dashboard-config" && !dashboardWidgetContextVisible) active = "reference-sidebar";
+    if (active === "canvas-config" && !canvasObjectContextVisible) active = "reference-sidebar";
     if (active !== "databases") rightTabBeforeDatabase = active;
     layout.rightActiveTab = active;
     sidebarRight.querySelectorAll<HTMLElement>("[data-pane-btn]").forEach((b) => {
       if (b.dataset.paneBtn === "databases") b.hidden = !databaseContextVisible;
       if (b.dataset.paneBtn === "dashboard-config") b.hidden = !dashboardWidgetContextVisible;
+      if (b.dataset.paneBtn === "canvas-config") b.hidden = !canvasObjectContextVisible;
       b.classList.toggle("active", b.dataset.paneBtn === active);
     });
     // Only top-level panel sections (direct children of sidebarRightBody), not inner reference cards.
@@ -199,6 +203,14 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       if (layout.rightCollapsed) { layout.rightCollapsed = false; applyWidths(); }
       applyRightTab("dashboard-config");
     } else applyRightTab(!visible && layout.rightActiveTab === "dashboard-config" ? "reference-sidebar" : undefined);
+  }
+
+  function setCanvasObjectContext(visible: boolean, activate = false) {
+    canvasObjectContextVisible = visible;
+    if (visible && activate) {
+      if (layout.rightCollapsed) { layout.rightCollapsed = false; applyWidths(); }
+      applyRightTab("canvas-config");
+    } else applyRightTab(!visible && layout.rightActiveTab === "canvas-config" ? "reference-sidebar" : undefined);
   }
 
   // ── Left sidebar top tabs (docs / search / outline) ────────────────
@@ -426,9 +438,9 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       btn.draggable = true;
       btn.style.setProperty("--doc-depth", String(depth));
       const count = descendantCount(doc.id, snap.documents);
-      const itemIcon = doc.kind === "canvas" ? "◇" : doc.kind === "dashboard" ? "▦" : "&#128196;";
-      btn.innerHTML = `<span class="list-icon${doc.kind === "canvas" ? " canvas-item-icon" : doc.kind === "dashboard" ? " dashboard-item-icon" : ""}">${itemIcon}</span><span class="list-label">${escapeHtml(doc.title)}</span>${count ? `<span class="doc-count">${count}</span>` : ""}`;
-      btn.onclick = () => doc.kind === "canvas" ? cb.onOpenCanvas(doc.id) : doc.kind === "dashboard" ? cb.onOpenDashboard(doc.id) : cb.onOpenDocument(doc.id);
+      const presentation = workspaceItemMeta[doc.kind];
+      btn.innerHTML = `<span class="list-icon${presentation.iconClass}">${presentation.icon}</span><span class="list-label">${escapeHtml(doc.title)}</span>${count ? `<span class="doc-count">${count}</span>` : ""}`;
+      btn.onclick = () => cb.onOpenDocument(doc.id);
       btn.oncontextmenu = (e) => { e.preventDefault(); showDocumentMenu(btn, doc); };
       btn.addEventListener("dragstart", event => {
         event.stopPropagation();
@@ -523,7 +535,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       };
       strip.oncontextmenu = (e) => {
         e.preventDefault();
-        showBookmarkMenu(strip, bk.id, bk.name, bk.color);
+        showBookmarkMenu(strip, bk.id, bk.name);
       };
       strip.addEventListener("dragstart", event => { event.dataTransfer?.setData("text/x-bookmark-id", bk.id); if (event.dataTransfer) event.dataTransfer.effectAllowed = "move"; strip.classList.add("is-dragging"); });
       strip.addEventListener("dragend", () => strip.classList.remove("is-dragging"));
@@ -1161,7 +1173,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     if (!confirm(`删除笔记本「${nb.name}」？其书签会归入第一个保留的笔记本。`)) return;
     execute({ type: "removeNotebook", id });
   }
-  function showBookmarkMenu(anchor: HTMLElement, id: string, name: string, color: string) {
+  function showBookmarkMenu(anchor: HTMLElement, id: string, name: string) {
     showContextMenu(anchor, [
       { label: "重命名", run: () => {
           const newName = prompt("重命名书签：", name);
@@ -1226,14 +1238,12 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     execute({ type: "createBookmark", bookmark: { id, notebookId: snap.activeNotebookId, name: name.trim(), color } });
   }
   function createDocument(bookmarkId: string, kind: WorkspaceItemKind = "document") {
-    const defaults = kind === "canvas" ? ["Canvas 名称：", "未命名 Canvas", "canvas"]
-      : kind === "dashboard" ? ["Dashboard 名称：", "工作台 Dashboard", "dashboard"]
-      : ["文档名称：", "未命名文档", "doc"];
-    const title = prompt(defaults[0], defaults[1]);
+    const presentation = workspaceItemMeta[kind];
+    const title = prompt(presentation.createPrompt, presentation.defaultTitle);
     if (!title?.trim()) return;
-    const id = `${defaults[2]}-${uid()}`;
+    const id = `${presentation.idPrefix}-${uid()}`;
     void execute({ type: "createDocument", document: { id, title: title.trim(), kind }, bookmarkId, parentId: null })
-      .then(() => kind === "canvas" ? cb.onOpenCanvas(id) : kind === "dashboard" ? cb.onOpenDashboard(id) : cb.onOpenDocument(id));
+      .then(() => cb.onOpenDocument(id));
   }
   function showWorkspaceCreateMenu(anchor: HTMLElement, bookmarkId: string) {
     document.querySelector(".workspace-create-menu")?.remove();
@@ -1279,6 +1289,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     showHistory,
     setDatabaseContext,
     setDashboardWidgetContext,
+    setCanvasObjectContext,
     updateHistory,
     setPanelContext,
     renderAll,
@@ -1292,6 +1303,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     showHistory,
     setDatabaseContext,
     setDashboardWidgetContext,
+    setCanvasObjectContext,
     updateHistory,
     setPanelContext,
     highlightActiveDocument: (id: string) => renderAll(id)

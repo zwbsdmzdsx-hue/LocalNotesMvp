@@ -5,12 +5,7 @@ export type Notebook = { id: string; name: string };
 export type Bookmark = { id: string; notebookId: string; name: string; color: string };
 export type WorkspaceItemKind = "document" | "canvas" | "dashboard";
 export type WorkspaceDocument = { id: string; title: string; bookmarkId: string; parentId: string | null; position: number; kind: WorkspaceItemKind };
-/**
- * Canvas uses the same Block model as a document for free-form content.
- * `text` remains a read-only compatibility value for canvases created by
- * older builds and is normalized at the workspace boundary.
- */
-export type CanvasNodeKind = "block" | "document" | "canvas" | "text" | "draw" | "curve" | "media";
+export type CanvasNodeKind = "block" | "document" | "canvas" | "draw" | "curve" | "media";
 export type CanvasPoint = { x: number; y: number };
 export type CanvasStroke = { points: CanvasPoint[]; color: string; width: number };
 export type CanvasCurveEndpoint = { nodeId: string; side: "top" | "right" | "bottom" | "left" };
@@ -35,6 +30,7 @@ export type CanvasReferenceDisplay = "preview" | "icon";
 export type CanvasNode = {
   id: string;
   kind: CanvasNodeKind;
+  name?: string;
   x: number;
   y: number;
   width: number;
@@ -42,8 +38,6 @@ export type CanvasNode = {
   zIndex: number;
   /** Canonical content for a free-form Canvas node. */
   block?: Block;
-  /** @deprecated Legacy Canvas payload. Read only; never written by new code. */
-  content?: string;
   targetId?: string;
   displayMode?: CanvasDisplayMode;
   /** Display preference for a Block-backed node that contains wiki links. */
@@ -54,29 +48,34 @@ export type CanvasNode = {
   fontSize?: number;
   strokes?: CanvasStroke[];
   curve?: CanvasCurve;
-  /** @deprecated Legacy media payload; normalized into block.content.media on load. */
-  media?: MediaAsset;
-  /** @deprecated Legacy caption; normalized into block.content.caption on load. */
-  caption?: string;
 };
 
-export function normalizeCanvasNode(node: CanvasNode, index = 0): CanvasNode {
+export type LegacyCanvasNode = Omit<CanvasNode, "kind"> & {
+  kind: "text" | "block" | "media";
+  content?: string;
+  media?: MediaAsset;
+  caption?: string;
+};
+export type CanvasNodeInput = CanvasNode | LegacyCanvasNode;
+
+export function normalizeCanvasNode(node: CanvasNodeInput, index = 0): CanvasNode {
+  const legacy = node as LegacyCanvasNode;
   if (node.kind === "media") {
-    const media = node.block?.content.media ?? node.media;
+    const media = node.block?.content.media ?? legacy.media;
     const block = node.block
-      ? { ...structuredClone(node.block), content: { ...structuredClone(node.block.content), media, caption: node.block.content.caption ?? node.caption } }
-      : media ? createBlock({ id: node.id, type: "media", position: String((index + 1) * 1000).padStart(8, "0"), content: { media, caption: node.caption } }) : undefined;
-    const { media: _legacyMedia, caption: _legacyCaption, ...layout } = structuredClone(node);
-    return { ...layout, block };
+      ? { ...structuredClone(node.block), content: { ...structuredClone(node.block.content), media, caption: node.block.content.caption ?? legacy.caption } }
+      : media ? createBlock({ id: node.id, type: "media", position: String((index + 1) * 1000).padStart(8, "0"), content: { media, caption: legacy.caption } }) : undefined;
+    const { content: _legacyContent, media: _legacyMedia, caption: _legacyCaption, ...layout } = structuredClone(legacy);
+    return { ...layout, kind: "media", block };
   }
-  if (node.kind !== "text" && node.kind !== "block") return structuredClone(node);
-  const legacyText = node.content ?? node.block?.content.text ?? "";
+  if (node.kind !== "text" && node.kind !== "block") return structuredClone(node) as CanvasNode;
+  const legacyText = legacy.content ?? node.block?.content.text ?? "";
   const block = node.block ?? createBlock({ id: node.id, position: String((index + 1) * 1000).padStart(8, "0"), content: { text: legacyText, html: legacyText, markdown: legacyText } });
-  const { content: _legacyContent, ...layout } = structuredClone(node);
+  const { content: _legacyContent, media: _legacyMedia, caption: _legacyCaption, ...layout } = structuredClone(legacy);
   return { ...layout, kind: "block", block };
 }
 
-export function normalizeCanvasNodes(nodes: CanvasNode[]): CanvasNode[] {
+export function normalizeCanvasNodes(nodes: readonly CanvasNodeInput[]): CanvasNode[] {
   return nodes.map((node, index) => normalizeCanvasNode(node, index));
 }
 export type CanvasViewport = { x: number; y: number; zoom: number };

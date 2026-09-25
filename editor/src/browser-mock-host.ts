@@ -3,7 +3,7 @@ import { EditorHistory } from "./history";
 import { orderBlockTree } from "./block-tree";
 import { normalizeCanvasNodes } from "./workspace-api";
 import { createBlock, createDocumentState } from "./document-model";
-import type { Notebook, Bookmark, WorkspaceDocument, WorkspaceSnapshot, SearchHit, CalendarTodo, CanvasDocument, CanvasNode, CanvasViewport, WorkspaceItemKind } from "./workspace-api";
+import type { Notebook, Bookmark, WorkspaceDocument, WorkspaceSnapshot, SearchHit, CalendarTodo, CanvasDocument, CanvasNode, CanvasNodeInput, CanvasViewport, WorkspaceItemKind } from "./workspace-api";
 import type { HostTransport } from "./editor-host-api";
 import { MockSaveStore } from "./mock-save-store";
 import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, StyleScope, MediaKind, DatabaseSource, DatabaseField, DatabaseRecord, GeoLocation, HistoryModel } from "../../protocol/types";
@@ -273,7 +273,7 @@ export class BrowserMockHost implements HostTransport {
     const now = new Date().toISOString();
     this.locations.set("loc-demo-studio", { id: "loc-demo-studio", scope: "notebook", notebookId: "nb-research", name: "演示工作室", address: "广东省广州市越秀区示例路 18 号", latitude: 23.1295, longitude: 113.2648, source: "map", precision: "street", createdAt: now, updatedAt: now });
 
-    const makeCanvas = (id: string, title: string, bookmarkId: string, nodes: CanvasNode[]) => {
+    const makeCanvas = (id: string, title: string, bookmarkId: string, nodes: CanvasNodeInput[]) => {
       this.createCanvas(title, id, bookmarkId);
       const canvas = this.canvases.get(id)!;
       canvas.nodes = normalizeCanvasNodes(nodes);

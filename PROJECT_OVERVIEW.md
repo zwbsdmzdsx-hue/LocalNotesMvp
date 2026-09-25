@@ -44,8 +44,9 @@ flowchart LR
 - **数据库块**：`data_sources/data_fields/data_records/data_values` 是数据唯一来源；正文块只保存 `properties.databaseId`，视图配置由 `databaseViews` 按数据库 ID 关联。旧 `databaseViewId` 只为兼容读取保留，新代码不得写入。
 - **地理位置**：位置目录是 `GeoLocation` 的唯一事实来源，支持全局和笔记本 scope；正文 `type="location"` 块只保存 `properties.locationId` 与可选显示名称覆盖，地图管理负责坐标、地址和来源更新。
 - **Canvas**：工作区项目以唯一 `kind=document|canvas|dashboard` 区分；Canvas 内的文档和 Canvas 节点只保存稳定目标 ID 与几何信息，是打开关系，不修改左侧目录 `parentId`。Canvas 的自由内容与媒体节点使用与正文相同的 `Block`（旧版 `text/content` 和媒体节点字段只在工作区边界兼容迁移），Canvas 只额外保存位置、尺寸、层级、引用显示偏好/自定义 Icon 和节点字号。Canvas 文档预览沿用正文标题层级折叠，曲线支持中点描述和 Icon 悬浮预览。嵌套引用建立时必须拒绝直接和间接循环。
+- **Canvas 标题卡**：标题卡的根块为 H1；卡内每段是独立的 `CanvasNode` 和 `Block`，`Block.parentId` 指向根块，按 `position` 排序。卡内输入 `#` 记为 H2，依次递增至 H6。子块保留独立 ID、引用与右栏索引，根块删除时级联删除子块。旧版多行标题卡打开时拆分并经 Canvas 保存队列写回。Canvas 节点名称保存在 `CanvasNode.name`，各类型显示固定图标；Dashboard 组件标题仍由 `dashboardWidget.title` 保存，类型图标由组件注册表或内置映射提供。
 - **Dashboard**：新版浏览器支持与文档、Canvas 平行的 `kind=dashboard` 工作区项目。Dashboard 使用专用视图；每个组件是 `Block.type="dashboard_widget"`，在 `properties.dashboardWidget` 中保存稳定组件实例 ID、组件类型、数据作用域、查询配置、描述、样式和布局，不保存渲染结果。组件通过 `DashboardWidgetRenderer` 注册表读取当前 `EditorState`，标题、移动、缩放、删除和新增均通过现有 `saveDocument` 版本/幂等保存路径完成。内置文档、关键字、待办、位置和数据表指标，可按字段筛选、条件表达式、分类及计数/求和/平均/最小/最大/去重汇总；公式沿用数据表表达式求值器。选中组件后在右栏配置来源、尺寸、坐标和样式。另有引用、反向链接、覆写、注释、历史、日历、位置、样式和数据库摘要组件。地图管理右栏通过 MapLibre 和 OpenFreeMap 在线矢量瓦片显示当前范围的位置标记；单点编辑地图仍用 Leaflet。Mock 仍是内存实现，未接入桌面 SQLite。
-- **文档创建与保存收敛**：左侧目录的三种项目统一通过 `WorkspaceApi.createDocument` 携带 `kind` 创建；`editor/src/document-model.ts` 为正文、Canvas、Dashboard 和 Mock 提供普通数据对象的块及文档初始快照工厂。Canvas 与 Dashboard 共用 `DocumentSaveSession` 的排队、等待 ACK、失败保留和 flush 规则，但仍分别调用现有 `saveCanvas` 与 `saveDocument`；正文保存队列与 Canvas 的视图数据/历史尚未迁入同一底层协议。这是浏览器阶段的共用逻辑，不表示桌面 SQLite 已接入 Canvas。
+- **文档创建与保存收敛**：左侧目录的三种项目统一通过 `WorkspaceApi.createDocument` 携带 `kind` 创建，目录图标与创建默认值由 `workspace-item-meta.ts` 定义；`editor/src/document-model.ts` 为正文、Canvas、Dashboard 和 Mock 提供普通数据对象的块及文档初始快照工厂。正文、Canvas、Dashboard 共用 `DocumentSaveSession` 的快照合并、串行保存、失败保留和 flush 规则。正文与 Dashboard 的适配器仍分别处理 `saveDocument` 版本、历史和界面 ACK；Canvas 使用 `saveCanvas` 的几何与画布历史协议。旧 Canvas 文本/媒体字段只在 `normalizeCanvasNode` 输入边界读取，运行时节点使用规范 `Block`。这些是新版浏览器阶段的共用逻辑，不表示桌面 SQLite 已接入 Canvas。
 - **右栏共享上下文**：`editor/src/panel-context.ts` 统一描述当前正文、Canvas 或 Dashboard 的面板数据来源。Canvas 和正文的乐观块快照会在保存等待期间先进入右栏；Dashboard 组件按 `activeDocument`、指定文档、笔记本或工作区作用域读取已载入的源状态，保存 ACK 后再由宿主快照校正。
 - **链接与引用**：默认新建关联统一使用正文 `[[笔记本/文档/块#^块ID]]` 双链。六点菜单只复制这个稳定链接；用户在右栏普通双链条目中明确选择显示方式时，才把该链接升级为同一宿主块下的 `reference_instance`。已有 `reference_instances` 仍可展示、切换模式和编辑兼容内容。
 - **作用域实现**：`editor/` 是当前新版网页入口，`web/` 是桌面兼容入口；两者不是同一运行时。新版先在 `BrowserMockHost` 验证交互，不能把 Mock 当成 SQLite 持久化实现，也不能为同一功能在两端各自发明一套模型。
@@ -66,9 +67,10 @@ Canvas 引用修复：新版 Canvas 的自由块在 Mock 文档索引中暴露�
 | [editor/src/editor-host-api.ts](editor/src/editor-host-api.ts) | 请求 ID、响应匹配、Promise、10 秒超时、宿主事件订阅 |
 | [editor/src/workspace-api.ts](editor/src/workspace-api.ts) | 侧栏只依赖类型化的快照、搜索、大纲和异步命令接口，不直接读写 Mock 或编辑器 DOM |
 | [editor/src/document-model.ts](editor/src/document-model.ts) | 新版网页共用的块与文档初始快照工厂；返回可序列化的普通对象 |
-| [editor/src/document-session.ts](editor/src/document-session.ts) | Canvas 与 Dashboard 共用的串行保存、草稿保留和 flush 会话类 |
+| [editor/src/document-session.ts](editor/src/document-session.ts) | 正文、Canvas 与 Dashboard 共用的串行保存、草稿保留和 flush 会话类 |
 | [editor/src/browser-workspace.ts](editor/src/browser-workspace.ts) | 浏览器工作区适配；命令串行执行，等待编辑保存后修改数据，重命名/删除后同步当前编辑器。原生工作区适配尚未接入 |
 | [editor/src/canvas-manager.ts](editor/src/canvas-manager.ts) | 新版无限画布视图；负责平移缩放、自由卡片、文档/Canvas 引用、节点六点菜单、字号与引用 Icon、移动缩放、预览/Icon 模式和画布历史交互 |
+| [editor/src/media-source.ts](editor/src/media-source.ts) | 新版网页共用的网络媒体地址识别与拖拽/剪贴板来源读取；Canvas 和正文都生成同一种媒体资产 |
 | [editor/src/dashboard-manager.ts](editor/src/dashboard-manager.ts) | 新版 Dashboard 视图；负责 `dashboard_widget` 容器块、组件注册表、布局拖动/缩放、右栏能力摘要渲染和保存适配 |
 | [editor/src/mock-save-store.ts](editor/src/mock-save-store.ts) | Mock 保存幂等记录、版本规则和完整快照校验 |
 | [editor/src/block-content.ts](editor/src/block-content.ts) | 正文序列化与 HTML 清理；剥离引用投影、保留空锚点 |
@@ -156,7 +158,7 @@ Canvas 引用修复：新版 Canvas 的自由块在 Mock 文档索引中暴露�
 
 新版浏览器编辑器提供“编辑 / 源码 / 预览”三态。编辑态保留现有富文本与引用操作；源码态编辑逐块 Markdown 原文；预览态只读渲染 GFM 标题、强调、删除线、引用、列表、代码、表格及普通链接，并禁用正文结构操作。模式切换会先排空保存队列，正文的 `content_json` 同时保留无损 `markdown`、经 DOMPurify 清理的 `html`、搜索用 `text` 和稳定双链 `links`。旧块没有 `markdown` 时从已有安全 HTML 转换，不修改 SQLite 表结构。该三态目前只接入 4173 的新版编辑器，桌面 EXE 默认加载的兼容编辑器仍是独立入口。
 
-新版 4173 侧栏的书签支持拖拽重排，书签右侧悬浮“+”可选择创建文档或 Canvas；两类项目都可在目录中拖到其他项目下形成最多三层的树，并显示全部后代数量。文档拖到其他笔记本标签或书签会迁移目录归属。正文块可跨文档拖入目标正文、目标文档或目标笔记本；落点会询问创建实时引用还是复制一份独立块，并按落点前后插入。Canvas 正文是可平移缩放的自由画布，可新建正文 `Block`，也可从左侧拖入文档或其他 Canvas。自由块复用文档的 Markdown、引用、待办、媒体、位置、数据库和样式数据结构；Canvas 另外支持 `draw` 手绘节点、可连接块四边中点的 `curve` Bezier 节点，以及统一的 `media` 媒体节点。手绘和曲线参与普通节点保存、删除、撤销/重做，曲线支持箭头、可插入控制点和分支端点，可拖动这些控制点并设置颜色、粗细、实线/虚线/点线；媒体可通过文件选择、拖拽或网络地址插入，引用文档中的媒体沿用同一套预览。正文块和媒体预览会在节点宽度内自动换行/适配。Canvas 节点仅增加稳定的空间布局参数，以及节点菜单管理的引用预览/Icon、Icon 字符和自定义 Icon 文件、字体大小。文档以可调整大小的只读内容窗口显示，Canvas 可切换缩略图预览或固定圆角方形 Icon，双击或打开按钮进入源项目。Canvas 嵌套是跳转关系，不改目录层级，并阻止直接或间接循环。目录和画布数据目前都属于浏览器 Mock 的内存工作区快照，未扩展桌面 SQLite/原生工作区协议；刷新浏览器页面会按 fixture 重置。
+新版 4173 侧栏的书签支持拖拽重排，书签右侧悬浮“+”可选择创建文档或 Canvas；两类项目都可在目录中拖到其他项目下形成最多三层的树，并显示全部后代数量。文档拖到其他笔记本标签或书签会迁移目录归属。正文块可跨文档拖入目标正文、目标文档或目标笔记本；落点会询问创建实时引用还是复制一份独立块，并按落点前后插入。Canvas 正文是可平移缩放的自由画布，可新建正文 `Block`，也可从左侧拖入文档或其他 Canvas。自由块复用文档的 Markdown、引用、待办、媒体、位置、数据库和样式数据结构；Canvas 另外支持 `draw` 手绘节点、可连接块四边中点的 `curve` Bezier 节点，以及统一的 `media` 媒体节点。手绘和曲线参与普通节点保存、删除、撤销/重做；选中曲线后在右栏调整两端连接侧、箭头、控制点、分支、颜色、粗细与线型。Canvas 块的名称、位置、尺寸、字号、显示方式和自定义图标也可在右栏设置；画布标题头和边框用于移动，尺寸从左下或右下角拖动。媒体可通过文件选择、拖拽、粘贴或网络地址插入，拖进画布时视窗边缘高亮，引用文档中的媒体沿用同一套预览。正文块和媒体预览会在节点宽度内自动换行/适配。文档以可调整大小的只读内容窗口显示，Canvas 可切换缩略图预览或固定圆角方形 Icon，双击或打开按钮进入源项目。Canvas 嵌套是跳转关系，不改目录层级，并阻止直接或间接循环。目录和画布数据目前都属于浏览器 Mock 的内存工作区快照，未扩展桌面 SQLite/原生工作区协议；刷新浏览器页面会按 fixture 重置。
 
 正文分列使用普通块共享列组，而不是单独的布局容器：同一行的根块在 `properties.columnGroup` 中保存相同组 ID，以 `properties.column` 保存零基列号，并用 `properties.columnWidths` 保存相对列宽；所有列块保持 `parentId=null`，同一列可按普通 `position` 排列多行。工具栏创建两列；拖到块左右边缘会在原位置新增列，拖到上下区域会在对应列或普通正文流中插入，拖出列组会恢复普通块，列间分隔线悬浮后可拖拽调宽，恢复按钮会移除列组属性并保留块。旧的 `properties.layout=columns` 容器快照在加载时迁移，不再写回；该信息仍属于现有块 `properties` JSON，不需要 SQLite 表迁移，历史快照会还原列归属与宽度。Markdown/HTML/CSS 仍可用于列内内容和样式，不能取代列结构。
 
@@ -166,7 +168,7 @@ Canvas 引用修复：新版 Canvas 的自由块在 Mock 文档索引中暴露�
 
 新版编辑器的数据库面板管理笔记本级字段和公式，并提供受限 DQL 查询、分组排序、查询结果刷新以及 Markdown/CSV 导出。表内可以新增/删除行列，列头菜单以小图标区分文本、数值、网页链接、多媒体、公式、规则、关系和汇总字段。公式与规则在编辑模式先显示结果，点击单元格才进入表达式源码；预览模式只显示结果。`database_table` 块保存数据库绑定，`data_view` 块只保存 DQL 声明；声明源码可往返编辑，解析失败不会覆盖已保存的字段定义。数据库记录和字段修改进入文档历史快照，撤销/重做会恢复对应结构化数据。
 
-新版编辑器支持统一的 `media` 块。图片、视频、音频、PDF 和普通文件可通过工具栏文件选择器、拖放或剪贴板插入；所有入口都调用 `storeMedia`，将内容复制到数据库旁的 `media` 目录并返回持久 `file:///` 地址，地址随普通 `saveDocument` 块快照保存。浏览器 Mock 使用内存 data URL。媒体共用统一预览组件，支持可编辑 caption、块对齐和图片拖拽尺寸调整；PDF 使用内嵌阅读器，普通文件提供下载链接，源码/预览模式不会把媒体块降级为文本。Canvas 也可直接保存 `http(s)` 媒体地址，文档引用预览会渲染对应的媒体元素。
+新版编辑器支持统一的 `media` 块。图片、视频、音频、PDF 和普通文件可通过工具栏文件选择器、拖放或剪贴板插入；本地文件调用 `storeMedia`，浏览器 Mock 使用内存 data URL。网络媒体地址直接记录 `http(s)` URL，不上传文件。正文拖入媒体时按目标块的上、下、左、右区域显示蓝线，上下调整块顺序，左右建立或扩展列组；本地文件与网络地址共享这套落点。媒体共用统一预览组件，支持可编辑 caption、块对齐和图片拖拽尺寸调整；PDF 使用内嵌阅读器，普通文件提供下载链接，源码/预览模式不会把媒体块降级为文本。新版网页的这些媒体交互尚未同步到桌面兼容入口与 SQLite 验收。
 
 链接绑定稳定文档/块 ID，显示标题不承担身份。重命名不能改变目标。同名文档的路径信息由仓储目录提供；新版联想当前仍主要筛选文档标题与当前文档块，完整跨工作区/跨文档块搜索尚未完成。
 

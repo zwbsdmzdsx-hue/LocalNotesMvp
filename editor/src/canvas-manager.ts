@@ -1,8 +1,9 @@
-import type { CanvasCurve, CanvasDocument, CanvasNode, CanvasPoint, CanvasStroke, WorkspaceApi, WorkspaceDocument } from "./workspace-api";
-import { markdownFromContent, renderMarkdown } from "./markdown";
+import type { CanvasCurve, CanvasDocument, CanvasNode, CanvasPoint, WorkspaceApi, WorkspaceDocument } from "./workspace-api";
+import { markdownFromContent, renderMarkdown, updateWikiLinkAlias } from "./markdown";
 import { createBlock } from "./document-model";
 import { DocumentSaveSession } from "./document-session";
-import { queryLinkSuggestions, headingInfo, type LinkSuggestion } from "./link-suggestions";
+import { hasMediaTransfer, mediaFromTransfer, mediaFromUrl } from "./media-source";
+import { blockWikiLink, queryLinkSuggestions, headingInfo, type LinkSuggestion } from "./link-suggestions";
 import type { BlockContent, EditorCommand, EditorState, LinkToken, ReferenceInstance, ReferenceMode, MediaAsset } from "../../protocol/types";
 
 type CanvasCallbacks = {
@@ -18,6 +19,7 @@ type CanvasCallbacks = {
   onStateChanged?(state: EditorState): void;
   onHistoryChanged?(model: NonNullable<CanvasDocument["history"]>): void;
   onActiveBlockChanged?(block?: import("../../protocol/types").Block): void;
+  onObjectSelection?(selected: boolean, activate?: boolean): void;
 };
 
 export type CanvasManager = {
@@ -88,6 +90,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   const title = view.querySelector<HTMLInputElement>(".canvas-title")!;
   const saveState = view.querySelector<HTMLElement>(".canvas-save-state")!;
   const zoomLabel = view.querySelector<HTMLOutputElement>(".canvas-zoom")!;
+  const inspector = document.querySelector<HTMLElement>('[data-slot="canvas-config"]')!;
   const undo = view.querySelector<HTMLButtonElement>("[data-canvas-action=undo]")!;
   const redo = view.querySelector<HTMLButtonElement>("[data-canvas-action=redo]")!;
   let current: CanvasDocument | null = null;
@@ -96,7 +99,6 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   let libraryPoint: { x: number; y: number } | null = null;
   let suggestionPopup: HTMLElement | null = null;
   let suggestionInput: HTMLTextAreaElement | null = null;
-  let suggestionNode: CanvasNode | null = null;
   let catalog: EditorState | null = null;
   let menuIndex = 0;
   let menuItems: LinkSuggestion[] = [];
@@ -129,8 +131,6 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   let curveMode = false;
   let pendingCurveEndpoint: { nodeId: string; side: CanvasCurve["start"]["side"] } | null = null;
   let branchCurveNode: CanvasNode | null = null;
-  let curveStylePopup: HTMLElement | null = null;
-  let curveStyleDismiss: ((event: PointerEvent) => void) | null = null;
   let nodeMenuPopup: HTMLElement | null = null;
   let nodeMenuDismiss: ((event: PointerEvent) => void) | null = null;
   let iconPreviewPopup: HTMLElement | null = null;
@@ -250,7 +250,8 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const replacement = `[[${sourceTarget}|📅 ${label}]]`;
     const nextValue = value.slice(0, start) + replacement + value.slice(end);
     const prefix = block.type === "heading" ? `${"#".repeat(block.properties.headingLevel ?? 1)} ` : block.type === "todo" ? `- [${block.content.checked ? "x" : " "}] ` : "";
-    block.content = callbacks.contentFromMarkdown(`${prefix}${nextValue}`, block.content);
+    if (block.parentId) updateHeadingChild(node, nextValue);
+    else block.content = callbacks.contentFromMarkdown(`${prefix}${nextValue}`, block.content);
     block.content.links = [...(block.content.links ?? []), { targetDocumentId, targetBlockId, targetScope, targetText: `${notebook}${target.title}`, alias: `📅 ${label}`, start, end: start + replacement.length }];
     block.revision += 1;
     lastTextSelection = { nodeId: node.id, start: start + replacement.length, end: start + replacement.length };
@@ -284,7 +285,6 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     suggestionPopup?.remove();
     suggestionPopup = null;
     suggestionInput = null;
-    suggestionNode = null;
   }
 
   function activeQuery(input: HTMLTextAreaElement) {
@@ -324,7 +324,6 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     menuItems = result.items;
     menuIndex = 0;
     suggestionInput = input;
-    suggestionNode = node;
     const popup = document.createElement("div");
     popup.className = "canvas-link-suggestions";
     popup.setAttribute("role", "listbox");
@@ -396,6 +395,28 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     popup.setAttribute("role", "menu");
     popup.setAttribute("aria-label", "引用显示方式");
     const label = document.createElement("strong"); label.textContent = "引用显示方式"; popup.append(label);
+    if (anchor.classList.contains("wiki-link") && node.block) {
+      const rename = document.createElement("button"); rename.type = "button";
+      rename.textContent = "修改显示文字";
+      rename.onmousedown = event => event.preventDefault();
+      rename.onclick = () => {
+        popup.remove(); modePopup = null;
+        const value = window.prompt("引用显示文字（留空恢复默认）", anchor.textContent ?? "");
+        if (value === null) return;
+        if (value.includes("]") || value.includes("|")) { callbacks.onError(new Error("显示文字不能包含 ] 或 |")); return; }
+        const preview = anchor.closest<HTMLElement>(".canvas-note-preview");
+        const links = [...(preview?.querySelectorAll<HTMLElement>(".wiki-link") ?? [])].filter(link => !link.closest(".canvas-live-reference"));
+        const occurrence = links.indexOf(anchor);
+        if (occurrence < 0) return;
+        const source = markdownFromContent(node.block!.content);
+        const next = updateWikiLinkAlias(source, occurrence, value);
+        if (next === source) return;
+        node.block!.content = callbacks.contentFromMarkdown(next, node.block!.content);
+        node.block!.revision += 1;
+        renderNodes(); scheduleSave();
+      };
+      popup.append(rename);
+    }
     (["link", "inline", "collapsed"] as ReferenceMode[]).forEach(mode => {
       const button = document.createElement("button"); button.type = "button";
       button.textContent = mode === "link" ? "仅标题链接" : mode === "inline" ? "正文直显" : "折叠卡片";
@@ -578,9 +599,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   }
 
   function nextPosition() {
-    if (!current?.nodes.length) return { x: 140, y: 100 };
-    const top = Math.min(...current.nodes.map(node => node.y));
-    const right = Math.max(...current.nodes.map(node => node.x + node.width));
+    const visible = current?.nodes.filter(node => !node.block?.parentId) ?? [];
+    if (!visible.length) return { x: 140, y: 100 };
+    const top = Math.min(...visible.map(node => node.y));
+    const right = Math.max(...visible.map(node => node.x + node.width));
     return { x: right + 36, y: top };
   }
 
@@ -597,13 +619,27 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     await saveSession.flush();
   }
 
-  function nodeLabel(node: CanvasNode, target?: WorkspaceDocument) {
+  function nodeTypeLabel(node: CanvasNode, target?: WorkspaceDocument) {
     if (node.kind === "block") return node.block?.type === "heading" ? "标题块" : node.block?.type === "todo" ? "待办块" : node.block?.type === "location" ? "位置块" : "正文块";
     if (node.kind === "draw") return "手绘";
     if (node.kind === "curve") return "曲线";
     if (node.kind === "media") return node.block?.content.media?.name || "媒体";
     if (!target) return "目标已删除";
     return target.title;
+  }
+
+  function nodeLabel(node: CanvasNode, target?: WorkspaceDocument) {
+    return node.name || nodeTypeLabel(node, target);
+  }
+
+  function nodeIcon(node: CanvasNode, target?: WorkspaceDocument) {
+    if (node.kind === "block") {
+      if (node.block?.type === "heading") return "H";
+      if (node.block?.type === "todo") return "☑";
+      if (node.block?.type === "location") return "⌖";
+      return "≡";
+    }
+    return ({ media: "▧", document: target?.kind === "dashboard" ? "▦" : "▤", canvas: "◇", draw: "✎", curve: "⌁", text: "≡" } as Record<string, string>)[node.kind] ?? "◇";
   }
 
   function renderCanvasThumbnail(container: HTMLElement, targetId: string) {
@@ -616,15 +652,16 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     caption.textContent = target.title;
     const miniature = document.createElement("div");
     miniature.className = "canvas-miniature";
-    if (!target.nodes.length) miniature.innerHTML = `<span>空白 Canvas</span>`;
+    const visible = target.nodes.filter(node => !node.block?.parentId);
+    if (!visible.length) miniature.innerHTML = `<span>空白 Canvas</span>`;
     else {
-      const minX = Math.min(...target.nodes.map(node => node.x));
-      const minY = Math.min(...target.nodes.map(node => node.y));
-      const maxX = Math.max(...target.nodes.map(node => node.x + node.width));
-      const maxY = Math.max(...target.nodes.map(node => node.y + node.height));
+      const minX = Math.min(...visible.map(node => node.x));
+      const minY = Math.min(...visible.map(node => node.y));
+      const maxX = Math.max(...visible.map(node => node.x + node.width));
+      const maxY = Math.max(...visible.map(node => node.y + node.height));
       const width = Math.max(1, maxX - minX);
       const height = Math.max(1, maxY - minY);
-      target.nodes.slice(0, 24).forEach(node => {
+      visible.slice(0, 24).forEach(node => {
         const tile = document.createElement("i");
         tile.className = `mini-${node.kind}`;
         tile.style.left = `${((node.x - minX) / width) * 86 + 5}%`;
@@ -787,10 +824,11 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     if (!additive) selected.clear();
     if (additive && selected.has(nodeId)) selected.delete(nodeId);
     else selected.add(nodeId);
-    stage.querySelectorAll<HTMLElement>(".canvas-node").forEach(node => node.classList.toggle("selected", selected.has(node.dataset.nodeId!)));
+    stage.querySelectorAll<HTMLElement>(".canvas-node, .canvas-heading-child").forEach(node => node.classList.toggle("selected", selected.has(node.dataset.nodeId!)));
     renderConnections();
     const active = current?.nodes.find(node => node.id === nodeId);
     callbacks.onActiveBlockChanged?.(active?.block);
+    renderSelectionInspector(true);
   }
 
   function beginMove(event: PointerEvent, nodeId: string) {
@@ -824,7 +862,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       if (next.pointerId !== pointerId) return;
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", end);
-      if (moved) scheduleSave();
+      if (moved) { scheduleSave(); renderSelectionInspector(); }
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", end);
@@ -835,11 +873,15 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     event.preventDefault();
     event.stopPropagation();
     selectNode(node.id, false);
-    const start = { x: event.clientX, y: event.clientY, width: node.width, height: node.height };
+    const direction = (event.currentTarget as HTMLElement).dataset.corner === "left" ? -1 : 1;
+    const start = { x: event.clientX, y: event.clientY, left: node.x, width: node.width, height: node.height };
     const element = stage.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(node.id)}"]`)!;
     const move = (next: PointerEvent) => {
-      node.width = Math.round(clamp(start.width + (next.clientX - start.x) / current!.viewport.zoom, 180, 900));
+      const dx = (next.clientX - start.x) / current!.viewport.zoom;
+      node.width = Math.round(clamp(start.width + direction * dx, 180, 900));
+      if (direction < 0) node.x = Math.round(start.left + start.width - node.width);
       node.height = Math.round(clamp(start.height + (next.clientY - start.y) / current!.viewport.zoom, 110, 760));
+      element.style.left = `${node.x}px`;
       element.style.width = `${node.width}px`;
       element.style.height = `${node.height}px`;
     };
@@ -847,6 +889,8 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", end);
       scheduleSave();
+      renderConnections();
+      renderSelectionInspector();
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", end);
@@ -855,14 +899,16 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   function removeNode(nodeId: string) {
     if (!current) return;
     closeNodeMenu();
+    const removed = new Set([nodeId, ...current.nodes.filter(node => node.block?.parentId === nodeId).map(node => node.id)]);
     current.nodes = current.nodes
-      .filter(node => node.id !== nodeId)
+      .filter(node => !removed.has(node.id))
       .filter(node => node.kind !== "curve" || !node.curve || (node.curve.start.nodeId !== nodeId && node.curve.end.nodeId !== nodeId))
       .map(node => node.kind === "curve" && node.curve
         ? { ...node, curve: { ...node.curve, branches: node.curve.branches?.filter(branch => branch.nodeId !== nodeId) } }
         : node);
-    selected.delete(nodeId);
+    removed.forEach(id => selected.delete(id));
     renderNodes();
+    renderSelectionInspector();
     scheduleSave();
   }
 
@@ -893,7 +939,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
 
   function focusNodeEditor(node: CanvasNode) {
     const element = stage.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(node.id)}"]`);
-    const body = element?.querySelector<HTMLElement>(".canvas-node-body");
+    const body = node.block?.parentId ? element : element?.querySelector<HTMLElement>(".canvas-node-body");
     const preview = body?.querySelector<HTMLElement>(".canvas-note-preview");
     body?.classList.add("canvas-note-editing");
     if (preview) preview.hidden = true;
@@ -986,8 +1032,23 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       button.onclick = event => { event.stopPropagation(); run(); };
       popup.append(button);
     };
+    add("重命名块", "✎", () => {
+      const value = window.prompt("块名称（留空恢复类型名称）", node.name ?? nodeTypeLabel(node, item(node.targetId)));
+      if (value === null) return;
+      node.name = value.trim() || undefined;
+      closeNodeMenu(); renderNodes(); scheduleSave();
+    });
     if (node.block) {
+      add("复制块链接", "↗", () => {
+        closeNodeMenu();
+        const owner = workspace.snapshot().documents.find(item => item.id === current?.id);
+        const notebook = catalog?.documents.find(item => item.id === current?.id)?.notebookName ?? "当前笔记本";
+        const link = blockWikiLink(notebook, owner?.title ?? current?.title ?? "Canvas", node.id);
+        void navigator.clipboard?.writeText(link).catch(callbacks.onError);
+      });
       add("编辑块内容", "✎", () => { closeNodeMenu(); focusNodeEditor(node); });
+      if (node.block.parentId) add("下方新增段落", "+", () => { closeNodeMenu(); addHeadingChild(node.block!.parentId!, node.id); });
+      else if (node.block.type === "heading") add("新增段落", "+", () => { closeNodeMenu(); addHeadingChild(node.id); });
       add("增大字号", "A+", () => setNodeFontSize(node, 2));
       add("减小字号", "A−", () => setNodeFontSize(node, -2));
       add("重置字号", "A", () => setNodeFontSize(node, null));
@@ -1109,7 +1170,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       }
       path.dataset.nodeId = node.id; path.style.pointerEvents = hit ? "stroke" : "none";
       if (!hit) path.classList.add("canvas-connection-visible");
-      path.addEventListener("click", event => { event.stopPropagation(); selectNode(node.id, (event as MouseEvent).shiftKey); if (node.kind === "curve" && node.curve) showCurveStyleEditor(node); });
+      path.addEventListener("click", event => { event.stopPropagation(); selectNode(node.id, (event as MouseEvent).shiftKey); });
       svg.append(path);
     };
     for (const node of current.nodes) {
@@ -1173,20 +1234,215 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     stage.prepend(svg);
   }
 
+  function headingChildren(parentId: string) {
+    return (current?.nodes.filter(node => node.block?.parentId === parentId) ?? [])
+      .sort((a, b) => a.block!.position.localeCompare(b.block!.position));
+  }
+
+  function orderHeadingChildren(parentId: string, children: CanvasNode[]) {
+    if (!current) return;
+    children.forEach((child, index) => { child.block!.position = String((index + 1) * 1000).padStart(8, "0"); });
+    const others = current.nodes.filter(node => node.block?.parentId !== parentId);
+    const parentIndex = others.findIndex(node => node.id === parentId);
+    others.splice(parentIndex + 1, 0, ...children);
+    current.nodes = others;
+  }
+
+  function updateHeadingChild(node: CanvasNode, value: string) {
+    const marker = value.match(/^(#{1,6})\s+(.*)$/s);
+    const level = marker ? Math.min(6, marker[1].length + 1) : 0;
+    node.block!.type = level ? "heading" : "paragraph";
+    node.block!.properties.headingLevel = level ? level as 1 | 2 | 3 | 4 | 5 | 6 : undefined;
+    const source = level ? `${"#".repeat(level)} ${marker![2]}` : value;
+    node.block!.content = callbacks.contentFromMarkdown(source, node.block!.content);
+    node.block!.revision += 1;
+    return source;
+  }
+
+  function createHeadingChild(parentId: string, afterId: string, value = "") {
+    const parent = current!.nodes.find(node => node.id === parentId)!;
+    const id = uid("canvas-block");
+    const child: CanvasNode = {
+      id, kind: "block", x: parent.x, y: parent.y, width: parent.width, height: 80, zIndex: parent.zIndex,
+      block: createBlock({ id, parentId, position: "" })
+    };
+    updateHeadingChild(child, value);
+    const children = headingChildren(parentId);
+    const afterIndex = children.findIndex(node => node.id === afterId);
+    children.splice(afterId === parentId ? 0 : afterIndex < 0 ? children.length : afterIndex + 1, 0, child);
+    orderHeadingChildren(parentId, children);
+    return child;
+  }
+
+  function focusHeadingChild(id: string, caret = 0) {
+    const input = stage.querySelector<HTMLTextAreaElement>(`.canvas-heading-child[data-node-id="${CSS.escape(id)}"] textarea`);
+    input?.focus();
+    input?.setSelectionRange(caret, caret);
+  }
+
+  function addHeadingChild(parentId: string, afterId = parentId) {
+    if (!current) return;
+    const child = createHeadingChild(parentId, afterId);
+    selected = new Set([child.id]);
+    renderNodes(); renderSelectionInspector(true); scheduleSave(); focusHeadingChild(child.id);
+  }
+
+  function splitHeadingLines(parentId: string, afterId: string, textarea: HTMLTextAreaElement, commit: () => void) {
+    if (!textarea.value.includes("\n")) return false;
+    const lines = textarea.value.split(/\r?\n/);
+    textarea.value = lines.shift()!;
+    commit();
+    for (const line of lines) afterId = createHeadingChild(parentId, afterId, line).id;
+    renderNodes(); scheduleSave(); focusHeadingChild(afterId, lines[lines.length - 1]?.length ?? 0);
+    return true;
+  }
+
+  function splitHeadingAtCaret(parentId: string, afterId: string, textarea: HTMLTextAreaElement, commit: () => void) {
+    const remainder = textarea.value.slice(textarea.selectionEnd);
+    textarea.value = textarea.value.slice(0, textarea.selectionStart);
+    commit();
+    const child = createHeadingChild(parentId, afterId, remainder);
+    renderNodes(); scheduleSave(); focusHeadingChild(child.id);
+  }
+
+  function bindCanvasTextEditor(node: CanvasNode, textarea: HTMLTextAreaElement, container: HTMLElement,
+    preview: HTMLElement, onChange: () => boolean, onEnter?: () => void, onCompositionEnd?: () => void) {
+    const remember = () => rememberTextSelection(node, textarea);
+    textarea.onfocus = () => { container.classList.add("canvas-note-editing"); preview.hidden = true; remember(); };
+    textarea.onblur = () => { closeSuggestions(); container.classList.remove("canvas-note-editing"); preview.hidden = false; };
+    textarea.onkeyup = remember;
+    textarea.onselect = remember;
+    textarea.oninput = () => {
+      remember();
+      if (onChange()) return;
+      if (!composing) { modePopup?.remove(); modePopup = null; showLinkSuggestions(textarea, node); }
+    };
+    textarea.addEventListener("compositionstart", () => { composing = true; closeSuggestions(); });
+    textarea.addEventListener("compositionend", () => { composing = false; onCompositionEnd?.(); showLinkSuggestions(textarea, node); });
+    textarea.addEventListener("click", () => { remember(); showLinkSuggestions(textarea, node); });
+    textarea.addEventListener("keydown", event => {
+      if (event.isComposing || composing || event.keyCode === 229) return;
+      if (event.key === "Escape") { event.preventDefault(); closeSuggestions(); modePopup?.remove(); modePopup = null; return; }
+      if (suggestionPopup && suggestionInput === textarea && menuItems.length) {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          menuIndex = (menuIndex + (event.key === "ArrowDown" ? 1 : -1) + menuItems.length) % menuItems.length;
+          suggestionPopup.querySelectorAll<HTMLElement>("[role=option]").forEach((option, index) => {
+            option.classList.toggle("active", index === menuIndex);
+            option.setAttribute("aria-selected", String(index === menuIndex));
+            if (index === menuIndex) option.scrollIntoView({ block: "nearest" });
+          });
+          return;
+        }
+        if (event.key === "Enter" || event.key === "Tab") {
+          event.preventDefault(); insertSuggestion(menuItems[menuIndex], textarea, node); return;
+        }
+      }
+      if (event.key === "Enter" && !event.shiftKey && onEnter) { event.preventDefault(); onEnter(); }
+    });
+    preview.onclick = event => {
+      if (!(event.target as Element).closest(".canvas-live-reference, .wiki-link, button, a, input")) {
+        container.classList.add("canvas-note-editing"); preview.hidden = true; textarea.focus();
+      }
+    };
+  }
+
+  function renderHeadingChildren(parent: CanvasNode, body: HTMLElement) {
+    const list = document.createElement("div");
+    list.className = "canvas-heading-children";
+    for (const child of headingChildren(parent.id)) {
+      const row = document.createElement("div");
+      row.className = `canvas-heading-child${selected.has(child.id) ? " selected" : ""}`;
+      row.dataset.nodeId = child.id;
+      row.onclick = event => { event.stopPropagation(); selectNode(child.id, event.shiftKey); };
+      const grip = document.createElement("button");
+      grip.type = "button"; grip.className = "canvas-heading-grip"; grip.textContent = "⠿";
+      grip.title = "拖动段落或打开块菜单"; grip.setAttribute("aria-label", "段落六点菜单");
+      grip.onpointerdown = event => {
+        if (event.button !== 0) return;
+        event.stopPropagation();
+        const start = { x: event.clientX, y: event.clientY };
+        const pointerId = event.pointerId;
+        let moved = false;
+        let target: HTMLElement | null = null;
+        const move = (next: PointerEvent) => {
+          if (next.pointerId !== pointerId) return;
+          if (Math.hypot(next.clientX - start.x, next.clientY - start.y) > 4) moved = true;
+          if (!moved) return;
+          target?.classList.remove("drop-target");
+          target = document.elementFromPoint(next.clientX, next.clientY)?.closest<HTMLElement>(".canvas-heading-child") ?? null;
+          if (target?.closest(".canvas-heading-card") !== row.closest(".canvas-heading-card")) target = null;
+          target?.classList.add("drop-target");
+        };
+        const up = (next: PointerEvent) => {
+          if (next.pointerId !== pointerId) return;
+          window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+          target?.classList.remove("drop-target");
+          if (!moved) return;
+          grip.dataset.dragged = "true";
+          const siblings = headingChildren(parent.id);
+          const from = siblings.findIndex(node => node.id === child.id);
+          const to = siblings.findIndex(node => node.id === target?.dataset.nodeId);
+          if (from < 0 || to < 0 || from === to) return;
+          siblings.splice(to - (from < to ? 1 : 0), 0, siblings.splice(from, 1)[0]);
+          orderHeadingChildren(parent.id, siblings);
+          renderNodes(); scheduleSave();
+        };
+        window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
+      };
+      grip.onclick = event => {
+        event.stopPropagation();
+        if (grip.dataset.dragged === "true") { grip.dataset.dragged = "false"; return; }
+        showNodeMenu(grip, child);
+      };
+      const content = document.createElement("div");
+      content.className = "canvas-heading-content";
+      const textarea = document.createElement("textarea");
+      textarea.className = "canvas-note-text";
+      textarea.setAttribute("aria-label", "标题块段落");
+      const source = markdownFromContent(child.block!.content);
+      textarea.value = child.block!.type === "heading"
+        ? `${"#".repeat(Math.max(1, (child.block!.properties.headingLevel ?? 2) - 1))} ${source.replace(/^#{1,6}\s+/, "")}`
+        : source;
+      const preview = document.createElement("div");
+      preview.className = "canvas-note-preview";
+      renderInlineLinks(preview, source, child);
+      content.classList.toggle("canvas-note-editing", !textarea.value.trim());
+      preview.hidden = content.classList.contains("canvas-note-editing");
+      const commit = () => { renderInlineLinks(preview, updateHeadingChild(child, textarea.value), child); scheduleSave(450); };
+      bindCanvasTextEditor(child, textarea, content, preview,
+        () => {
+          if (splitHeadingLines(parent.id, child.id, textarea, commit)) return true;
+          commit();
+          return false;
+        },
+        () => splitHeadingAtCaret(parent.id, child.id, textarea, commit));
+      content.append(textarea, preview);
+      row.append(grip, content);
+      list.append(row);
+    }
+    const add = document.createElement("button");
+    add.type = "button"; add.className = "canvas-heading-add"; add.textContent = "+";
+    add.title = "新增段落"; add.setAttribute("aria-label", "新增标题块段落");
+    add.onclick = event => { event.stopPropagation(); const children = headingChildren(parent.id); addHeadingChild(parent.id, children[children.length - 1]?.id ?? parent.id); };
+    list.append(add);
+    body.append(list);
+  }
+
   function renderNodes() {
     if (!current) return;
     const token = ++renderToken;
     stage.replaceChildren();
     renderConnections();
-    empty.hidden = current.nodes.length > 0;
+    empty.hidden = current.nodes.some(node => !node.block?.parentId);
     for (const node of current.nodes) {
-      if (node.kind === "draw" || node.kind === "curve") continue;
+      if (node.kind === "draw" || node.kind === "curve" || node.block?.parentId) continue;
       const target = item(node.targetId);
       const element = document.createElement("article");
       // Keep the historical `.canvas-node-text` hook for existing integrations
       // while the semantic class now reflects the canonical Block-backed kind.
       const kindClass = node.kind === "block" ? "canvas-node-block canvas-node-text" : `canvas-node-${node.kind}`;
-      element.className = `canvas-node ${kindClass}${node.displayMode === "icon" ? " icon-mode" : ""}${node.referenceDisplay === "icon" ? " reference-icon-mode" : ""}${selected.has(node.id) ? " selected" : ""}`;
+      element.className = `canvas-node ${kindClass}${node.block?.type === "heading" ? " canvas-heading-card" : ""}${node.displayMode === "icon" ? " icon-mode" : ""}${node.referenceDisplay === "icon" ? " reference-icon-mode" : ""}${selected.has(node.id) ? " selected" : ""}`;
       element.dataset.nodeId = node.id;
       element.style.left = `${node.x}px`;
       element.style.top = `${node.y}px`;
@@ -1201,6 +1457,9 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         event.stopPropagation();
         pickCurveEndpoint(node, event);
       }, true);
+      element.addEventListener("pointerdown", event => {
+        if (event.target === element && event.button === 0) beginMove(event, node.id);
+      });
       element.onclick = event => {
         event.stopPropagation();
         if (curveMode && node.kind !== "curve" && node.kind !== "draw") { pickCurveEndpoint(node, event); return; }
@@ -1224,7 +1483,14 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       const label = document.createElement("span");
       label.className = "canvas-node-label";
       label.textContent = nodeLabel(node, target);
-      head.append(grip, label);
+      const typeIcon = document.createElement("span");
+      typeIcon.className = "canvas-node-type-icon";
+      typeIcon.textContent = nodeIcon(node, target);
+      typeIcon.title = nodeTypeLabel(node, target);
+      head.append(grip, typeIcon, label);
+      head.addEventListener("pointerdown", event => {
+        if (!(event.target as Element).closest("button") && event.button === 0) beginMove(event, node.id);
+      });
       if (node.block) {
         const edit = document.createElement("button"); edit.type = "button"; edit.textContent = "✎";
         edit.setAttribute("aria-label", "编辑块源码");
@@ -1281,7 +1547,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         appendIconVisual(icon.querySelector(".canvas-icon-slot")!, node.referenceIcon || "↗", "引用 Icon");
         const token = node.block.content.links?.find(link => link.targetDocumentId);
         const targetDoc = token ? item(token.targetDocumentId) : undefined;
-        icon.querySelector("strong")!.textContent = targetDoc?.title ?? "引用";
+        icon.querySelector("strong")!.textContent = node.name || targetDoc?.title || "引用";
         icon.addEventListener("pointerenter", () => showIconPreview(icon, { ...node, kind: "document", targetId: targetDoc?.id }, targetDoc));
         icon.addEventListener("pointerleave", scheduleHideIconPreview);
         icon.onclick = event => {
@@ -1327,39 +1593,12 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           preview.hidden = body.classList.contains("canvas-note-editing");
           scheduleSave(450);
         };
-        const rememberCaret = () => rememberTextSelection(node, textarea);
-        textarea.oninput = () => {
-          rememberCaret();
+        bindCanvasTextEditor(node, textarea, body, preview, () => {
+          if (node.block?.type === "heading" && splitHeadingLines(node.id, node.id, textarea, syncPreview)) return true;
           syncPreview();
-          if (!composing) { modePopup?.remove(); modePopup = null; showLinkSuggestions(textarea, node); }
-        };
-        textarea.onfocus = () => { body.classList.add("canvas-note-editing"); preview.hidden = true; rememberCaret(); };
-        textarea.onkeyup = rememberCaret;
-        textarea.onselect = rememberCaret;
-        textarea.onblur = () => { closeSuggestions(); body.classList.remove("canvas-note-editing"); preview.hidden = false; };
-        textarea.addEventListener("compositionstart", () => { composing = true; closeSuggestions(); });
-        textarea.addEventListener("compositionend", () => { composing = false; syncPreview(); showLinkSuggestions(textarea, node); });
-        textarea.addEventListener("click", () => { rememberCaret(); showLinkSuggestions(textarea, node); });
-        textarea.addEventListener("keydown", event => {
-          if (event.isComposing || composing || event.keyCode === 229) return;
-          if (event.key === "Escape") { event.preventDefault(); closeSuggestions(); modePopup?.remove(); modePopup = null; return; }
-          if (!suggestionPopup || suggestionInput !== textarea) return;
-          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-            event.preventDefault();
-            menuIndex = (menuIndex + (event.key === "ArrowDown" ? 1 : -1) + menuItems.length) % Math.max(1, menuItems.length);
-            suggestionPopup.querySelectorAll<HTMLElement>("[role=option]").forEach((option, index) => {
-              option.classList.toggle("active", index === menuIndex); option.setAttribute("aria-selected", String(index === menuIndex));
-              if (index === menuIndex) option.scrollIntoView({ block: "nearest" });
-            });
-          } else if ((event.key === "Enter" || event.key === "Tab") && menuItems[menuIndex]) {
-            event.preventDefault(); insertSuggestion(menuItems[menuIndex], textarea, node);
-          }
-        });
-        preview.onclick = event => {
-          if (!(event.target as Element).closest(".canvas-live-reference, .wiki-link, button, a, input")) {
-            body.classList.add("canvas-note-editing"); preview.hidden = true; textarea.focus();
-          }
-        };
+          return false;
+        }, node.block.type === "heading" ? () => splitHeadingAtCaret(node.id, node.id, textarea, syncPreview) : undefined,
+        syncPreview);
         const initialPrefix = node.block.type === "heading"
           ? `${"#".repeat(node.block.properties.headingLevel ?? 1)} `
           : node.block.type === "todo"
@@ -1429,6 +1668,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           body.append(dates);
         }
         body.append(textarea, preview);
+        if (node.block.type === "heading") renderHeadingChildren(node, body);
       } else if (node.kind === "media" && node.block?.content.media) {
         const media = node.block.content.media;
         if (media.kind === "image") {
@@ -1451,7 +1691,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           icon.title = `打开 ${target.title}`;
           icon.innerHTML = `<span class="canvas-icon-slot" aria-hidden="true"></span><strong></strong>`;
           appendIconVisual(icon.querySelector(".canvas-icon-slot")!, node.referenceIcon || "▤", target.title);
-          icon.querySelector("strong")!.textContent = target.title;
+          icon.querySelector("strong")!.textContent = nodeLabel(node, target);
           icon.onclick = event => { event.stopPropagation(); openTarget(target); };
           icon.addEventListener("pointerenter", () => showIconPreview(icon, node, target));
           icon.addEventListener("pointerleave", scheduleHideIconPreview);
@@ -1465,7 +1705,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           icon.title = `打开 ${target.title}`;
           icon.innerHTML = `<span class="canvas-icon-slot" aria-hidden="true"></span><strong></strong>`;
           appendIconVisual(icon.querySelector(".canvas-icon-slot")!, node.referenceIcon || "◇", target.title);
-          icon.querySelector("strong")!.textContent = target.title;
+          icon.querySelector("strong")!.textContent = nodeLabel(node, target);
           icon.onclick = event => { event.stopPropagation(); openTarget(target); };
           icon.addEventListener("pointerenter", () => showIconPreview(icon, node, target));
           icon.addEventListener("pointerleave", scheduleHideIconPreview);
@@ -1479,13 +1719,16 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       }
       element.append(body);
       if (node.displayMode !== "icon") {
-        const resize = document.createElement("button");
-        resize.type = "button";
-        resize.className = "canvas-resize-handle";
-        resize.title = "调整大小";
-        resize.setAttribute("aria-label", `调整${nodeLabel(node, target)}大小`);
-        resize.onpointerdown = event => beginResize(event, node);
-        element.append(resize);
+        for (const corner of ["left", "right"] as const) {
+          const resize = document.createElement("button");
+          resize.type = "button";
+          resize.className = `canvas-resize-handle canvas-resize-${corner}`;
+          resize.dataset.corner = corner;
+          resize.title = "调整大小";
+          resize.setAttribute("aria-label", `从${corner === "left" ? "左" : "右"}下角调整${nodeLabel(node, target)}大小`);
+          resize.onpointerdown = event => beginResize(event, node);
+          element.append(resize);
+        }
       }
       element.ondblclick = event => {
         if ((event.target as Element).closest("button,textarea")) return;
@@ -1495,6 +1738,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     }
     applyViewport();
     updateHistoryButtons();
+    renderSelectionInspector();
   }
 
   function addBlock(point = nextPosition(), type: "paragraph" | "heading" | "todo" = "paragraph") {
@@ -1502,12 +1746,13 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const maxZ = Math.max(0, ...current.nodes.map(node => node.zIndex));
     const blockId = uid("canvas-block");
     const node: CanvasNode = {
-      id: blockId, kind: "block", x: Math.round(point.x), y: Math.round(point.y), width: 280, height: 180, zIndex: maxZ + 1,
+      id: blockId, kind: "block", x: Math.round(point.x), y: Math.round(point.y), width: type === "heading" ? 300 : 260, height: type === "heading" ? 125 : 110, zIndex: maxZ + 1,
       block: createBlock({ id: blockId, type, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), properties: type === "heading" ? { headingLevel: 1 } : {} })
     };
     current.nodes.push(node);
     selected = new Set([node.id]);
     renderNodes();
+    renderSelectionInspector(true);
     scheduleSave();
     requestAnimationFrame(() => stage.querySelector<HTMLTextAreaElement>(`[data-node-id="${CSS.escape(node.id)}"] textarea`)?.focus());
   }
@@ -1581,22 +1826,90 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     current.nodes.push({ id, kind: "curve", x: Math.min(startPoint.x, endPoint.x), y: Math.min(startPoint.y, endPoint.y), width: Math.max(80, Math.abs(endPoint.x - startPoint.x)), height: Math.max(64, Math.abs(endPoint.y - startPoint.y)), zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, curve });
     selected = new Set([id]);
     pendingCurveEndpoint = null; curveMode = false; viewport.classList.remove("curve-mode"); updateCanvasModeButtons();
-    renderNodes(); scheduleSave(); showCurveStyleEditor(current.nodes.find(item => item.id === id)!);
+    renderNodes(); scheduleSave(); renderSelectionInspector(true);
   }
 
   function closeCurveStyleEditor() {
-    if (curveStyleDismiss) {
-      document.removeEventListener("pointerdown", curveStyleDismiss);
-      curveStyleDismiss = null;
+    inspector.querySelector(".canvas-curve-style")?.remove();
+  }
+
+  function renderSelectionInspector(activate = false) {
+    inspector.replaceChildren();
+    const nodes = current?.nodes.filter(node => selected.has(node.id)) ?? [];
+    callbacks.onObjectSelection?.(nodes.length > 0, activate);
+    if (!nodes.length) return;
+    if (nodes.length > 1) {
+      const summary = document.createElement("p"); summary.className = "canvas-inspector-summary";
+      summary.textContent = `已选中 ${nodes.length} 个对象`;
+      inspector.append(summary);
+      return;
     }
-    curveStylePopup?.remove();
-    curveStylePopup = null;
+    const node = nodes[0];
+    const section = document.createElement("div"); section.className = "canvas-object-settings";
+    const kind = document.createElement("small"); kind.textContent = nodeTypeLabel(node, item(node.targetId)); section.append(kind);
+    const field = (label: string, value: string, apply: (value: string) => void, type = "text") => {
+      const row = document.createElement("label"); row.textContent = label;
+      const input = document.createElement("input"); input.type = type; input.value = value;
+      input.addEventListener("change", () => apply(input.value)); row.append(input); section.append(row);
+    };
+    field("名称", node.name ?? "", value => { node.name = value.trim() || undefined; renderNodes(); scheduleSave(); });
+    if (node.kind !== "curve" && node.kind !== "draw" && !node.block?.parentId) {
+      for (const [label, key] of [["X", "x"], ["Y", "y"], ["宽度", "width"], ["高度", "height"]] as const) {
+        field(label, String(node[key]), value => {
+          const number = Number(value);
+          if (!Number.isFinite(number)) return;
+          node[key] = Math.round(key === "width" ? clamp(number, 180, 900) : key === "height" ? clamp(number, 110, 760) : number);
+          renderNodes(); scheduleSave();
+        }, "number");
+      }
+    }
+    if (node.kind === "media" && node.block) {
+      field("说明", node.block.content.caption ?? "", value => {
+        node.block!.content.caption = value;
+        node.block!.revision += 1;
+        renderNodes(); scheduleSave();
+      });
+    }
+    if (node.block) {
+      field("字号", String(node.fontSize ?? 14), value => {
+        const size = Number(value);
+        if (!Number.isFinite(size)) return;
+        node.fontSize = Math.round(clamp(size, 10, 48));
+        renderNodes(); scheduleSave();
+      }, "number");
+    }
+    const selectField = (label: string, value: string, options: [string, string][], apply: (value: string) => void) => {
+      const row = document.createElement("label"); row.textContent = label;
+      const select = document.createElement("select");
+      options.forEach(([id, text]) => { const option = document.createElement("option"); option.value = id; option.textContent = text; select.append(option); });
+      select.value = value;
+      select.onchange = () => apply(select.value);
+      row.append(select); section.append(row);
+    };
+    if (isReferenceBlock(node)) {
+      selectField("引用显示", node.referenceDisplay ?? "preview", [["preview", "正文预览"], ["icon", "图标"]], value => setReferenceDisplay(node, value as "preview" | "icon"));
+    } else if (node.kind === "document" || node.kind === "canvas") {
+      selectField("显示方式", node.displayMode ?? "preview", [["preview", "内容缩略图"], ["icon", "图标"]], value => {
+        if (node.displayMode !== value) toggleCanvasMode(node);
+      });
+    }
+    if (isReferenceBlock(node) || node.kind === "document" || node.kind === "canvas") {
+      field("图标字符或地址", node.referenceIcon ?? "", value => {
+        node.referenceIcon = value.trim() || undefined;
+        renderNodes(); scheduleSave();
+      });
+      const upload = document.createElement("button"); upload.type = "button"; upload.className = "canvas-inspector-upload";
+      upload.textContent = "上传图标"; upload.onclick = () => { void uploadNodeIcon(node); };
+      section.append(upload);
+    }
+    inspector.append(section);
+    if (node.curve) showCurveStyleEditor(node);
   }
 
   function showCurveStyleEditor(node: CanvasNode) {
     if (!node.curve) return;
     closeCurveStyleEditor();
-    const popup = document.createElement("div"); popup.className = "canvas-curve-style context-menu"; popup.setAttribute("aria-label", "曲线样式");
+    const popup = document.createElement("div"); popup.className = "canvas-curve-style"; popup.setAttribute("aria-label", "曲线样式");
     const heading = document.createElement("strong"); heading.textContent = "曲线样式"; popup.append(heading);
     const colorLabel = document.createElement("label"); colorLabel.textContent = "颜色 ";
     const color = document.createElement("input"); color.type = "color"; color.value = node.curve.color; colorLabel.append(color);
@@ -1607,6 +1920,26 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const dash = document.createElement("select");
     [["solid", "实线"], ["dashed", "虚线"], ["dotted", "点线"]].forEach(([value, label]) => { const option = document.createElement("option"); option.value = value; option.textContent = label; dash.append(option); });
     dash.value = node.curve.dash; dashLabel.append(dash);
+    const endpointField = (label: string, key: "start" | "end") => {
+      const row = document.createElement("label"); row.textContent = label;
+      const select = document.createElement("select"); select.dataset.endpoint = key;
+      [["top", "上边"], ["right", "右边"], ["bottom", "下边"], ["left", "左边"]].forEach(([value, text]) => {
+        const option = document.createElement("option"); option.value = value; option.textContent = text; select.append(option);
+      });
+      select.value = node.curve![key].side;
+      select.onchange = () => {
+        const previous = endpointPoint(node.curve![key]);
+        node.curve![key].side = select.value as CanvasCurve["start"]["side"];
+        const next = endpointPoint(node.curve![key]);
+        if (previous && next) {
+          const control = key === "start" ? node.curve!.control1 : node.curve!.control2;
+          control.x += next.x - previous.x;
+          control.y += next.y - previous.y;
+        }
+        renderConnections(); scheduleSave(0);
+      };
+      row.append(select); return row;
+    };
     const arrowLabel = document.createElement("label"); arrowLabel.textContent = "箭头 ";
     const arrow = document.createElement("div"); arrow.className = "canvas-arrow-options";
     let arrowValue: CanvasCurve["arrow"] = node.curve.arrow ?? "none";
@@ -1618,7 +1951,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     arrowLabel.append(arrow);
     const description = document.createElement("label"); description.textContent = "描述 ";
     const descriptionInput = document.createElement("input"); descriptionInput.type = "text"; descriptionInput.value = node.curve.label ?? ""; descriptionInput.placeholder = "连接说明"; descriptionInput.maxLength = 120; description.append(descriptionInput);
-    popup.append(colorLabel, widthLabel, dashLabel, arrowLabel, description);
+    popup.append(endpointField("起点连接", "start"), endpointField("终点连接", "end"), colorLabel, widthLabel, dashLabel, arrowLabel, description);
     const update = () => { node.curve!.color = color.value; node.curve!.width = Number(width.value); node.curve!.dash = dash.value as CanvasCurve["dash"]; node.curve!.arrow = arrowValue; node.curve!.label = descriptionInput.value.trim() || undefined; output.value = `${node.curve!.width}px`; renderConnections(); scheduleSave(120); };
     color.oninput = width.oninput = dash.oninput = descriptionInput.oninput = update;
     const control = document.createElement("button"); control.type = "button"; control.textContent = "插入控制点"; control.onclick = () => {
@@ -1629,59 +1962,40 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       renderConnections(); scheduleSave(0);
     };
     const branch = document.createElement("button"); branch.type = "button"; branch.textContent = "添加分支点"; branch.onclick = () => {
-      branchCurveNode = node; closeCurveStyleEditor(); curveMode = true; drawMode = false; pendingCurveEndpoint = null; viewport.classList.add("curve-mode"); updateCanvasModeButtons(); saveState.textContent = "分支模式：点击要连接的块";
+      branchCurveNode = node; curveMode = true; drawMode = false; pendingCurveEndpoint = null; viewport.classList.add("curve-mode"); updateCanvasModeButtons(); saveState.textContent = "分支模式：点击要连接的块";
     };
-    const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger"; remove.textContent = "删除曲线"; remove.onclick = () => { removeNode(node.id); closeCurveStyleEditor(); };
+    const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger"; remove.textContent = "删除曲线"; remove.onclick = () => removeNode(node.id);
     popup.append(control, branch, remove);
-    document.body.append(popup); curveStylePopup = popup;
-    const dismiss = (event: PointerEvent) => {
-      if (event.target instanceof Node && popup.contains(event.target)) return;
-      closeCurveStyleEditor();
-    };
-    curveStyleDismiss = dismiss;
-    window.setTimeout(() => {
-      if (curveStylePopup === popup) document.addEventListener("pointerdown", dismiss);
-    }, 0);
-    popup.addEventListener("keydown", event => { if (event.key === "Escape") closeCurveStyleEditor(); });
-    const selectedPath = stage.querySelector<SVGPathElement>(`path[data-node-id="${CSS.escape(node.id)}"]`);
-    const rect = selectedPath?.getBoundingClientRect() ?? viewport.getBoundingClientRect();
-    popup.style.left = `${Math.min(window.innerWidth - 220, rect.left + 12)}px`; popup.style.top = `${Math.min(window.innerHeight - 180, rect.top + 12)}px`;
+    inspector.append(popup);
   }
 
   async function insertMediaFiles(files: readonly File[], point = nextPosition()) {
     if (!current || !callbacks.storeMedia) return;
     try {
+      let lastId: string | undefined;
       for (const [index, file] of files.entries()) {
         const media = await callbacks.storeMedia(file);
         const width = media.kind === "audio" ? 320 : 360;
         const height = media.kind === "audio" ? 120 : media.kind === "pdf" ? 300 : 240;
         const id = uid("canvas-media");
+        lastId = id;
         current.nodes.push({ id, kind: "media", x: Math.round(point.x + index * 24), y: Math.round(point.y + index * 24), width, height, zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1,
           block: createBlock({ id, type: "media", position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), content: { media } }) });
       }
-      renderNodes(); scheduleSave();
+      if (lastId) selected = new Set([lastId]);
+      renderNodes(); renderSelectionInspector(true); scheduleSave();
     } catch (error) { callbacks.onError(error); }
-  }
-
-  function mediaKindFromUrl(url: string): MediaAsset["kind"] {
-    const path = (() => { try { return new URL(url).pathname.toLocaleLowerCase(); } catch { return url.toLocaleLowerCase(); } })();
-    if (/\.(?:png|jpe?g|gif|webp|svg|avif|bmp)(?:$|\?)/i.test(path)) return "image";
-    if (/\.(?:mp4|webm|mov|m4v|ogv)(?:$|\?)/i.test(path)) return "video";
-    if (/\.(?:mp3|wav|ogg|m4a|aac|flac)(?:$|\?)/i.test(path)) return "audio";
-    if (/\.pdf(?:$|\?)/i.test(path)) return "pdf";
-    return "file";
   }
 
   function insertMediaUrl(point = nextPosition()) {
     if (!current) return;
     const raw = window.prompt("输入媒体网络地址（http:// 或 https://）", "https://");
     if (raw === null) return;
-    const url = raw.trim();
-    let parsed: URL;
-    try { parsed = new URL(url); } catch { callbacks.onError(new Error("媒体地址无效")); return; }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") { callbacks.onError(new Error("媒体地址必须使用 http 或 https")); return; }
-    const name = decodeURIComponent(parsed.pathname.split("/").pop() || "远程媒体");
-    const media: MediaAsset = { id: uid("remote-media"), kind: mediaKindFromUrl(url), name, mimeType: "application/octet-stream", size: 0, url };
+    try { addMediaAsset(mediaFromUrl(raw), point); } catch (error) { callbacks.onError(error); }
+  }
+
+  function addMediaAsset(media: MediaAsset, point = nextPosition()) {
+    if (!current) return;
     const width = media.kind === "audio" ? 320 : 360;
     const height = media.kind === "audio" ? 120 : media.kind === "pdf" ? 300 : 240;
     const id = uid("canvas-media");
@@ -1689,6 +2003,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       block: createBlock({ id, type: "media", position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), content: { media } }) });
     selected = new Set([id]);
     renderNodes();
+    renderSelectionInspector(true);
     scheduleSave();
   }
 
@@ -1718,6 +2033,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     selected = new Set([node.id]);
     library.hidden = true;
     renderNodes();
+    renderSelectionInspector(true);
     scheduleSave();
   }
 
@@ -1797,6 +2113,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     current.nodes.push(node);
     selected = new Set([node.id]);
     renderNodes();
+    renderSelectionInspector(true);
     scheduleSave();
     requestAnimationFrame(() => {
       const input = stage.querySelector<HTMLTextAreaElement>(`[data-node-id="${CSS.escape(node.id)}"] .canvas-note-text`);
@@ -1837,10 +2154,11 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     if (!current.nodes.length) current.viewport = { x: 80, y: 80, zoom: 1 };
     else {
       const rect = viewport.getBoundingClientRect();
-      const minX = Math.min(...current.nodes.map(node => node.x));
-      const minY = Math.min(...current.nodes.map(node => node.y));
-      const maxX = Math.max(...current.nodes.map(node => node.x + node.width));
-      const maxY = Math.max(...current.nodes.map(node => node.y + node.height));
+      const visible = current.nodes.filter(node => !node.block?.parentId);
+      const minX = Math.min(...visible.map(node => node.x));
+      const minY = Math.min(...visible.map(node => node.y));
+      const maxX = Math.max(...visible.map(node => node.x + node.width));
+      const maxY = Math.max(...visible.map(node => node.y + node.height));
       const zoom = clamp(Math.min((rect.width - 100) / Math.max(1, maxX - minX), (rect.height - 100) / Math.max(1, maxY - minY)), .25, 1.35);
       current.viewport = { x: (rect.width - (maxX - minX) * zoom) / 2 - minX * zoom, y: (rect.height - (maxY - minY) * zoom) / 2 - minY * zoom, zoom };
     }
@@ -1876,8 +2194,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   };
   viewport.addEventListener("dragover", event => {
     const hasWorkspaceItem = event.dataTransfer?.types.includes("text/x-workspace-item-id");
-    const hasFiles = Boolean(event.dataTransfer?.files?.length);
-    if (!hasWorkspaceItem && !hasFiles) return;
+    if (!hasWorkspaceItem && !hasMediaTransfer(event.dataTransfer)) return;
     event.preventDefault();
     viewport.classList.add("drop-active");
     if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
@@ -1887,16 +2204,36 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   });
   viewport.addEventListener("drop", event => {
     viewport.classList.remove("drop-active");
+    const workspaceId = event.dataTransfer?.getData("text/x-workspace-item-id");
+    if (workspaceId) {
+      event.preventDefault();
+      addReference(workspaceId, worldPoint(event.clientX, event.clientY), true);
+      return;
+    }
     const files = event.dataTransfer?.files ? [...event.dataTransfer.files] : [];
     if (files.length) {
       event.preventDefault();
       void insertMediaFiles(files, worldPoint(event.clientX, event.clientY));
       return;
     }
-    const id = event.dataTransfer?.getData("text/x-workspace-item-id");
-    if (!id) return;
-    event.preventDefault();
-    addReference(id, worldPoint(event.clientX, event.clientY), true);
+    const media = mediaFromTransfer(event.dataTransfer);
+    if (media) {
+      event.preventDefault();
+      addMediaAsset(media, worldPoint(event.clientX, event.clientY));
+      return;
+    }
+  });
+  view.addEventListener("paste", event => {
+    if (view.hidden || !current) return;
+    const target = event.target as HTMLElement;
+    if (target.matches("input,textarea,[contenteditable=true]")) return;
+    const files = event.clipboardData?.files ? [...event.clipboardData.files] : [];
+    if (files.length) { event.preventDefault(); void insertMediaFiles(files); return; }
+    const media = mediaFromTransfer(event.clipboardData);
+    if (media) {
+      event.preventDefault();
+      addMediaAsset(media);
+    }
   });
 
   let panning: { pointerId: number; clientX: number; clientY: number; x: number; y: number } | null = null;
@@ -1968,7 +2305,9 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const editing = target.matches("input,textarea,[contenteditable=true]");
     if (!editing && (event.key === "Delete" || event.key === "Backspace") && selected.size) {
       event.preventDefault();
-      current.nodes = current.nodes.filter(node => !selected.has(node.id));
+      const deleted = new Set(selected);
+      current.nodes.forEach(node => { if (node.block?.parentId && deleted.has(node.block.parentId)) deleted.add(node.id); });
+      current.nodes = current.nodes.filter(node => !deleted.has(node.id));
       selected.clear();
       renderNodes();
       scheduleSave();
@@ -1987,6 +2326,19 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const canvas = workspace.canvas(canvasId);
     if (!canvas) { callbacks.onError(new Error("Canvas 不存在")); return; }
     current = canvas;
+    catalog = null;
+    let migratedHeadings = false;
+    for (const node of [...current.nodes]) {
+      if (node.block?.type !== "heading" || node.block.parentId) continue;
+      const lines = markdownFromContent(node.block.content).split(/\r?\n/);
+      if (lines.length < 2) continue;
+      const titleLine = lines.shift()!;
+      node.block.content = callbacks.contentFromMarkdown(titleLine, node.block.content);
+      node.block.revision += 1;
+      let after = node.id;
+      for (const line of lines) after = createHeadingChild(node.id, after, line).id;
+      migratedHeadings = true;
+    }
     closeSuggestions(); modePopup?.remove(); modePopup = null; closeCurveStyleEditor(); closeNodeMenu(); hideIconPreview();
     drawMode = false; curveMode = false; pendingCurveEndpoint = null; viewport.classList.remove("draw-mode", "curve-mode");
     void callbacks.onLoadDocumentPreview(canvasId).then(state => {
@@ -2012,6 +2364,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     view.hidden = false;
     document.body.dataset.workspaceMode = "canvas";
     renderNodes();
+    if (migratedHeadings) scheduleSave();
     viewport.focus({ preventScroll: true });
   }
 
@@ -2020,6 +2373,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     drawMode = false; curveMode = false; pendingCurveEndpoint = null; drawing = null; viewport.classList.remove("draw-mode", "curve-mode");
     current = null;
     selected.clear();
+    inspector.replaceChildren(); callbacks.onObjectSelection?.(false);
     lastTextSelection = null;
     library.hidden = true;
     view.hidden = true;

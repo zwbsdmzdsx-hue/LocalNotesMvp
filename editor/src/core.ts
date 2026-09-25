@@ -1,7 +1,7 @@
-import { queryLinkSuggestions, headingInfo, headingSection, type LinkSuggestion } from "./link-suggestions";
+import { blockWikiLink, queryLinkSuggestions, headingSection, type LinkSuggestion } from "./link-suggestions";
 import { createBlock as createCanonicalBlock } from "./document-model";
 import { sanitizeHtml, editableContent } from "./block-content";
-import type { BlockType, BlockContent, BlockProperties, Block, BlockComment, LinkToken, Note, Backlink, OverrideNotice, ReferenceOverride, ReferenceMode, ReferenceInstance, ReferenceTargetScope, EditorState, SaveMutation, RequestMap, StyleSheet, MediaAsset, MediaKind, DatabaseField, DatabaseSource, DatabaseRecord, DatabaseValue } from "../../protocol/types";
+import type { BlockType, BlockContent, BlockProperties, Block, BlockComment, LinkToken, ReferenceMode, ReferenceInstance, ReferenceTargetScope, EditorState, SaveMutation, RequestMap, StyleSheet, MediaAsset, DatabaseField, DatabaseSource, DatabaseRecord, DatabaseValue } from "../../protocol/types";
 import type { EditorHostApi } from "./editor-host-api";
 import type { HistoryModel } from "./history";
 import { orderBlockTree } from "./block-tree";
@@ -9,6 +9,8 @@ import { markdownFromContent, markdownFromHtml, plainTextFromContent, renderMark
 import { parseDql, executeDql } from "./database-query";
 import { LocationManager, renderLocationMap } from "./location-manager";
 import type { SurfaceKind } from "./panel-context";
+import { DocumentSaveSession } from "./document-session";
+import { hasMediaTransfer, mediaFromTransfer } from "./media-source";
 
 // The existing renderer and editing operations are shared by browser and desktop.
 export function mountEditor(host: EditorHostApi, ui: {
@@ -66,17 +68,13 @@ const locationManager = new LocationManager({
   onError: showError
 });
 let mutationVersion = 0;
-let inFlightMutation: SaveMutation | null = null;
-let queuedMutation: SaveMutation | null = null;
 let commandTail: Promise<void> = Promise.resolve();
 let commandFailure: Error | null = null;
-let saveFailure: string | null = null;
 let historyTail: Promise<void> = Promise.resolve();
 let historyBusy = false;
 let editGroup = newId();
 let editTarget: EventTarget | null = null;
 let editTime = 0;
-const saveDrainWaiters: Array<() => void> = [];
 let activeEditable: HTMLElement | null = null;
 let lastEditorCaret: { editable: HTMLElement; range: Range } | null = null;
 let activeBlock: HTMLElement | null = null;
@@ -98,26 +96,13 @@ let draggingBlockId: string | null = null;
 let draggingBlockIds: string[] = [];
 let dropIndicator: { targetId?: string; groupId?: string; position: "before" | "after" | "child" | "column-left" | "column-right" | "group-before" | "group-after" } | null = null;
 let draggingColumnGroup: string | null = null;
-let draggingColumn: { containerId: string; column: number } | null = null;
-let columnDropIndicator: { containerId: string; column: number; slot: HTMLElement } | null = null;
 let mediaResize: { blockId: string; startX: number; startWidth: number; containerWidth: number } | null = null;
 const selectedBlockIds = new Set<string>();
 let blockSelectionDrag: { pointerId: number; active: boolean; startId: string } | null = null;
 
-const referenceModeLabels: Record<ReferenceMode, string> = {
-  inline: "正文直显",
-  collapsed: "折叠卡片",
-  sidebar: "右侧分栏",
-  link: "仅标题链接"
-};
-
-type Message = { [K in keyof RequestMap]: { type: K } & RequestMap[K] }[keyof RequestMap];
+type Message = { [K in Exclude<keyof RequestMap, "saveDocument">]: { type: K } & RequestMap[K] }[Exclude<keyof RequestMap, "saveDocument">];
 function post(message: Message, sourceDocumentId = state?.note.id): Promise<void> {
   const { type, ...payload } = message;
-  if (type === "saveDocument") {
-    return host.saveDocument(payload as SaveMutation).then(handleSaveAck, error =>
-      handleSaveNack({ mutationId: (payload as SaveMutation).mutationId, error: error.message }));
-  }
   if (type === "openDocument" || type === "navigateBack" || type === "navigateForward") {
     return historyTail.then(() => flush()).then(() => ui.beforeNavigation?.()).then(() => host.request(type, payload as RequestMap[typeof type], sourceDocumentId))
       .then(() => undefined).catch(showError);
@@ -514,7 +499,6 @@ function applyStyleToSelection(style: StyleSheet) {
     saveStatus.textContent = "请先在正文中选中内容";
     return;
   }
-  const range = remembered.range.cloneRange();
   const startBlock = remembered.start.editable;
   const endBlock = remembered.end.editable;
   const editables = [...blockSurface.querySelectorAll<HTMLElement>(".block-text.rich-editor")];
@@ -1013,7 +997,7 @@ function syncBlockSurface() {
           });
           summary.append(delBtn);
         }
-        const newBody = renderReferenceBody(reference, mode, id);
+        const newBody = renderReferenceBody(reference, mode);
         const oldBody = existing.querySelector<HTMLElement>(":scope > .reference-card, :scope > .sidebar-reference-entry");
         if (oldBody) {
           const oldSig = oldBody.dataset.rowSignature ?? "";
@@ -1061,7 +1045,7 @@ function syncBlockSurface() {
  * shell). Returns either a reference-card, a sidebar-reference-entry, or null if there's
  * nothing to render. The returned element carries a `data-row-signature` for diff use.
  */
-function renderReferenceBody(reference: ReferenceInstance | undefined, mode: ReferenceMode, hostBlockId: string): HTMLElement | null {
+function renderReferenceBody(reference: ReferenceInstance | undefined, mode: ReferenceMode): HTMLElement | null {
   if (!reference) return null;
   if (mode === "sidebar" || mode === "link") {
     const entry = document.createElement("button");
@@ -1156,7 +1140,7 @@ function renderOwnBlockShell(block: Block): HTMLElement {
     const reference = state!.references.find((item) => item.hostBlockId === block.id);
     const mode = reference?.mode ?? "inline";
     shell.innerHTML = `<div class="reference-heading"><button type="button" class="grip" aria-label="引用菜单" title="引用显示方式" draggable="true">⠿</button></div>`;
-    const body = renderReferenceBody(reference, mode, block.id);
+    const body = renderReferenceBody(reference, mode);
     if (body) {
       shell.append(body);
       // Add a × button to the card summary so the user can detach this reference inline
@@ -1678,66 +1662,62 @@ function syncNotices() {
 function showError(error: unknown) {
   saveStatus.textContent = "保存失败：" + (error instanceof Error ? error.message : String(error));
 }
-function executeDatabaseCommand(command: { operation: string; [key: string]: unknown }, sourceType: string) {
+function executeAfterSaveCommand(command: { operation: string; [key: string]: unknown }, sourceType: string,
+  changedMessage: string, version: (current: EditorState) => Record<string, unknown>) {
   const owner = state?.note.id;
   if (!owner) return Promise.reject(new Error("文档尚未载入"));
   const previous = commandTail;
   const task = previous.catch(() => undefined).then(async () => {
-    await new Promise<void>(resolve => runAfterSaveDrain(resolve));
-    if (!state || state.note.id !== owner) throw new Error("文档已切换，请重试数据库操作。");
-    const result = await host.executeCommand({ ...command, mutationId: newId(), clientVersion: state.note.clientVersion + 1 }, owner);
+    await saveSession.flush();
+    if (!state || state.note.id !== owner) throw new Error(changedMessage);
+    const result = await host.executeCommand({ ...command, mutationId: newId(), ...version(state) }, owner);
     applyServerState(result.state, sourceType);
     return result;
   });
   commandTail = task.then(() => undefined, error => { commandFailure = error; showError(error); });
   return task;
+}
+function executeDatabaseCommand(command: { operation: string; [key: string]: unknown }, sourceType: string) {
+  return executeAfterSaveCommand(command, sourceType, "文档已切换，请重试数据库操作。",
+    current => ({ clientVersion: current.note.clientVersion + 1 }));
 }
 function executeLocationCommand(command: { operation: string; [key: string]: unknown }, sourceType: string) {
-  const owner = state?.note.id;
-  if (!owner) return Promise.reject(new Error("文档尚未载入"));
-  const previous = commandTail;
-  const task = previous.catch(() => undefined).then(async () => {
-    await new Promise<void>(resolve => runAfterSaveDrain(resolve));
-    if (!state || state.note.id !== owner) throw new Error("文档已切换，请重试位置操作。");
-    const result = await host.executeCommand({ ...command, mutationId: newId(), expectedLocationVersion: state.locationVersion ?? 0 }, owner);
-    applyServerState(result.state, sourceType);
-    return result;
-  });
-  commandTail = task.then(() => undefined, error => { commandFailure = error; showError(error); });
-  return task;
+  return executeAfterSaveCommand(command, sourceType, "文档已切换，请重试位置操作。",
+    current => ({ expectedLocationVersion: current.locationVersion ?? 0 }));
 }
 async function flush() {
-  if (saveFailure) throw new Error(saveFailure);
-  await new Promise<void>(resolve => runAfterSaveDrain(resolve));
+  await saveSession.flush();
   await commandTail;
-  if (saveFailure) throw new Error(saveFailure);
   if (commandFailure) throw commandFailure;
 }
 
-function pumpSaveQueue() {
-  if (inFlightMutation || !queuedMutation) {
-    finishSaveDrain();
-    return;
+type DocumentSnapshot = Pick<SaveMutation, "documentId" | "title" | "blocks" | "historyGroup">;
+const saveSession = new DocumentSaveSession<DocumentSnapshot>(async snapshot => {
+  const mutation: SaveMutation = {
+    ...snapshot,
+    mutationId: newId(),
+    clientVersion: Math.max(mutationVersion, state?.note.id === snapshot.documentId ? state.note.clientVersion : 0) + 1
+  };
+  const ack = await host.saveDocument(mutation);
+  mutationVersion = ack.clientVersion;
+  if (state?.note.id !== snapshot.documentId) return;
+  state.note.clientVersion = ack.clientVersion;
+  if (ack.history) { state.history = ack.history; publishHistory(); }
+}, (phase, error) => {
+  if (phase === "pending" || phase === "saving") saveStatus.textContent = "正在保存...";
+  if (phase === "saved") {
+    saveStatus.textContent = "已保存到本地数据库";
+    if (state?.references.some(reference => reference.targetDocumentId === state?.note.id)) void refreshLiveReferences();
+    const link = sidebarLink;
+    if (link && state && link.documentId === state.note.id && !link.referenceId) void showLinkSidebar(link, false);
   }
-  inFlightMutation = queuedMutation;
-  queuedMutation = null;
-  const mutation = inFlightMutation;
-  post({
-    type: "saveDocument",
-    documentId: mutation.documentId,
-    mutationId: mutation.mutationId,
-    clientVersion: mutation.clientVersion,
-    title: mutation.title,
-    blocks: mutation.blocks,
-    historyGroup: mutation.historyGroup
-  }, mutation.documentId);
-}
-
-function finishSaveDrain() {
-  if (inFlightMutation || queuedMutation || !saveDrainWaiters.length) return;
-  const waiters = saveDrainWaiters.splice(0);
-  waiters.forEach((action) => action());
-}
+  if (phase === "failed") {
+    mutationVersion = state?.note.clientVersion ?? 0;
+    const message = error instanceof Error ? error.message : String(error ?? "本地数据库拒绝了这次保存");
+    saveStatus.textContent = `保存失败：${message}`;
+    showError(message);
+  }
+});
 
 function enqueueDocumentSave() {
   if (!state?.note.id) return;
@@ -1751,47 +1731,18 @@ function enqueueDocumentSave() {
     ui.canvasStateChanged?.(state, true);
     return;
   }
-  saveFailure = null;
-  const documentId = state.note.id;
-  // Coalesced edits replace the queued snapshot; they must keep its version.
-  // SQLite versions are contiguous, so only a transaction that will be sent
-  // needs a new version number.
-  const clientVersion = queuedMutation?.documentId === documentId
-    ? queuedMutation.clientVersion
-    : Math.max(mutationVersion, state.note.clientVersion ?? 0, inFlightMutation?.clientVersion ?? 0) + 1;
-  mutationVersion = clientVersion;
-  const mutation: SaveMutation = {
-    documentId,
-    mutationId: newId(),
+  const snapshot: DocumentSnapshot = {
+    documentId: state.note.id,
     historyGroup: editGroup,
-    clientVersion,
     title: titleInput.value.trim() || "未命名笔记",
     blocks: readOwnBlocks()
   };
-  state.blocks = mutation.blocks;
+  state.blocks = snapshot.blocks;
   // Keep the panel context ahead of the save ACK. The queued snapshot is the
   // canonical optimistic state, so the calendar and the other right-side
   // panels can render a just-entered date/link without waiting for transport.
   renderAllPanels();
-  queuedMutation = mutation;
-  saveStatus.textContent = "正在保存...";
-  pumpSaveQueue();
-}
-
-function handleSaveAck(message: { mutationId: string; documentId: string; clientVersion: number; history?: HistoryModel }) {
-  if (!inFlightMutation || inFlightMutation.mutationId !== message.mutationId) return;
-  if (inFlightMutation.documentId !== message.documentId) return;
-  if (state?.note.id === message.documentId) state.note.clientVersion = message.clientVersion;
-  saveFailure = null;
-  inFlightMutation = null;
-  if (state?.note.id === message.documentId && message.history) { state.history = message.history; publishHistory(); }
-  saveStatus.textContent = "已保存到本地数据库";
-  pumpSaveQueue();
-  finishSaveDrain();
-  if (!inFlightMutation && !queuedMutation && state?.references.some(reference => reference.targetDocumentId === message.documentId)) {
-    void refreshLiveReferences();
-  }
-  if (!inFlightMutation && !queuedMutation && sidebarLink?.documentId === message.documentId && !sidebarLink.referenceId) void showLinkSidebar(sidebarLink, false);
+  saveSession.schedule(snapshot);
 }
 
 let deferredReferenceRefresh = false;
@@ -1838,22 +1789,8 @@ document.addEventListener("focusout", () => {
   });
 });
 
-function handleSaveNack(message: { mutationId: string; error: string }) {
-  if (!inFlightMutation || inFlightMutation.mutationId !== message.mutationId) return;
-  const error = message.error || "本地数据库拒绝了这次保存";
-  inFlightMutation = null;
-  queuedMutation = null;
-  mutationVersion = state?.note.clientVersion ?? 0;
-  saveFailure = error;
-  saveStatus.textContent = `保存失败：${error}`;
-  showError(error);
-  saveDrainWaiters.splice(0).forEach(resolve => resolve());
-}
-
 function runAfterSaveDrain(action: () => void) {
-  if (saveFailure) return;
-  saveDrainWaiters.push(action);
-  pumpSaveQueue();
+  void saveSession.flush().then(action).catch(showError);
 }
 
 function postAfterFlush(message: Message) {
@@ -2233,8 +2170,18 @@ document.addEventListener("contextmenu", event => {
   event.preventDefault();
   const instance = state?.references.find(item => item.id === target.referenceId);
   if (instance) showReferenceMenu(target.anchor, undefined, instance);
-  // Ordinary [[...]] links are read-only navigation targets. New live
-  // reference instances are not created from a secondary context menu.
+  else if (target.anchor.classList.contains("wiki-link") && editorMode !== "preview") {
+    showMenu(target.anchor, [{ label: "修改显示文字", run: () => {
+      const value = window.prompt("引用显示文字（留空恢复默认）", target.anchor.textContent ?? "");
+      if (value === null) return;
+      const label = value.trim();
+      if (label.includes("]") || label.includes("|")) { showError(new Error("显示文字不能包含 ] 或 |")); return; }
+      const fallback = target.anchor.dataset.targetHeading || target.anchor.dataset.targetTitle || "链接";
+      target.anchor.textContent = label || fallback;
+      const editable = target.anchor.closest<HTMLElement>(".block-text[contenteditable]");
+      editable?.dispatchEvent(new Event("input", { bubbles: true }));
+    } }]);
+  }
 });
 document.addEventListener("keydown", event => { if (event.key === "Escape") dismissPreview(); });
 
@@ -2577,14 +2524,12 @@ function render(next: EditorState) {
   // Upgrade the old hidden layout-block representation once when a document is
   // loaded. New columns are ordinary root blocks sharing a columnGroup.
   next.blocks = migrateLegacyColumns(next.blocks).map(normalizeCanonicalBlockProperties);
-  const blockById = new Map(next.blocks.map(block => [block.id, block]));
   next.blocks.forEach(block => {
     if (block.properties.columnGroup) {
       block.parentId = null;
       return;
     }
     if (!block.parentId) return;
-    const parent = blockById.get(block.parentId);
     if (block.type !== "reference") {
       block.parentId = null;
       const { column: _column, columnGroup: _group, columnWidths: _widths, ...properties } = block.properties;
@@ -2597,7 +2542,6 @@ function render(next: EditorState) {
   activeEditable = null;
   if (changed) activeBlock = null;
   if (changed) {
-    saveFailure = null;
     commandFailure = null;
     mutationVersion = next.note.clientVersion ?? 0;
     editGroup = newId();
@@ -3184,10 +3128,6 @@ function renderDatabaseTable(block: Block) {
   return wrapper;
 }
 
-function mediaKindLabel(kind: MediaKind) {
-  return kind === "image" ? "图片" : kind === "video" ? "视频" : kind === "audio" ? "音频" : kind === "pdf" ? "PDF" : "文件";
-}
-
 function boundedMediaWidth(value: number | undefined) {
   return Math.max(10, Math.min(100, Number.isFinite(value) ? value! : 100));
 }
@@ -3300,12 +3240,6 @@ function finishMediaResize() {
 
 document.addEventListener("pointermove", updateMediaResize);
 document.addEventListener("pointerup", finishMediaResize);
-
-function formatMediaSize(size: number) {
-  if (!Number.isFinite(size) || size < 1024) return `${Math.max(0, size | 0)} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-}
 
 function contentFromRichFragment(fragment: DocumentFragment, fallback: BlockContent): BlockContent {
   const container = document.createElement("div");
@@ -3436,7 +3370,6 @@ function readOwnBlocks(): Block[] {
   const blocks: Block[] = [...blockSurface.querySelectorAll<HTMLElement>("[data-own-block]")].map((shell): Block => {
     const old = state?.blocks.find((block) => block.id === shell.dataset.id);
     const oldParentId = shell.dataset.parentId || null;
-    const oldParent = oldParentId ? state?.blocks.find(block => block.id === oldParentId) : undefined;
     const isReferenceChild = shell.dataset.type === "reference" && !!oldParentId;
     const parentId = isReferenceChild ? oldParentId : null;
     const columnGroup = shell.dataset.columnGroup || old?.properties.columnGroup;
@@ -3567,45 +3500,6 @@ function scheduleDocumentSave(structural?: number) {
   if (structural !== undefined) editGroup = newId();
   enqueueDocumentSave();
 }
-
-function saveDocument() {
-  editGroup = newId();
-  enqueueDocumentSave();
-}
-
-/**
- * Compare two references' rendered structure (which blocks are visible, in what order,
- * with what hidden/override flags). Returns true when the two would render the same set
- * of rows — useful for deciding whether a saveInstanceBlock / moveReferenceBlock /
- * hideReferenceBlock ACK requires a card re-render (which would clobber focused
- * contentEditables). Returns false when blocks were added/removed/moved/re-parented
- * or hidden state changed.
- */
-function sameInstanceStructure(a: ReferenceInstance, b: ReferenceInstance): boolean {
-  return visibleRowSignature(a) === visibleRowSignature(b);
-}
-
-/**
- * Signature of a reference's currently visible rows. Used both for change detection
- * and to skip re-rendering sidebar cards whose DOM already matches state.
- */
-function visibleRowSignature(r: ReferenceInstance): string {
-  const hidden = new Set(r.hiddenBlockIds);
-  const isHidden = (block: Block): boolean => {
-    let candidate: Block | undefined = block;
-    const visited = new Set<string>();
-    while (candidate && !visited.has(candidate.id)) {
-      if (hidden.has(candidate.id)) return true;
-      visited.add(candidate.id);
-      candidate = r.blocks.find((item) => item.id === candidate?.parentId);
-    }
-    return false;
-  };
-  return r.blocks.filter((b) => !isHidden(b)).map((b) => `${b.id}:${b.parentId ?? ""}:${b.position}`).join("|");
-}
-
-// (sameInstanceStructure / visibleRowSignature are no longer needed: renderRelations runs on
-// every ACK and diffs against current state, so we always re-render stale cards.)
 
 function renderReference(reference: ReferenceInstance, inSidebar = false) {
   const card = document.createElement("section");
@@ -3875,7 +3769,9 @@ function detachReferenceAsPlainText(reference: ReferenceInstance) {
 
   removeReferencesFromLocalState(new Set([reference.id]));
   // Save immediately; removing the host block also removes its reference instance.
-  saveDocument();
+  editGroup = newId();
+  enqueueDocumentSave();
+  void saveSession.flush().catch(showError);
   saveStatus.textContent = "引用已断开，内容保留为正文";
 }
 
@@ -4163,7 +4059,7 @@ async function copyBlockLink(block: Block) {
   if (!state) return;
   const document = state.documents.find(item => item.id === state!.note.id);
   const notebook = document?.notebookName ?? "当前笔记本";
-  const link = `[[${notebook}/${state.note.title}#^${block.id}]]`;
+  const link = blockWikiLink(notebook, state.note.title, block.id);
   try {
     await navigator.clipboard?.writeText(link);
     saveStatus.textContent = "块链接已复制，可粘贴到 [[ 联想中使用";
@@ -4426,22 +4322,6 @@ function insertLocationBlock(locationId: string) {
   scheduleDocumentSave(0);
 }
 
-function focusFirstBodyBlock() {
-  const first = blockSurface.querySelector<HTMLElement>(":scope > [data-own-block] .block-text")
-    ?? blockSurface.querySelector<HTMLElement>("[data-own-block] .block-text");
-  if (first) {
-    first.focus();
-    const selection = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(first);
-    range.collapse(true);
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-    return;
-  }
-  addBlock("paragraph", { focusFirst: true });
-}
-
 function addDatabaseTable() {
   if (editorMode === "preview" || !state) return;
   const databaseId = `db-${newId()}`;
@@ -4519,14 +4399,6 @@ function exportDatabase(block: Block, csv: boolean) {
     .catch(showError);
 }
 
-function mediaKindForMime(mimeType: string): MediaKind {
-  if (mimeType.startsWith("image/")) return "image";
-  if (mimeType.startsWith("video/")) return "video";
-  if (mimeType.startsWith("audio/")) return "audio";
-  if (mimeType === "application/pdf") return "pdf";
-  return "file";
-}
-
 function filesFromTransfer(transfer: DataTransfer | null | undefined) {
   if (!transfer) return [];
   const files = [...transfer.items]
@@ -4551,48 +4423,67 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
-async function insertMediaFiles(files: readonly File[], anchor?: HTMLElement | null) {
+type MediaDropPlacement = { targetId?: string; groupId?: string; position: "before" | "after" | "column-left" | "column-right" | "group-before" | "group-after" };
+
+function mediaPlacementFromAnchor(anchor?: HTMLElement | null): MediaDropPlacement | null {
+  const shell = anchor?.closest<HTMLElement>("[data-own-block]") ?? activeBlock;
+  return shell?.dataset.id ? { targetId: shell.dataset.id, position: "after" } : null;
+}
+
+function insertMediaAssets(assets: readonly MediaAsset[], placement: MediaDropPlacement | null) {
+  if (!state || !assets.length) return;
+  const target = placement?.targetId ? state.blocks.find(block => block.id === placement.targetId) : undefined;
+  const appendPosition = Number(nextPosition(null));
+  const blocks = assets.map((asset, index) => {
+    const block = createBlock("media");
+    block.content = { text: asset.name, html: "", media: asset };
+    block.position = String(appendPosition + index * 1000).padStart(8, "0");
+    state!.blocks.push(block);
+    return block;
+  });
+  const position = placement?.position;
+  if (target && (position === "column-left" || position === "column-right") && !target.parentId) {
+    placeBlocksInColumn(blocks, target, position);
+  } else if (target) {
+    blocks.forEach(block => {
+      block.parentId = target.parentId;
+      if (target.properties.columnGroup) setColumnMember(block, target.properties.columnGroup, columnIndex(target), target.properties.columnWidths);
+    });
+    insertBlocksRelative(blocks, target, position === "before" ? "before" : "after");
+  } else if (placement?.groupId && (position === "group-before" || position === "group-after")) {
+    const items = rootMoveItems().filter(item => !blocks.some(block => item.key === block.id));
+    const index = items.findIndex(item => item.key === `group:${placement.groupId}`);
+    if (index >= 0) {
+      items.splice(index + (position === "group-after" ? 1 : 0), 0, ...blocks.map(block => ({ key: block.id, blocks: [block] })));
+      applyRootMoveOrder(items);
+    }
+  }
+  state.blocks = orderBlockTree(state.blocks);
+  renderAllPanels();
+  scheduleDocumentSave(0);
+}
+
+async function insertMediaFiles(files: readonly File[], anchor?: HTMLElement | null, placement = mediaPlacementFromAnchor(anchor)) {
   if (!state || editorMode === "preview") return;
+  const documentState = state;
   const accepted = files.filter(file => file.size >= 0);
   if (!accepted.length) {
     showError(new Error("请选择可读取的媒体文件。"));
     return;
   }
-  const anchorShell = anchor?.closest<HTMLElement>("[data-own-block]") ?? activeBlock;
-  let anchorBlock = anchorShell?.dataset.id ? state.blocks.find(block => block.id === anchorShell.dataset.id) : undefined;
   const failures: string[] = [];
-  let inserted = 0;
+  const assets: MediaAsset[] = [];
   for (const file of accepted) {
     try {
       const data = await fileToBase64(file);
       const result = await host.storeMedia({ name: file.name, mimeType: file.type, size: file.size, data });
-      const asset = result.media;
-      const block = createBlock("media");
-      block.parentId = anchorBlock?.parentId ?? null;
-      if (anchorBlock?.properties.columnGroup) {
-        block.properties = {
-          columnGroup: anchorBlock.properties.columnGroup,
-          column: columnIndex(anchorBlock),
-          columnWidths: anchorBlock.properties.columnWidths
-        };
-      }
-      block.position = anchorBlock ? anchorBlock.position : nextPosition(block.parentId);
-      block.content = { text: asset.name, html: "", media: asset };
-      state.blocks.push(block);
-      if (anchorBlock) {
-        insertBlocksRelative([block], anchorBlock, "after");
-        anchorBlock = block;
-      }
-      inserted++;
+      assets.push(result.media);
     } catch (error) {
       failures.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  if (inserted) {
-    state.blocks = orderBlockTree(state.blocks);
-    renderAllPanels();
-    scheduleDocumentSave(0);
-  }
+  if (state !== documentState) { showError(new Error("媒体读取期间文档已切换，请在目标文档中重新插入。")); return; }
+  insertMediaAssets(assets, placement);
   if (failures.length) showError(new Error(`部分媒体未插入：${failures.join("；")}`));
 }
 
@@ -4617,25 +4508,6 @@ function addColumns() {
   renderAllPanels();
   blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(first.id)}"] .block-text`)?.focus();
   scheduleDocumentSave(0);
-}
-
-function addColumnChild(groupId: string, column: number) {
-  if (editorMode === "preview" || !state) return;
-  const members = state.blocks.filter(block => block.properties.columnGroup === groupId && columnIndex(block) === column);
-  if (!members.length) return;
-  const child = createBlock("paragraph");
-  child.position = String((Math.max(0, ...members.map(block => Number(block.position))) + 1000)).padStart(8, "0");
-  child.properties = { columnGroup: groupId, column, columnWidths: members.find(block => block.properties.columnWidths)?.properties.columnWidths };
-  state.blocks.push(child);
-  state.blocks = orderBlockTree(state.blocks);
-  renderAllPanels();
-  blockSurface.querySelector<HTMLElement>(`[data-own-block][data-id="${CSS.escape(child.id)}"] .block-text`)?.focus();
-  scheduleDocumentSave(0);
-}
-
-function restoreColumns(shell: HTMLElement) {
-  if (!state) return;
-  if (shell.dataset.columnGroup) restoreColumnGroup(shell.dataset.columnGroup);
 }
 
 function applyFormat(command: "bold" | "italic" | "hiliteColor") {
@@ -4701,8 +4573,7 @@ async function switchEditorMode(next: EditorMode) {
   const activeId = activeBlock?.dataset.id;
   if (state && editorMode !== "preview") {
     enqueueDocumentSave();
-    await flush();
-    if (saveFailure) return;
+    try { await flush(); } catch { return; }
   }
   editorMode = next;
   localStorage.setItem("lnm-editor-mode", editorMode);
@@ -4930,9 +4801,12 @@ document.addEventListener("paste", event => {
   const target = event.target as HTMLElement | null;
   if (!target?.closest(".block-text[contenteditable='true'], .media-name[contenteditable='true']")) return;
   const files = filesFromTransfer(event.clipboardData);
-  if (!files.length) return;
+  const media = !files.length && (event.clipboardData?.types.includes("text/uri-list") || event.clipboardData?.types.includes("text/html"))
+    ? mediaFromTransfer(event.clipboardData) : null;
+  if (!files.length && !media) return;
   event.preventDefault();
-  void insertMediaFiles(files, target.closest<HTMLElement>("[data-own-block]") ?? activeBlock);
+  if (files.length) void insertMediaFiles(files, target);
+  else if (media) insertMediaAssets([media], mediaPlacementFromAnchor(target));
 }, true);
 document.addEventListener("copy", event => {
   const remembered = styleSelection;
@@ -5001,7 +4875,6 @@ function clearDropIndicator() {
   document.querySelectorAll(".columns-row").forEach(el => el.classList.remove("drop-before", "drop-after"));
   document.querySelectorAll(".column-divider").forEach(el => el.classList.remove("drop-target"));
   dropIndicator = null;
-  columnDropIndicator = null;
 }
 
 function setDropIndicator(targetShell: HTMLElement, position: "before" | "after" | "child") {
@@ -5108,11 +4981,34 @@ function setDragPreview(event: DragEvent, values: string[]) {
   setTimeout(() => ghost.remove(), 0);
 }
 
+function updateMediaDropIndicator(event: DragEvent) {
+  const element = event.target as HTMLElement;
+  const shell = element.closest<HTMLElement>(".block-shell[data-own-block]");
+  if (shell?.dataset.id && !shell.closest(".reference-row")) {
+    const block = state?.blocks.find(item => item.id === shell.dataset.id);
+    const rect = shell.getBoundingClientRect();
+    const x = (event.clientX - rect.left) / Math.max(1, rect.width);
+    const y = (event.clientY - rect.top) / Math.max(1, rect.height);
+    if (block && !block.parentId && x < .18) setColumnDropIndicator(shell, "left");
+    else if (block && !block.parentId && x > .82) setColumnDropIndicator(shell, "right");
+    else setDropIndicator(shell, y < .5 ? "before" : "after");
+    return;
+  }
+  const row = element.closest<HTMLElement>(".columns-row[data-column-group]");
+  if (row?.dataset.columnGroup) {
+    const rect = row.getBoundingClientRect();
+    setGroupDropIndicator(row, row.dataset.columnGroup, event.clientY < rect.top + rect.height / 2 ? "before" : "after");
+  } else clearDropIndicator();
+}
+
 function handleDragOver(event: DragEvent) {
-  if (event.dataTransfer?.types.includes("Files")) {
+  const mediaTransfer = !draggingBlockId && !event.dataTransfer?.types.includes("text/x-block-id") &&
+    (hasMediaTransfer(event.dataTransfer) || event.dataTransfer?.types.includes("text/plain"));
+  if (mediaTransfer) {
     event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
     blockSurface.classList.add("media-drop-active");
+    updateMediaDropIndicator(event);
     return;
   }
   const sourceDocumentId = event.dataTransfer?.getData("text/x-source-document-id");
@@ -5203,9 +5099,12 @@ function handleDragOver(event: DragEvent) {
 }
 
 function handleDragLeave(event: DragEvent) {
-  if (event.dataTransfer?.types.includes("Files")) {
+  if (blockSurface.classList.contains("media-drop-active")) {
     const related = event.relatedTarget as Node | null;
-    if (!related || !blockSurface.contains(related)) blockSurface.classList.remove("media-drop-active");
+    if (!related || !blockSurface.contains(related)) {
+      blockSurface.classList.remove("media-drop-active");
+      clearDropIndicator();
+    }
     return;
   }
   if (event.dataTransfer?.types.includes("text/x-block-id")) {
@@ -5262,7 +5161,7 @@ function insertBlocksRelative(blocks: Block[], target: Block, position: "before"
   const groupId = target.properties.columnGroup;
   const column = groupId ? columnIndex(target) : undefined;
   const movedIds = new Set(blocks.map(block => block.id));
-  const siblings = state.blocks.filter(candidate => !movedIds.has(candidate.id) && candidate.parentId === null &&
+  const siblings = state.blocks.filter(candidate => !movedIds.has(candidate.id) && candidate.parentId === target.parentId &&
     (groupId ? candidate.properties.columnGroup === groupId && columnIndex(candidate) === column : !candidate.properties.columnGroup));
   siblings.sort((left, right) => left.position.localeCompare(right.position) || left.id.localeCompare(right.id));
   const targetIndex = siblings.findIndex(candidate => candidate.id === target.id);
@@ -5271,15 +5170,48 @@ function insertBlocksRelative(blocks: Block[], target: Block, position: "before"
   siblings.forEach((candidate, index) => { candidate.position = String((index + 1) * 1000).padStart(8, "0"); });
 }
 
+function placeBlocksInColumn(blocks: Block[], target: Block, position: "column-left" | "column-right") {
+  if (!state) return;
+  let groupId = target.properties.columnGroup;
+  if (!groupId) {
+    groupId = `columns-${newId()}`;
+    const targetPosition = target.position;
+    setColumnMember(target, groupId, position === "column-left" ? 1 : 0, [1, 1]);
+    blocks.forEach(block => setColumnMember(block, groupId!, position === "column-left" ? 0 : 1, [1, 1]));
+    target.position = targetPosition;
+    blocks.forEach((block, index) => { block.position = String(Number(targetPosition) + index).padStart(8, "0"); });
+  } else {
+    const targetColumn = columnIndex(target);
+    const insertedColumn = position === "column-left" ? targetColumn : targetColumn + 1;
+    state.blocks.filter(block => block.properties.columnGroup === groupId).forEach(block => {
+      if (columnIndex(block) >= insertedColumn) block.properties = { ...block.properties, column: columnIndex(block) + 1 };
+    });
+    const widths = state.blocks.find(block => block.properties.columnGroup === groupId)?.properties.columnWidths ?? [];
+    const nextWidths = [...widths.slice(0, insertedColumn), 1, ...widths.slice(insertedColumn)];
+    state.blocks.filter(block => block.properties.columnGroup === groupId).forEach(block => {
+      block.properties = { ...block.properties, columnWidths: nextWidths };
+    });
+    blocks.forEach((block, index) => {
+      setColumnMember(block, groupId!, insertedColumn, nextWidths);
+      block.position = String(Number(target.position) + index).padStart(8, "0");
+    });
+    normalizeColumnGroup(groupId);
+  }
+}
+
 function handleDrop(event: DragEvent) {
   event.preventDefault();
-  const files = event.dataTransfer?.files ? [...event.dataTransfer.files] : [];
-  if (files.length) {
+  const files = filesFromTransfer(event.dataTransfer);
+  const media = !files.length && !draggingBlockId && !event.dataTransfer?.types.includes("text/x-block-id")
+    ? mediaFromTransfer(event.dataTransfer) : null;
+  if (files.length || media) {
+    updateMediaDropIndicator(event);
+    const placement = dropIndicator && dropIndicator.position !== "child" ? { ...dropIndicator } as MediaDropPlacement : null;
     blockSurface.classList.remove("media-drop-active");
     clearDropIndicator();
     draggingBlockId = null;
-    draggingColumn = null;
-    void insertMediaFiles(files, event.target as HTMLElement);
+    if (files.length) void insertMediaFiles(files, event.target as HTMLElement, placement);
+    else if (media) insertMediaAssets([media], placement);
     return;
   }
   const externalBlockId = event.dataTransfer?.getData("text/x-block-id");
@@ -5373,31 +5305,7 @@ function handleDrop(event: DragEvent) {
   } else if (!targetBlock) {
     draggedBlocks.forEach(block => { block.position = nextPosition(null); });
   } else if (position === "column-left" || position === "column-right") {
-    let groupId = targetBlock.properties.columnGroup;
-    if (!groupId) {
-      groupId = `columns-${newId()}`;
-      const targetPosition = targetBlock.position;
-      setColumnMember(targetBlock, groupId, position === "column-left" ? 1 : 0, [1, 1]);
-      draggedBlocks.forEach(block => setColumnMember(block, groupId!, position === "column-left" ? 0 : 1, [1, 1]));
-      targetBlock.position = targetPosition;
-      draggedBlocks.forEach((block, index) => { block.position = String(Number(targetPosition) + index).padStart(8, "0"); });
-    } else {
-      const targetColumn = columnIndex(targetBlock);
-      const insertedColumn = position === "column-left" ? targetColumn : targetColumn + 1;
-      state.blocks.filter(block => block.properties.columnGroup === groupId).forEach(block => {
-        if (columnIndex(block) >= insertedColumn) block.properties = { ...block.properties, column: columnIndex(block) + 1 };
-      });
-      const widths = state.blocks.find(block => block.properties.columnGroup === groupId)?.properties.columnWidths ?? [];
-      const nextWidths = [...widths.slice(0, insertedColumn), 1, ...widths.slice(insertedColumn)];
-      state.blocks.filter(block => block.properties.columnGroup === groupId).forEach(block => {
-        block.properties = { ...block.properties, columnWidths: nextWidths };
-      });
-      draggedBlocks.forEach((block, index) => {
-        setColumnMember(block, groupId!, insertedColumn, nextWidths);
-        block.position = String(Number(targetBlock.position) + index).padStart(8, "0");
-      });
-      normalizeColumnGroup(groupId);
-    }
+    placeBlocksInColumn(draggedBlocks, targetBlock, position);
   } else if (targetBlock) {
     if (targetBlock.properties.columnGroup) {
       draggedBlocks.forEach(block => setColumnMember(block, targetBlock.properties.columnGroup!, columnIndex(targetBlock), targetBlock.properties.columnWidths));
@@ -5419,7 +5327,6 @@ function handleDragEnd() {
   blockSurface.classList.remove("external-block-drop-active");
   clearDropIndicator();
   document.querySelectorAll(".column-grip").forEach(el => el.classList.remove("is-dragging"));
-  draggingColumn = null;
   draggingColumnGroup = null;
   document.querySelectorAll(".block-shell").forEach(el => el.classList.remove("is-dragging"));
   draggingBlockId = null;
@@ -5452,28 +5359,7 @@ function clear() {
   saveStatus.textContent = "请选择或新建笔记";
 }
 async function createDiaryDocument(documentId: string, headingTitle: string) {
-  // A Canvas reuses the document-shaped state for its panels, but its layout
-  // owns persistence. Saving a diary heading through render()/enqueueDocumentSave
-  // here would therefore try to send the diary blocks to the active Canvas.
-  // Write the diary document directly while keeping the Canvas state mounted.
-  if (canvasContext) {
-    await flush();
-    const loaded = await host.loadDocument(documentId);
-    const exists = loaded.blocks.some(block => {
-      const source = markdownFromContent(block.content).split(/\r?\n/).find(value => value.trim()) ?? "";
-      return /^\s*#(?:[ \u3000]+|$)/.test(source) && source.replace(/^\s*#[ \u3000]*/, "").trim() === headingTitle;
-    });
-    if (!exists) {
-      const position = String((loaded.blocks.length + 1) * 1000).padStart(8, "0");
-      loaded.blocks.push({
-        id: newId(), parentId: null, position, type: "heading",
-        content: { text: headingTitle, html: `<h1>${escapeText(headingTitle)}</h1>`, markdown: `# ${headingTitle}` },
-        properties: { headingLevel: 1 }, revision: 1
-      });
-      await host.saveDocument({ documentId, mutationId: newId(), clientVersion: (loaded.note.clientVersion ?? 0) + 1, title: loaded.note.title, blocks: loaded.blocks });
-    }
-    return;
-  }
+  const fromCanvas = canvasContext;
   await flush();
   const loaded = await host.loadDocument(documentId);
   const exists = loaded.blocks.some(block => {
@@ -5487,6 +5373,12 @@ async function createDiaryDocument(documentId: string, headingTitle: string) {
       content: { text: headingTitle, html: `<h1>${escapeText(headingTitle)}</h1>`, markdown: `# ${headingTitle}` },
       properties: { headingLevel: 1 }, revision: 1
     });
+  }
+  // Canvas owns the active surface's persistence. Save the diary document
+  // directly without replacing the mounted Canvas state.
+  if (fromCanvas) {
+    if (!exists) await host.saveDocument({ documentId, mutationId: newId(), clientVersion: (loaded.note.clientVersion ?? 0) + 1, title: loaded.note.title, blocks: loaded.blocks });
+    return;
   }
   render(loaded);
   enqueueDocumentSave();
@@ -5504,7 +5396,7 @@ return {
   insertCalendarLink,
   readOnlyProjection,
   contentFromMarkdown,
-  retry: () => { saveFailure = null; commandFailure = null; enqueueDocumentSave(); },
+  retry: () => { commandFailure = null; enqueueDocumentSave(); },
   load: (next: EditorState) => { canvasContext = false; render(next); },
   loadCanvas: (next: EditorState) => { canvasContext = true; render(next); },
   setCanvasActiveBlock: (block?: Block) => {
