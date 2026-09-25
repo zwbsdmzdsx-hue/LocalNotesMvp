@@ -2381,12 +2381,34 @@ function syncColumnGroupRow(row: HTMLElement, groupId: string, members: Block[])
     });
     return;
   }
+  const tracks = [...grid.querySelectorAll<HTMLElement>(":scope > .column-track")];
+  if (tracks.length === count && tracks.every(track => track.dataset.editorMode === editorMode)) {
+    grid.dataset.signature = signature;
+    for (let column = 0; column < count; column++) {
+      const track = tracks[column];
+      const columnBlocks = ordered.filter(block => columnIndex(block) === column);
+      const desiredIds = new Set(columnBlocks.map(block => block.id));
+      columnBlocks.forEach((block, index) => {
+        const shell = grid.querySelector<HTMLElement>(`.block-shell[data-id="${CSS.escape(block.id)}"]`) ?? renderOwnBlockShell(block);
+        shell.dataset.columnGroup = groupId;
+        shell.dataset.column = String(column);
+        shell.dataset.parentId = "";
+        if (track.children[index] !== shell) track.insertBefore(shell, track.children[index] ?? null);
+        syncBlockCommentBubble(shell, block);
+      });
+      track.querySelectorAll<HTMLElement>(":scope > .block-shell").forEach(shell => {
+        if (!desiredIds.has(shell.dataset.id ?? "")) shell.remove();
+      });
+    }
+    return;
+  }
   grid.dataset.signature = signature;
   grid.replaceChildren();
   for (let column = 0; column < count; column++) {
     const track = document.createElement("div");
     track.className = "column-track";
     track.dataset.column = String(column);
+    track.dataset.editorMode = editorMode;
     const columnBlocks = ordered.filter(block => columnIndex(block) === column);
     for (const block of columnBlocks) {
       let shell = row.querySelector<HTMLElement>(`.block-shell[data-id="${CSS.escape(block.id)}"]`)

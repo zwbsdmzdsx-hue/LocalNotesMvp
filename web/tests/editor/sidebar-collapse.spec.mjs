@@ -1,5 +1,18 @@
 import { test, expect } from "@playwright/test";
 
+async function createSidebarReference(page) {
+  const paragraph = page.locator('[data-id="a1"] > .block-row > .block-text');
+  await page.locator('[data-editor-mode="source"]').click();
+  await paragraph.fill('第二个引用 [[默认笔记本/Gamma#^g1]]');
+  await expect(page.locator('#status')).toContainText('已保存');
+  await page.locator('[data-editor-mode="rich"]').click();
+  await page.locator('[data-pane-btn="reference-sidebar"]').click();
+  const entry = page.locator('#reference-sidebar .linked-reference-entry').filter({ hasText: 'Gamma' });
+  await expect(entry).toBeVisible();
+  await entry.locator('.reference-mode-menu').click();
+  await page.getByRole('menu').getByText('右侧分栏', { exact: true }).click();
+}
+
 test("× button on sidebar reference card does NOT blank 实时引用 panel", async ({ page }) => {
   await page.goto("/");
   // Set the only reference to sidebar mode
@@ -253,10 +266,7 @@ test("creating a new reference does NOT blank 实时引用 panel mid-action", as
   await page.waitForTimeout(400);
   const sidebar = page.locator('#reference-sidebar');
   const before = await sidebar.locator('.reference-card[data-reference-id]').count();
-  // Click the grip on a paragraph block (not the reference)
-  const para = page.locator('[data-own-block][data-type="paragraph"]').first();
-  await para.locator(".grip").click();
-  await page.getByRole("menu").getByText("嵌入为实时引用").click();
+  await createSidebarReference(page);
   // Sample panel during/after action
   const samples = [];
   await page.waitForTimeout(50).then(async () => {
@@ -333,10 +343,7 @@ test("CREATE-REFERENCE: panel never goes blank during new reference creation", a
   const sidebar = page.locator('#reference-sidebar');
   const before = await sidebar.locator('.reference-card[data-reference-id]').count();
   console.log("Before create: cards=", before);
-  // Add new reference via paragraph grip
-  const para = page.locator('[data-own-block][data-type="paragraph"]').first();
-  await para.locator('.grip').click();
-  await page.getByRole("menu").getByText("嵌入为实时引用").click();
+  await createSidebarReference(page);
   // Sample the panel contents during/after the operation
   const samples = [];
   const start = Date.now();
@@ -405,10 +412,7 @@ test("REMOVE-REFERENCE + tab switch: panel still clean after coming back", async
 test("CREATE-REFERENCE + tab switch: panel reflects the new card after returning", async ({ page }) => {
   await page.goto("/");
   await page.waitForTimeout(400);
-  // Create a new reference on a paragraph
-  const para = page.locator('[data-own-block][data-type="paragraph"]').first();
-  await para.locator('.grip').click();
-  await page.getByRole("menu").getByText("嵌入为实时引用").click();
+  await createSidebarReference(page);
   await page.waitForTimeout(800);
   // Switch away and back
   await page.locator('#sidebar-right [data-pane-btn="backlinks"]').click();

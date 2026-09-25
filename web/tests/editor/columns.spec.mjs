@@ -229,6 +229,11 @@ test('restoring columns orders every column top-to-bottom without gaps', async (
   await right.press('Enter');
   await page.keyboard.type('右列第二行');
   await saved(page);
+  const beforeRestore = await page.evaluate(() => window.mockHost.state('alpha').blocks
+    .filter(block => block.properties.columnGroup)
+    .map(block => ({ text: block.content.text, column: block.properties.column, position: block.position })));
+  expect(beforeRestore.sort((a, b) => a.column - b.column || a.position.localeCompare(b.position)).map(block => block.text))
+    .toEqual(['左列第一行', '左列第二行', '右列第一行', '右列第二行']);
   const groupId = await page.evaluate(() => window.mockHost.state('alpha').blocks.find(block => block.properties.columnGroup)?.properties.columnGroup);
   await page.locator('.columns-restore').click();
   await saved(page);

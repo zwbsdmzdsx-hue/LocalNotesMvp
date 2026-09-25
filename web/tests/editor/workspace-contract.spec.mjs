@@ -50,13 +50,13 @@ test("deleting current document selects a live document and clears dead history"
   await expect(page.locator("#status")).toContainText("已保存");
 });
 
-test("deleting a parent promotes its child and saves a valid tree", async ({ page }) => {
+test("ordinary blocks stay flat and deleting one keeps its sibling", async ({ page }) => {
   await page.goto("/");
   await page.locator('[data-doc="beta"]').click();
   await page.locator('[data-id="b2"] .block-text').click();
   await page.locator("#indent").click();
-  await expect(page.locator('[data-id="b2"]')).toHaveAttribute("data-parent-id", "b1");
-  await expect(page.locator("#status")).toContainText("已保存");
+  await expect(page.locator('[data-id="b2"]')).toHaveAttribute("data-parent-id", "");
+  await expect(page.locator("#status")).toContainText("正文块不支持普通子级");
   await page.locator('[data-id="b1"] .delete-block').click();
   await expect(page.locator("#status")).toContainText("已保存");
   await page.locator('[data-doc="alpha"]').click();
