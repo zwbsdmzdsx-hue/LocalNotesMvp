@@ -1,6 +1,8 @@
 import * as L from "leaflet";
+import type * as MapLibre from "maplibre-gl";
 import type { LeafletMouseEvent } from "leaflet";
 import "../../web/node_modules/leaflet/dist/leaflet.css";
+import "../../web/node_modules/maplibre-gl/dist/maplibre-gl.css";
 import type { EditorCommand } from "../../protocol/types";
 import type { GeoLocation, LocationPrecision, LocationScope, LocationSource } from "../../protocol/types";
 
@@ -79,6 +81,9 @@ export class LocationManager {
   private draft: LocationDraft | null = null;
   private map: L.Map | null = null;
   private marker: L.Marker | null = null;
+  private overviewMap: MapLibre.Map | null = null;
+  private overviewMarkers: MapLibre.Marker[] = [];
+  private overviewObserver: IntersectionObserver | null = null;
   private reverseTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly options: LocationManagerOptions) {}
@@ -92,6 +97,7 @@ export class LocationManager {
 
   private renderList(state: LocationManagerState) {
     this.disposeMap();
+    this.disposeOverviewMap();
     const panel = this.options.panel;
     panel.replaceChildren();
     const head = document.createElement("div"); head.className = "location-manager-head";
@@ -107,12 +113,52 @@ export class LocationManager {
     const locations = state.locations.filter(location => location.scope === this.scope && (this.scope === "global" || location.notebookId === state.notebookId));
     const active = locations.filter(location => !location.deletedAt);
     const deleted = locations.filter(location => !!location.deletedAt);
+    const mapCanvas = document.createElement("div"); mapCanvas.className = "location-overview-map"; mapCanvas.setAttribute("aria-label", "位置矢量地图"); mapCanvas.setAttribute("aria-busy", "true");
+    panel.append(mapCanvas);
+    this.overviewObserver = new IntersectionObserver(entries => {
+      if (!entries[0]?.isIntersecting) return;
+      this.overviewObserver?.disconnect(); this.overviewObserver = null;
+      this.renderOverviewMap(mapCanvas, active);
+    });
+    this.overviewObserver.observe(mapCanvas);
     if (!active.length && !deleted.length) { const empty = document.createElement("p"); empty.className = "location-empty"; empty.textContent = "暂无位置记录"; panel.append(empty); return; }
     active.forEach(location => panel.append(this.renderCard(location, false)));
     if (deleted.length) {
       const heading = document.createElement("div"); heading.className = "location-deleted-heading"; heading.textContent = "已删除位置"; panel.append(heading);
       deleted.forEach(location => panel.append(this.renderCard(location, true)));
     }
+  }
+
+  private renderOverviewMap(container: HTMLElement, locations: GeoLocation[]) {
+    void import("maplibre-gl").then(maplibregl => {
+      if (!container.isConnected) return;
+      const first = locations[0];
+      const map = new maplibregl.Map({
+        container,
+        style: "https://tiles.openfreemap.org/styles/liberty",
+        center: first ? [first.longitude, first.latitude] : [113.2644, 23.1291],
+        zoom: locations.length > 1 ? 8 : 11,
+        attributionControl: false
+      });
+      this.overviewMap = map;
+      map.once("idle", () => container.setAttribute("aria-busy", "false"));
+      map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+      map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
+      locations.forEach(location => {
+        const pin = document.createElement("button"); pin.type = "button"; pin.className = "location-vector-pin"; pin.title = location.name; pin.setAttribute("aria-label", `地图标记：${location.name}`);
+        pin.onclick = () => container.parentElement?.querySelector<HTMLElement>(`.location-card[data-location-id="${CSS.escape(location.id)}"]`)?.scrollIntoView({ block: "nearest" });
+        const marker = new maplibregl.Marker({ element: pin, anchor: "bottom" }).setLngLat([location.longitude, location.latitude]).addTo(map);
+        this.overviewMarkers.push(marker);
+      });
+      if (locations.length > 1) {
+        const bounds = new maplibregl.LngLatBounds();
+        locations.forEach(location => bounds.extend([location.longitude, location.latitude]));
+        map.fitBounds(bounds, { padding: 30, maxZoom: 13, duration: 0 });
+      }
+      const observer = new ResizeObserver(() => { if (container.isConnected && container.clientWidth) map.resize(); });
+      observer.observe(container);
+      map.on("remove", () => observer.disconnect());
+    }).catch(error => this.options.onError(error));
   }
 
   private renderCard(location: GeoLocation, deleted: boolean) {
@@ -138,6 +184,7 @@ export class LocationManager {
   private renderEditor(state: LocationManagerState) {
     const draft = this.draft!;
     this.disposeMap();
+    this.disposeOverviewMap();
     const panel = this.options.panel; panel.replaceChildren();
     const head = document.createElement("div"); head.className = "location-editor-head";
     const back = document.createElement("button"); back.textContent = "← 返回位置"; back.onclick = () => { this.draft = null; this.render(); };
@@ -187,4 +234,5 @@ export class LocationManager {
     try { await this.options.execute({ operation, ...payload }, operation); this.draft = null; this.render(); } catch (error) { this.options.onError(error); }
   }
   private disposeMap() { clearTimeout(this.reverseTimer); this.reverseTimer = undefined; this.map?.remove(); this.map = null; this.marker = null; }
+  private disposeOverviewMap() { this.overviewObserver?.disconnect(); this.overviewObserver = null; this.overviewMarkers.forEach(marker => marker.remove()); this.overviewMarkers = []; this.overviewMap?.remove(); this.overviewMap = null; }
 }

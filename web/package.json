@@ -17,6 +17,7 @@
     "@types/leaflet": "^1.9.22",
     "dompurify": "^3.4.15",
     "leaflet": "^1.9.4",
+    "maplibre-gl": "^6.11.2",
     "marked": "^18.0.13",
     "turndown": "^7.2.4"
   }

@@ -15,6 +15,7 @@ web/node_modules/
 **/.vite/
 editor/dist/
 web/test-results/
+web/test-results-*/
 web/compat-test-results/
 web/playwright-report/
 tests/*.png

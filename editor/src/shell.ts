@@ -63,6 +63,7 @@ export interface ShellApi {
   showLocations(): void;
   showHistory(): void;
   setDatabaseContext(visible: boolean, activate?: boolean): void;
+  setDashboardWidgetContext(visible: boolean, activate?: boolean): void;
   updateHistory(model: HistoryModel): void;
   setPanelContext(context: PanelContext | null): void;
 }
@@ -104,6 +105,7 @@ const BOOKMARK_COLORS = [
 export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellApi {
   const layout = loadLayout();
   let databaseContextVisible = false;
+  let dashboardWidgetContextVisible = false;
   let panelContext: PanelContext | null = null;
   let rightTabBeforeDatabase = layout.rightActiveTab === "databases" ? "reference-sidebar" : layout.rightActiveTab;
   function execute(command: WorkspaceCommand) {
@@ -141,7 +143,8 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       { tab: "calendar", label: "日历", slot: "calendar" },
       { tab: "locations", label: "地图管理", slot: "locations" },
       { tab: "styles", label: "CSS 管理", slot: "styles" },
-      { tab: "databases", label: "数据表属性", slot: "databases" }
+      { tab: "databases", label: "数据表属性", slot: "databases" },
+      { tab: "dashboard-config", label: "组件设置", slot: "dashboard-config" }
     ];
     for (const s of sections) {
       const sec = document.createElement("section");
@@ -162,10 +165,12 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
   function applyRightTab(tab?: string) {
     let active = tab ?? layout.rightActiveTab;
     if (active === "databases" && !databaseContextVisible) active = rightTabBeforeDatabase || "reference-sidebar";
+    if (active === "dashboard-config" && !dashboardWidgetContextVisible) active = "reference-sidebar";
     if (active !== "databases") rightTabBeforeDatabase = active;
     layout.rightActiveTab = active;
     sidebarRight.querySelectorAll<HTMLElement>("[data-pane-btn]").forEach((b) => {
       if (b.dataset.paneBtn === "databases") b.hidden = !databaseContextVisible;
+      if (b.dataset.paneBtn === "dashboard-config") b.hidden = !dashboardWidgetContextVisible;
       b.classList.toggle("active", b.dataset.paneBtn === active);
     });
     // Only top-level panel sections (direct children of sidebarRightBody), not inner reference cards.
@@ -186,6 +191,14 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
       return;
     }
     applyRightTab(!visible && layout.rightActiveTab === "databases" ? rightTabBeforeDatabase : undefined);
+  }
+
+  function setDashboardWidgetContext(visible: boolean, activate = false) {
+    dashboardWidgetContextVisible = visible;
+    if (visible && activate) {
+      if (layout.rightCollapsed) { layout.rightCollapsed = false; applyWidths(); }
+      applyRightTab("dashboard-config");
+    } else applyRightTab(!visible && layout.rightActiveTab === "dashboard-config" ? "reference-sidebar" : undefined);
   }
 
   // ── Left sidebar top tabs (docs / search / outline) ────────────────
@@ -1276,6 +1289,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     showLocations,
     showHistory,
     setDatabaseContext,
+    setDashboardWidgetContext,
     updateHistory,
     setPanelContext,
     renderAll,
@@ -1288,6 +1302,7 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     showLocations,
     showHistory,
     setDatabaseContext,
+    setDashboardWidgetContext,
     updateHistory,
     setPanelContext,
     highlightActiveDocument: (id: string) => renderAll(id)

@@ -115,7 +115,8 @@ canvasManager = mountCanvasManager(workspace, {
 dashboardManager = mountDashboardManager(host, workspace, {
   onOpenDocument: (id, blockId) => { void dashboardManager.flush().then(() => host.openDocument(id, blockId)).catch(editor.showError); },
   onError: editor.showError,
-  onStateChanged: state => { if (dashboardManager.isOpen()) dashboardManager.applyState(state); }
+  onStateChanged: state => { if (dashboardManager.isOpen()) dashboardManager.applyState(state); },
+  onWidgetSelection: (selected, activate) => shell.setDashboardWidgetContext(selected, activate)
 });
 host.onEvent(event => {
   if (event.kind === "documentChanged") {

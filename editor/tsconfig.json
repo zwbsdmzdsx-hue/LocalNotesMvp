@@ -6,7 +6,8 @@
       "dompurify": ["../web/node_modules/dompurify/dist/purify.es.d.mts"],
       "marked": ["../web/node_modules/marked/lib/marked.d.ts"],
       "turndown": ["../web/node_modules/@types/turndown/index.d.ts"],
-      "leaflet": ["../web/node_modules/@types/leaflet/index.d.ts"]
+      "leaflet": ["../web/node_modules/@types/leaflet/index.d.ts"],
+      "maplibre-gl": ["../web/node_modules/maplibre-gl"]
     }
   },
   "include": ["src/**/*.ts", "../protocol/types.ts"]

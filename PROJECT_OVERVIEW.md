@@ -1,6 +1,6 @@
 # LocalNotesMvp 项目全景
 
-核对日期：2026-09-24，包含当前工作区修改。历史代码基准：`46ecbc1`。本文描述当前实现，后续设想单独标注；功能与文档不一致时，以实际入口、代码和测试为准。
+核对日期：2026-09-25，包含当前工作区修改。历史代码基准：`46ecbc1`。本文描述当前实现，后续设想单独标注；功能与文档不一致时，以实际入口、代码和测试为准。
 
 ## 1. 产品定位
 
@@ -44,7 +44,7 @@ flowchart LR
 - **数据库块**：`data_sources/data_fields/data_records/data_values` 是数据唯一来源；正文块只保存 `properties.databaseId`，视图配置由 `databaseViews` 按数据库 ID 关联。旧 `databaseViewId` 只为兼容读取保留，新代码不得写入。
 - **地理位置**：位置目录是 `GeoLocation` 的唯一事实来源，支持全局和笔记本 scope；正文 `type="location"` 块只保存 `properties.locationId` 与可选显示名称覆盖，地图管理负责坐标、地址和来源更新。
 - **Canvas**：工作区项目以唯一 `kind=document|canvas|dashboard` 区分；Canvas 内的文档和 Canvas 节点只保存稳定目标 ID 与几何信息，是打开关系，不修改左侧目录 `parentId`。Canvas 的自由内容节点使用与正文相同的 `Block`（旧版 `text/content` 节点只在工作区边界兼容迁移），Canvas 只额外保存位置、尺寸、层级、引用显示偏好/自定义 Icon 和节点字号。Canvas 文档预览沿用正文标题层级折叠，曲线支持中点描述和 Icon 悬浮预览。嵌套引用建立时必须拒绝直接和间接循环。
-- **Dashboard**：新版浏览器支持与文档、Canvas 平行的 `kind=dashboard` 工作区项目。Dashboard 使用专用视图；每个组件是 `Block.type="dashboard_widget"`，在 `properties.dashboardWidget` 中保存稳定组件实例 ID、组件类型、数据作用域、查询配置和布局，不保存渲染结果。组件通过 `DashboardWidgetRenderer` 注册表读取当前 `EditorState`，标题、移动、缩放、删除和新增均通过现有 `saveDocument` 版本/幂等保存路径完成。当前内置右栏引用、反向链接、覆写、注释、历史、日历、位置、样式和数据库的摘要组件；Mock 仍是内存实现，未接入桌面 SQLite。
+- **Dashboard**：新版浏览器支持与文档、Canvas 平行的 `kind=dashboard` 工作区项目。Dashboard 使用专用视图；每个组件是 `Block.type="dashboard_widget"`，在 `properties.dashboardWidget` 中保存稳定组件实例 ID、组件类型、数据作用域、查询配置、描述、样式和布局，不保存渲染结果。组件通过 `DashboardWidgetRenderer` 注册表读取当前 `EditorState`，标题、移动、缩放、删除和新增均通过现有 `saveDocument` 版本/幂等保存路径完成。内置文档、关键字、待办、位置和数据表指标，可按字段筛选、条件表达式、分类及计数/求和/平均/最小/最大/去重汇总；公式沿用数据表表达式求值器。选中组件后在右栏配置来源、尺寸、坐标和样式。另有引用、反向链接、覆写、注释、历史、日历、位置、样式和数据库摘要组件。地图管理右栏通过 MapLibre 和 OpenFreeMap 在线矢量瓦片显示当前范围的位置标记；单点编辑地图仍用 Leaflet。Mock 仍是内存实现，未接入桌面 SQLite。
 - **右栏共享上下文**：`editor/src/panel-context.ts` 统一描述当前正文、Canvas 或 Dashboard 的面板数据来源。Canvas 和正文的乐观块快照会在保存等待期间先进入右栏；Dashboard 组件按 `activeDocument`、指定文档、笔记本或工作区作用域读取已载入的源状态，保存 ACK 后再由宿主快照校正。
 - **链接与引用**：默认新建关联统一使用正文 `[[笔记本/文档/块#^块ID]]` 双链。六点菜单只复制这个稳定链接；用户在右栏普通双链条目中明确选择显示方式时，才把该链接升级为同一宿主块下的 `reference_instance`。已有 `reference_instances` 仍可展示、切换模式和编辑兼容内容。
 - **作用域实现**：`editor/` 是当前新版网页入口，`web/` 是桌面兼容入口；两者不是同一运行时。新版先在 `BrowserMockHost` 验证交互，不能把 Mock 当成 SQLite 持久化实现，也不能为同一功能在两端各自发明一套模型。
