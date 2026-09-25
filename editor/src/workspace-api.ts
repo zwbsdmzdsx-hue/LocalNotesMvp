@@ -1,4 +1,5 @@
 import type { Block, ReferenceInstance, HistoryModel, MediaAsset } from "../../protocol/types";
+import { createBlock } from "./document-model";
 
 export type Notebook = { id: string; name: string };
 export type Bookmark = { id: string; notebookId: string; name: string; color: string };
@@ -53,22 +54,24 @@ export type CanvasNode = {
   fontSize?: number;
   strokes?: CanvasStroke[];
   curve?: CanvasCurve;
+  /** @deprecated Legacy media payload; normalized into block.content.media on load. */
   media?: MediaAsset;
+  /** @deprecated Legacy caption; normalized into block.content.caption on load. */
   caption?: string;
 };
 
 export function normalizeCanvasNode(node: CanvasNode, index = 0): CanvasNode {
+  if (node.kind === "media") {
+    const media = node.block?.content.media ?? node.media;
+    const block = node.block
+      ? { ...structuredClone(node.block), content: { ...structuredClone(node.block.content), media, caption: node.block.content.caption ?? node.caption } }
+      : media ? createBlock({ id: node.id, type: "media", position: String((index + 1) * 1000).padStart(8, "0"), content: { media, caption: node.caption } }) : undefined;
+    const { media: _legacyMedia, caption: _legacyCaption, ...layout } = structuredClone(node);
+    return { ...layout, block };
+  }
   if (node.kind !== "text" && node.kind !== "block") return structuredClone(node);
   const legacyText = node.content ?? node.block?.content.text ?? "";
-  const block = node.block ?? {
-    id: node.id,
-    parentId: null,
-    position: String((index + 1) * 1000).padStart(8, "0"),
-    type: "paragraph" as const,
-    content: { text: legacyText, html: legacyText, markdown: legacyText },
-    properties: {},
-    revision: 1
-  };
+  const block = node.block ?? createBlock({ id: node.id, position: String((index + 1) * 1000).padStart(8, "0"), content: { text: legacyText, html: legacyText, markdown: legacyText } });
   const { content: _legacyContent, ...layout } = structuredClone(node);
   return { ...layout, kind: "block", block };
 }
@@ -109,9 +112,7 @@ export type WorkspaceCommand =
   | { type: "renameNotebook" | "renameBookmark" | "renameDocument"; id: string; name: string }
   | { type: "createNotebook"; notebook: Notebook }
   | { type: "createBookmark"; bookmark: Bookmark }
-  | { type: "createDocument"; document: { id: string; title: string }; bookmarkId: string; parentId?: string | null }
-  | { type: "createCanvas"; canvas: { id: string; title: string }; bookmarkId: string; parentId?: string | null }
-  | { type: "createDashboard"; dashboard: { id: string; title: string }; bookmarkId: string; parentId?: string | null }
+  | { type: "createDocument"; document: { id: string; title: string; kind?: WorkspaceItemKind }; bookmarkId: string; parentId?: string | null }
   | { type: "moveDocument"; id: string; bookmarkId: string; parentId: string | null; index: number }
   | { type: "transferBlock"; sourceDocumentId: string; targetDocumentId: string; blockId: string; mode: "reference" | "copy" }
   | { type: "moveBookmark"; id: string; index: number }

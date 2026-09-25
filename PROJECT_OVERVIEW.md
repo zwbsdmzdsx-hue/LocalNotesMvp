@@ -43,8 +43,9 @@ flowchart LR
 - **分栏**：普通块通过 `properties.columnGroup`、`column` 和 `columnWidths` 组成列组；不存在独立的分栏容器块。旧的 `layout/columnCount/columnGap` 只允许在加载迁移时读取，保存不会再产生这些字段。
 - **数据库块**：`data_sources/data_fields/data_records/data_values` 是数据唯一来源；正文块只保存 `properties.databaseId`，视图配置由 `databaseViews` 按数据库 ID 关联。旧 `databaseViewId` 只为兼容读取保留，新代码不得写入。
 - **地理位置**：位置目录是 `GeoLocation` 的唯一事实来源，支持全局和笔记本 scope；正文 `type="location"` 块只保存 `properties.locationId` 与可选显示名称覆盖，地图管理负责坐标、地址和来源更新。
-- **Canvas**：工作区项目以唯一 `kind=document|canvas|dashboard` 区分；Canvas 内的文档和 Canvas 节点只保存稳定目标 ID 与几何信息，是打开关系，不修改左侧目录 `parentId`。Canvas 的自由内容节点使用与正文相同的 `Block`（旧版 `text/content` 节点只在工作区边界兼容迁移），Canvas 只额外保存位置、尺寸、层级、引用显示偏好/自定义 Icon 和节点字号。Canvas 文档预览沿用正文标题层级折叠，曲线支持中点描述和 Icon 悬浮预览。嵌套引用建立时必须拒绝直接和间接循环。
+- **Canvas**：工作区项目以唯一 `kind=document|canvas|dashboard` 区分；Canvas 内的文档和 Canvas 节点只保存稳定目标 ID 与几何信息，是打开关系，不修改左侧目录 `parentId`。Canvas 的自由内容与媒体节点使用与正文相同的 `Block`（旧版 `text/content` 和媒体节点字段只在工作区边界兼容迁移），Canvas 只额外保存位置、尺寸、层级、引用显示偏好/自定义 Icon 和节点字号。Canvas 文档预览沿用正文标题层级折叠，曲线支持中点描述和 Icon 悬浮预览。嵌套引用建立时必须拒绝直接和间接循环。
 - **Dashboard**：新版浏览器支持与文档、Canvas 平行的 `kind=dashboard` 工作区项目。Dashboard 使用专用视图；每个组件是 `Block.type="dashboard_widget"`，在 `properties.dashboardWidget` 中保存稳定组件实例 ID、组件类型、数据作用域、查询配置、描述、样式和布局，不保存渲染结果。组件通过 `DashboardWidgetRenderer` 注册表读取当前 `EditorState`，标题、移动、缩放、删除和新增均通过现有 `saveDocument` 版本/幂等保存路径完成。内置文档、关键字、待办、位置和数据表指标，可按字段筛选、条件表达式、分类及计数/求和/平均/最小/最大/去重汇总；公式沿用数据表表达式求值器。选中组件后在右栏配置来源、尺寸、坐标和样式。另有引用、反向链接、覆写、注释、历史、日历、位置、样式和数据库摘要组件。地图管理右栏通过 MapLibre 和 OpenFreeMap 在线矢量瓦片显示当前范围的位置标记；单点编辑地图仍用 Leaflet。Mock 仍是内存实现，未接入桌面 SQLite。
+- **文档创建与保存收敛**：左侧目录的三种项目统一通过 `WorkspaceApi.createDocument` 携带 `kind` 创建；`editor/src/document-model.ts` 为正文、Canvas、Dashboard 和 Mock 提供普通数据对象的块及文档初始快照工厂。Canvas 与 Dashboard 共用 `DocumentSaveSession` 的排队、等待 ACK、失败保留和 flush 规则，但仍分别调用现有 `saveCanvas` 与 `saveDocument`；正文保存队列与 Canvas 的视图数据/历史尚未迁入同一底层协议。这是浏览器阶段的共用逻辑，不表示桌面 SQLite 已接入 Canvas。
 - **右栏共享上下文**：`editor/src/panel-context.ts` 统一描述当前正文、Canvas 或 Dashboard 的面板数据来源。Canvas 和正文的乐观块快照会在保存等待期间先进入右栏；Dashboard 组件按 `activeDocument`、指定文档、笔记本或工作区作用域读取已载入的源状态，保存 ACK 后再由宿主快照校正。
 - **链接与引用**：默认新建关联统一使用正文 `[[笔记本/文档/块#^块ID]]` 双链。六点菜单只复制这个稳定链接；用户在右栏普通双链条目中明确选择显示方式时，才把该链接升级为同一宿主块下的 `reference_instance`。已有 `reference_instances` 仍可展示、切换模式和编辑兼容内容。
 - **作用域实现**：`editor/` 是当前新版网页入口，`web/` 是桌面兼容入口；两者不是同一运行时。新版先在 `BrowserMockHost` 验证交互，不能把 Mock 当成 SQLite 持久化实现，也不能为同一功能在两端各自发明一套模型。
@@ -64,9 +65,11 @@ Canvas 引用修复：新版 Canvas 的自由块在 Mock 文档索引中暴露�
 | [editor/src/browser-mock-host.ts](editor/src/browser-mock-host.ts) | Alpha/Beta 最小兼容锚点，以及 Gamma、Epsilon、演示中心、Zeta 等 Markdown/待办/数据库/位置/媒体 Demo；项目路线图与研究白板 Canvas 也在此提供浏览器态实现，另含内存保存、导航、侧栏树和引用命令；不是完整存储实现 |
 | [editor/src/editor-host-api.ts](editor/src/editor-host-api.ts) | 请求 ID、响应匹配、Promise、10 秒超时、宿主事件订阅 |
 | [editor/src/workspace-api.ts](editor/src/workspace-api.ts) | 侧栏只依赖类型化的快照、搜索、大纲和异步命令接口，不直接读写 Mock 或编辑器 DOM |
+| [editor/src/document-model.ts](editor/src/document-model.ts) | 新版网页共用的块与文档初始快照工厂；返回可序列化的普通对象 |
+| [editor/src/document-session.ts](editor/src/document-session.ts) | Canvas 与 Dashboard 共用的串行保存、草稿保留和 flush 会话类 |
 | [editor/src/browser-workspace.ts](editor/src/browser-workspace.ts) | 浏览器工作区适配；命令串行执行，等待编辑保存后修改数据，重命名/删除后同步当前编辑器。原生工作区适配尚未接入 |
 | [editor/src/canvas-manager.ts](editor/src/canvas-manager.ts) | 新版无限画布视图；负责平移缩放、自由卡片、文档/Canvas 引用、节点六点菜单、字号与引用 Icon、移动缩放、预览/Icon 模式和画布历史交互 |
-| [editor/src/dashboard-manager.ts](editor/src/dashboard-manager.ts) | 新版 Dashboard 视图；负责 `dashboard_widget` 容器块、组件注册表、布局拖动/缩放、右栏能力摘要渲染和保存队列 |
+| [editor/src/dashboard-manager.ts](editor/src/dashboard-manager.ts) | 新版 Dashboard 视图；负责 `dashboard_widget` 容器块、组件注册表、布局拖动/缩放、右栏能力摘要渲染和保存适配 |
 | [editor/src/mock-save-store.ts](editor/src/mock-save-store.ts) | Mock 保存幂等记录、版本规则和完整快照校验 |
 | [editor/src/block-content.ts](editor/src/block-content.ts) | 正文序列化与 HTML 清理；剥离引用投影、保留空锚点 |
 | [editor/src/markdown.ts](editor/src/markdown.ts) | 新版 Markdown 的安全渲染、旧 HTML 转源码、双链与引用锚点往返 |

@@ -17,7 +17,7 @@ test("Canvas inserts and previews a remote media URL", async ({ page }) => {
   page.once("dialog", dialog => dialog.accept("https://cdn.example.test/photo.png"));
   await page.locator('[data-canvas-action="media-url"]').click();
   await expect(page.locator(".canvas-node-media img")).toHaveAttribute("src", "https://cdn.example.test/photo.png");
-  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "media")?.media?.url)).toBe("https://cdn.example.test/photo.png");
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "media")?.block?.content.media?.url)).toBe("https://cdn.example.test/photo.png");
 });
 
 test("Canvas document previews render source media blocks", async ({ page }) => {

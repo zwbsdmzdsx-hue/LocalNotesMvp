@@ -21,9 +21,13 @@ export function createBrowserWorkspace(store: BrowserMockHost, session: {
       case "renameDocument": store.renameDocument(command.id, command.name); break;
       case "createNotebook": store.notebooksPush(command.notebook); store.openNotebook(command.notebook.id); break;
       case "createBookmark": store.bookmarksPush(command.bookmark); break;
-      case "createDocument": store.createDocument(command.document.title, command.document.id, command.bookmarkId, command.parentId ?? null); break;
-      case "createCanvas": store.createCanvas(command.canvas.title, command.canvas.id, command.bookmarkId, command.parentId ?? null); break;
-      case "createDashboard": store.createDashboard(command.dashboard.title, command.dashboard.id, command.bookmarkId, command.parentId ?? null); break;
+      case "createDocument": {
+        const { id, title, kind = "document" } = command.document;
+        if (kind === "canvas") store.createCanvas(title, id, command.bookmarkId, command.parentId ?? null);
+        else if (kind === "dashboard") store.createDashboard(title, id, command.bookmarkId, command.parentId ?? null);
+        else store.createDocument(title, id, command.bookmarkId, command.parentId ?? null);
+        break;
+      }
       case "moveDocument": store.moveDocument(command.id, command.bookmarkId, command.parentId, command.index); break;
       case "transferBlock": store.transferBlock(command.sourceDocumentId, command.targetDocumentId, command.blockId, command.mode); break;
       case "moveBookmark": store.moveBookmark(command.id, command.index); break;

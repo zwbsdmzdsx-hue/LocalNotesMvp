@@ -36,4 +36,7 @@ test("a failed Dashboard save blocks navigation and keeps the current layout", a
   await page.locator('.doc-item .list-label', { hasText: "Alpha" }).click();
   await expect(page.locator(".dashboard-view")).toBeVisible();
   await expect(page.locator(".dashboard-save-state")).toHaveText("保存失败");
+  await page.locator('[data-doc="beta"]').click();
+  await expect(page.locator(".dashboard-view")).toBeVisible();
+  await expect(page.locator('.dashboard-widget')).toHaveCount(3);
 });

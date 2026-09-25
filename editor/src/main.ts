@@ -17,6 +17,16 @@ function workspaceKind(id: string) {
   return workspace.snapshot().documents.find(item => item.id === id)?.kind;
 }
 
+async function flushSurfaces() {
+  await dashboardManager.flush();
+  await canvasManager.flush();
+  await editor.flush();
+}
+
+function navigate(action: () => Promise<unknown>) {
+  void flushSurfaces().then(action).catch(editor.showError);
+}
+
 const workspace = createBrowserWorkspace(transport, {
   flush: () => editor.flush(),
   reloadCurrent: async () => {
@@ -34,26 +44,27 @@ const shell = mountShell(workspace, {
   onError: error => editor.showError(error),
   onRestoreHistory: entryId => void (canvasManager?.isOpen() ? canvasManager.restoreHistory(entryId) : editor.restoreHistory(entryId)),
   onOpenDocument: (id, blockId) => {
-    void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.openDocument(id, blockId)).catch(editor.showError);
+    navigate(() => host.openDocument(id, blockId));
   },
   onOpenCanvas: id => {
-    void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.openDocument(id)).catch(editor.showError);
+    navigate(() => host.openDocument(id));
   },
   onOpenDashboard: id => {
-    void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.openDocument(id)).catch(editor.showError);
+    navigate(() => host.openDocument(id));
   },
   onNavigateBack: () => {
-    void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.navigateBack()).catch(editor.showError);
+    navigate(() => host.navigateBack());
   },
   onNavigateForward: () => {
-    void dashboardManager.flush().then(() => canvasManager.flush()).then(() => editor.flush()).then(() => host.navigateForward()).catch(editor.showError);
+    navigate(() => host.navigateForward());
   },
   onOpenSticky: () => {
     alert("便签窗口：浏览器模式下是占位提示。桌面端请从主窗口新建便签。");
   },
   onCreateNote: () => {
-    void editor.flush().then(async () => {
-      const id = transport.createDocument("新建笔记 " + new Date().toLocaleTimeString());
+    void flushSurfaces().then(async () => {
+      const id = `doc-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
+      await workspace.execute({ type: "createDocument", document: { id, title: "新建笔记 " + new Date().toLocaleTimeString(), kind: "document" }, bookmarkId: workspace.snapshot().activeBookmarkId });
       await host.openDocument(id);
       shell.highlightActiveDocument(id);
     }).catch(editor.showError);
@@ -81,6 +92,7 @@ const editor = mountEditor(host, {
   canvasStateChanged: (state, persist) => canvasManager?.applyEditorState(state, persist),
   canvasInsertCalendarLink: (documentId, blockId, scope, label) => canvasManager?.insertCalendarLink(documentId, blockId, scope, label) ?? false,
   canvasInsertLocationBlock: locationId => canvasManager?.insertLocationBlock(locationId) ?? false,
+  beforeNavigation: async () => { await dashboardManager.flush(); await canvasManager.flush(); },
   surfaceStateChanged: (state, surface) => {
     // core also listens to documentLoaded for desktop compatibility. In the
     // browser entrypoint the main router owns Dashboard/Canvas switching, so a
@@ -98,9 +110,9 @@ const editor = mountEditor(host, {
 });
 canvasManager = mountCanvasManager(workspace, {
   onOpenDocument: (id, blockId) => {
-    void canvasManager.flush().then(() => editor.flush()).then(() => host.openDocument(id, blockId)).catch(editor.showError);
+    navigate(() => host.openDocument(id, blockId));
   },
-  onOpenCanvas: id => { void canvasManager.flush().then(() => editor.flush()).then(() => host.openDocument(id)).catch(editor.showError); },
+  onOpenCanvas: id => navigate(() => host.openDocument(id)),
   onError: editor.showError,
   onWorkspaceChanged: () => shell.refresh(),
   onLoadDocumentPreview: documentId => host.loadDocument(documentId),
@@ -113,7 +125,7 @@ canvasManager = mountCanvasManager(workspace, {
   onActiveBlockChanged: block => editor.setCanvasActiveBlock(block)
 });
 dashboardManager = mountDashboardManager(host, workspace, {
-  onOpenDocument: (id, blockId) => { void dashboardManager.flush().then(() => host.openDocument(id, blockId)).catch(editor.showError); },
+  onOpenDocument: (id, blockId) => navigate(() => host.openDocument(id, blockId)),
   onError: editor.showError,
   onStateChanged: state => { if (dashboardManager.isOpen()) dashboardManager.applyState(state); },
   onWidgetSelection: (selected, activate) => shell.setDashboardWidgetContext(selected, activate)
@@ -165,9 +177,9 @@ const bar = document.createElement("nav");
 bar.className = "browser-devbar";
 bar.innerHTML = '<strong>浏览器开发模式 · 仅内存数据，刷新即重置</strong><button id="dev-back" title="后退">←</button><button id="dev-forward" title="前进">→</button><button data-doc="alpha">Alpha</button><button data-doc="beta">Beta</button><button data-doc="gamma">Gamma</button><button id="dev-fail">模拟下次保存失败</button><button id="dev-retry">重试保存</button><button id="dev-reset-layout">重置布局</button>';
 document.body.prepend(bar);
-bar.querySelectorAll<HTMLButtonElement>("[data-doc]").forEach(b => b.onclick = () => void editor.flush().then(() => host.openDocument(b.dataset.doc!)).then(() => shell.highlightActiveDocument(b.dataset.doc!)).catch(editor.showError));
-bar.querySelector<HTMLButtonElement>("#dev-back")!.onclick = () => void canvasManager.flush().then(() => editor.flush()).then(() => host.navigateBack()).catch(editor.showError);
-bar.querySelector<HTMLButtonElement>("#dev-forward")!.onclick = () => void canvasManager.flush().then(() => editor.flush()).then(() => host.navigateForward()).catch(editor.showError);
+bar.querySelectorAll<HTMLButtonElement>("[data-doc]").forEach(b => b.onclick = () => navigate(() => host.openDocument(b.dataset.doc!)));
+bar.querySelector<HTMLButtonElement>("#dev-back")!.onclick = () => navigate(() => host.navigateBack());
+bar.querySelector<HTMLButtonElement>("#dev-forward")!.onclick = () => navigate(() => host.navigateForward());
 bar.querySelector<HTMLButtonElement>("#dev-fail")!.onclick = () => transport.failNextSave = true;
 bar.querySelector<HTMLButtonElement>("#dev-retry")!.onclick = () => editor.retry();
 bar.querySelector<HTMLButtonElement>("#dev-reset-layout")!.onclick = () => { localStorage.removeItem("lnm-shell-layout-v1"); location.reload(); };

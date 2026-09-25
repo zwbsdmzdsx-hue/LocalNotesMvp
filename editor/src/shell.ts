@@ -1,4 +1,4 @@
-import type { WorkspaceApi, WorkspaceCommand, WorkspaceDocument, CalendarTodo } from "./workspace-api";
+import type { WorkspaceApi, WorkspaceCommand, WorkspaceDocument, WorkspaceItemKind, CalendarTodo } from "./workspace-api";
 import type { HistoryModel } from "./history";
 import type { Block, EditorState } from "../../protocol/types";
 import type { PanelContext } from "./panel-context";
@@ -1225,26 +1225,15 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     const color = BOOKMARK_COLORS[Math.floor(Math.random() * BOOKMARK_COLORS.length)];
     execute({ type: "createBookmark", bookmark: { id, notebookId: snap.activeNotebookId, name: name.trim(), color } });
   }
-  function createDocument(bookmarkId: string) {
-    const title = prompt("文档名称：", "未命名文档");
-    if (!title || !title.trim()) return;
-    const id = "doc-" + uid();
-    void execute({ type: "createDocument", document: { id, title: title.trim() }, bookmarkId, parentId: null })
-      .then(() => cb.onOpenDocument(id));
-  }
-  function createCanvas(bookmarkId: string) {
-    const title = prompt("Canvas 名称：", "未命名 Canvas");
-    if (!title || !title.trim()) return;
-    const id = "canvas-" + uid();
-    void execute({ type: "createCanvas", canvas: { id, title: title.trim() }, bookmarkId, parentId: null })
-      .then(() => cb.onOpenCanvas(id));
-  }
-  function createDashboard(bookmarkId: string) {
-    const title = prompt("Dashboard 名称：", "工作台 Dashboard");
-    if (!title || !title.trim()) return;
-    const id = "dashboard-" + uid();
-    void execute({ type: "createDashboard", dashboard: { id, title: title.trim() }, bookmarkId, parentId: null })
-      .then(() => cb.onOpenDashboard(id));
+  function createDocument(bookmarkId: string, kind: WorkspaceItemKind = "document") {
+    const defaults = kind === "canvas" ? ["Canvas 名称：", "未命名 Canvas", "canvas"]
+      : kind === "dashboard" ? ["Dashboard 名称：", "工作台 Dashboard", "dashboard"]
+      : ["文档名称：", "未命名文档", "doc"];
+    const title = prompt(defaults[0], defaults[1]);
+    if (!title?.trim()) return;
+    const id = `${defaults[2]}-${uid()}`;
+    void execute({ type: "createDocument", document: { id, title: title.trim(), kind }, bookmarkId, parentId: null })
+      .then(() => kind === "canvas" ? cb.onOpenCanvas(id) : kind === "dashboard" ? cb.onOpenDashboard(id) : cb.onOpenDocument(id));
   }
   function showWorkspaceCreateMenu(anchor: HTMLElement, bookmarkId: string) {
     document.querySelector(".workspace-create-menu")?.remove();
@@ -1252,8 +1241,8 @@ export function mountShell(workspace: WorkspaceApi, cb: ShellCallbacks): ShellAp
     menu.className = "workspace-create-menu";
     const options = [
       { icon: "▤", label: "新建文档", run: () => createDocument(bookmarkId) },
-      { icon: "◇", label: "新建 Canvas", run: () => createCanvas(bookmarkId) },
-      { icon: "▦", label: "新建 Dashboard", run: () => createDashboard(bookmarkId) }
+      { icon: "◇", label: "新建 Canvas", run: () => createDocument(bookmarkId, "canvas") },
+      { icon: "▦", label: "新建 Dashboard", run: () => createDocument(bookmarkId, "dashboard") }
     ];
     options.forEach(option => {
       const button = document.createElement("button");

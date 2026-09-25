@@ -1,6 +1,8 @@
 import type { EditorState, Block, BlockProperties } from "../../protocol/types";
 import type { WorkspaceApi } from "./workspace-api";
 import type { EditorHostApi } from "./editor-host-api";
+import { createBlock } from "./document-model";
+import { DocumentSaveSession } from "./document-session";
 import { dashboardRows, normalizeDashboardQuery, runDashboardQuery, type DashboardOperator, type DashboardQuery } from "./dashboard-query";
 
 export type DashboardWidgetKind =
@@ -19,10 +21,8 @@ type DashboardCallbacks = {
   onWidgetSelection?(selected: boolean, activate?: boolean): void;
 };
 
-type DashboardConfig = NonNullable<BlockProperties["dashboardWidget"]> & {
-  description?: string;
-  style?: { background?: string; color?: string; accent?: string; fontSize?: number };
-};
+type DashboardConfig = NonNullable<BlockProperties["dashboardWidget"]>;
+type DashboardSaveSnapshot = { documentId: string; title: string; blocks: Block[] };
 
 const uid = () => `dashboard-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
 const escapeText = (value: unknown) => String(value ?? "");
@@ -89,9 +89,20 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
   let current: EditorState | null = null;
   let sourceState: EditorState | null = null;
   const sourceStates = new Map<string, EditorState>();
-  let saveTail = Promise.resolve();
-  let saveTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastSaveError: unknown = null;
+  const versions = new Map<string, number>();
+  const saveSession = new DocumentSaveSession<DashboardSaveSnapshot>(async snapshot => {
+    const clientVersion = versions.get(snapshot.documentId);
+    if (clientVersion === undefined) throw new Error("Dashboard 版本未知");
+    const result = await host.saveDocument({ ...snapshot, mutationId: uid(), clientVersion: clientVersion + 1 });
+    versions.set(snapshot.documentId, result.clientVersion);
+    if (current?.note.id === snapshot.documentId) {
+      current.note.clientVersion = result.clientVersion;
+      callbacks.onStateChanged?.(structuredClone(current));
+    }
+  }, (phase, error) => {
+    setSaveState(phase === "pending" ? "未保存" : phase === "saving" ? "保存中" : phase === "saved" ? "已保存" : "保存失败", phase === "failed");
+    if (phase === "failed") callbacks.onError(error);
+  });
   let selectedWidgetId: string | null = null;
   const renderers = new Map<string, DashboardWidgetRenderer>(defaultRenderers().map(renderer => [renderer.kind, renderer]));
 
@@ -288,25 +299,12 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
       "位置汇总": { source: "locations", measure: "count" }, "表格汇总": { source: "databaseRecords", measure: "count" }
     };
     const metric = !!presets[kind];
-    const block: Block = { id: uid(), parentId: null, position: String((current.blocks.length + 1) * 1000).padStart(8, "0"), type: "dashboard_widget", content: { text: "", html: "" }, properties: { dashboardWidget: { kind: metric ? "metric" : kind, title: kind, scope: metric ? "workspace" : "activeDocument", query: metric ? { ...presets[kind] } : undefined, layout: { x: 32 + (index % 3) * 344, y: 32 + Math.floor(index / 3) * 244, width: 320, height: 220 } } }, revision: 1 };
+    const block = createBlock({ id: uid(), type: "dashboard_widget", position: String((current.blocks.length + 1) * 1000).padStart(8, "0"), properties: { dashboardWidget: { kind: metric ? "metric" : kind, title: kind, scope: metric ? "workspace" : "activeDocument", query: metric ? { ...presets[kind] } : undefined, layout: { x: 32 + (index % 3) * 344, y: 32 + Math.floor(index / 3) * 244, width: 320, height: 220 } } } });
     current.blocks.push(block); render(); selectWidget(block.id, true); scheduleSave(); void hydrateSources();
   }
   function scheduleSave() {
-    if (saveTimer) clearTimeout(saveTimer);
-    saveState.textContent = "未保存";
-    saveTimer = setTimeout(() => {
-      saveTimer = null;
-      saveTail = saveTail.catch(() => undefined).then(async () => {
-        try { await save(); lastSaveError = null; }
-        catch (error) { lastSaveError = error; setSaveState("保存失败", true); callbacks.onError(error); }
-      });
-    }, 350);
-  }
-  async function save() {
     if (!current) return;
-    setSaveState("保存中");
-    const result = await host.saveDocument({ documentId: current.note.id, title: current.note.title, blocks: structuredClone(current.blocks), mutationId: uid(), clientVersion: current.note.clientVersion + 1 });
-    current.note.clientVersion = result.clientVersion; setSaveState("已保存"); callbacks.onStateChanged?.(structuredClone(current));
+    saveSession.schedule({ documentId: current.note.id, title: current.note.title, blocks: structuredClone(current.blocks) }, 350);
   }
   function setupAddMenu() {
     view.querySelector<HTMLButtonElement>("[data-dashboard-action=add]")!.onclick = event => {
@@ -323,6 +321,7 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
   setupAddMenu();
   function open(state: EditorState, nextSourceState?: EditorState | null) {
     current = structuredClone(state);
+    versions.set(state.note.id, state.note.clientVersion);
     selectedWidgetId = null;
     sourceStates.clear();
     sourceState = nextSourceState ? structuredClone(nextSourceState) : sourceState;
@@ -340,5 +339,5 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     if (sourceState && (!documentId || sourceState.note.id === documentId)) sourceStates.delete(sourceState.note.id);
     if (current) void hydrateSources();
   }
-  return { open, close, isOpen: () => !view.hidden, applyState: state => { if (!current || current.note.id !== state.note.id) return; current = structuredClone(state); render(); renderSettings(); }, setSourceState, refreshSources, register: renderer => { renderers.set(renderer.kind, renderer); if (current) render(); }, flush: async () => { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveTail = saveTail.catch(() => undefined).then(async () => { try { await save(); lastSaveError = null; } catch (error) { lastSaveError = error; setSaveState("保存失败", true); callbacks.onError(error); } }); } await saveTail; if (lastSaveError) throw lastSaveError; } };
+  return { open, close, isOpen: () => !view.hidden, applyState: state => { if (!current || current.note.id !== state.note.id) return; current = structuredClone(state); versions.set(state.note.id, state.note.clientVersion); render(); renderSettings(); }, setSourceState, refreshSources, register: renderer => { renderers.set(renderer.kind, renderer); if (current) render(); }, flush: () => saveSession.flush() };
 }

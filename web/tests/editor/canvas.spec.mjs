@@ -14,6 +14,19 @@ test.beforeEach(async ({ page }) => {
   await expect(page.locator("#title")).toHaveValue("Alpha");
 });
 
+test("a failed Canvas save keeps the draft when navigating from the dev bar", async ({ page }) => {
+  await createCanvas(page, "待保存画布");
+  await page.locator('[data-canvas-action="add"]').click();
+  await expect(page.locator(".canvas-save-state")).toHaveText("已保存");
+  await page.getByRole("button", { name: "编辑块源码" }).click();
+  await page.evaluate(() => window.mockHost.failNextSave = true);
+  await page.locator(".canvas-node-text textarea").fill("尚未保存的内容");
+  await page.locator('[data-doc="beta"]').click();
+  await expect(page.locator(".canvas-save-state")).toHaveText("保存失败");
+  await expect(page.locator(".canvas-view")).toBeVisible();
+  await expect(page.locator(".canvas-node-text textarea")).toHaveValue("尚未保存的内容");
+});
+
 test("bookmark plus creates a Canvas with movable resizable cards and history", async ({ page }) => {
   await createCanvas(page, "项目画布");
   await expect(page.locator('.doc-item .list-label', { hasText: "项目画布" })).toBeVisible();
@@ -240,7 +253,49 @@ test("Canvas accepts dropped media and persists a unified preview node", async (
   await page.locator('[data-canvas-action="media"]').click();
   await (await chooser).setFiles({ name: "pixel.png", mimeType: "image/png", buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64") });
   await expect(page.locator(".canvas-node-media img")).toBeVisible();
-  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "media")?.media?.name)).toBe("pixel.png");
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "media")?.block?.content.media?.name)).toBe("pixel.png");
+  expect(await page.evaluate(() => {
+    const id = window.mockHost.current;
+    const node = window.mockHost.canvas(id).nodes.find(item => item.kind === "media");
+    const block = window.mockHost.state(id).blocks.find(item => item.id === node.id);
+    return { type: block?.type, name: block?.content.media?.name, legacyMedia: Object.hasOwn(node, "media") };
+  })).toEqual({ type: "media", name: "pixel.png", legacyMedia: false });
+});
+
+test("legacy Canvas media is read as a block with its caption", async ({ page }) => {
+  await page.goto("/");
+  const media = await page.evaluate(() => {
+    const node = window.mockHost.canvas("canvas-roadmap").nodes.find(item => item.id === "canvas-roadmap-cover");
+    const block = window.mockHost.state("canvas-roadmap").blocks.find(item => item.id === node.id);
+    return { nodeType: node.block?.type, caption: node.block?.content.caption, indexedType: block?.type, legacyMedia: Object.hasOwn(node, "media") };
+  });
+  expect(media).toEqual({ nodeType: "media", caption: "路线图视觉卡片", indexedType: "media", legacyMedia: false });
+});
+
+test("mixed legacy Canvas media keeps its block and moves old media fields", async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const { normalizeCanvasNode } = await import("/src/workspace-api.ts");
+    const media = { id: "asset", kind: "image", name: "cover.png", mimeType: "image/png", size: 1, url: "https://example.test/cover.png" };
+    const node = normalizeCanvasNode({ id: "cover", kind: "media", x: 0, y: 0, width: 300, height: 200, zIndex: 1,
+      media, caption: "旧说明", block: { id: "cover", parentId: null, position: "00001000", type: "media", content: { text: "", html: "" }, properties: {}, revision: 3 } });
+    return { media: node.block?.content.media, caption: node.block?.content.caption, revision: node.block?.revision, hasLegacy: "media" in node || "caption" in node };
+  });
+  expect(result).toEqual({ media: { id: "asset", kind: "image", name: "cover.png", mimeType: "image/png", size: 1, url: "https://example.test/cover.png" }, caption: "旧说明", revision: 3, hasLegacy: false });
+});
+
+test("Canvas media caption edits persist in the shared block", async ({ page }) => {
+  await createCanvas(page, "媒体说明画布");
+  page.once("dialog", dialog => dialog.accept("https://cdn.example.test/photo.png"));
+  await page.locator('[data-canvas-action="media-url"]').click();
+  await page.locator(".canvas-node-media .canvas-node-grip").click();
+  page.once("dialog", dialog => dialog.accept("项目封面"));
+  await page.getByText("编辑说明", { exact: true }).click();
+  await expect(page.locator(".canvas-media-caption")).toHaveText("项目封面");
+  await expect(page.locator(".canvas-save-state")).toHaveText("已保存");
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  await page.locator('.doc-item .list-label', { hasText: "媒体说明画布" }).click();
+  await expect(page.locator(".canvas-media-caption")).toHaveText("项目封面");
+  expect(await page.evaluate(() => window.mockHost.state(window.mockHost.current).blocks.find(block => block.type === "media")?.content.caption)).toBe("项目封面");
 });
 
 test("editing a seeded Canvas with a legacy curve envelope saves and navigates", async ({ page }) => {

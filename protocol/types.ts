@@ -68,10 +68,12 @@ export type BlockProperties = {
   dashboardWidget?: {
     kind: string;
     title?: string;
+    description?: string;
     scope: "activeDocument" | "document" | "notebook" | "workspace" | "database";
     sourceId?: string;
     query?: Record<string, unknown>;
     layout: { x: number; y: number; width: number; height: number; zIndex?: number };
+    style?: { background?: string; color?: string; accent?: string; fontSize?: number };
   };
 };
 export type Block = { id: string; parentId: string | null; position: string; type: BlockType; content: BlockContent; properties: BlockProperties; revision: number; scopeType?: "canonical" | "reference_instance" };

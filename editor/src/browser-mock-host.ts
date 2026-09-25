@@ -2,6 +2,7 @@ import { headingSection } from "./link-suggestions";
 import { EditorHistory } from "./history";
 import { orderBlockTree } from "./block-tree";
 import { normalizeCanvasNodes } from "./workspace-api";
+import { createBlock, createDocumentState } from "./document-model";
 import type { Notebook, Bookmark, WorkspaceDocument, WorkspaceSnapshot, SearchHit, CalendarTodo, CanvasDocument, CanvasNode, CanvasViewport, WorkspaceItemKind } from "./workspace-api";
 import type { HostTransport } from "./editor-host-api";
 import { MockSaveStore } from "./mock-save-store";
@@ -275,9 +276,9 @@ export class BrowserMockHost implements HostTransport {
     const makeCanvas = (id: string, title: string, bookmarkId: string, nodes: CanvasNode[]) => {
       this.createCanvas(title, id, bookmarkId);
       const canvas = this.canvases.get(id)!;
-      canvas.nodes = nodes;
+      canvas.nodes = normalizeCanvasNodes(nodes);
       const document = this.docs.get(id)!;
-      document.blocks = nodes.flatMap(node => node.block ? [node.block] : []);
+      document.blocks = canvas.nodes.flatMap(node => node.block ? [node.block] : []);
       this.recordCanvasHistory(id);
     };
     const roadmapBlock = demoBlock("canvas-roadmap-note", "paragraph", "把研究结论、发布计划和实时引用放在一起。", "00001000");
@@ -483,18 +484,7 @@ export class BrowserMockHost implements HostTransport {
     this.itemKinds.set(id, "document");
     this.titleByDocument.set(id, title);
     const bookmark = this.bookmarks.find(item => item.id === bookmarkId);
-    this.docs.set(id, {
-      note: { id, title, isSticky: false, clientVersion: 0, workspaceId: bookmark?.notebookId },
-      blocks: [],
-      documents: [],
-      backlinks: [],
-      overrideNotices: [],
-       references: [],
-       databases: [], databaseRecords: {},
-       systemStyles: structuredClone(this.globalSystemStyles),
-      documentStyles: [],
-      notebookStyles: []
-    });
+    this.docs.set(id, createDocumentState(id, title, bookmark?.notebookId, this.globalSystemStyles));
     this.parentByDocument.set(id, parentId);
     const list = this.documentByBookmark.get(bookmarkId) ?? [];
     list.push(id);
@@ -521,14 +511,13 @@ export class BrowserMockHost implements HostTransport {
     this.createDocument(title, requestedId, bookmarkId, parentId);
     this.itemKinds.set(requestedId, "dashboard");
     const state = this.docs.get(requestedId)!;
-    const widget = (id: string, kind: string, titleText: string, x: number, y: number, width = 320, height = 220): Block => ({
-      id, parentId: null, position: String((state.blocks.length + 1) * 1000).padStart(8, "0"), type: "dashboard_widget",
-      content: { text: "", html: "" }, properties: { dashboardWidget: { kind, title: titleText, scope: "activeDocument", layout: { x, y, width, height } } }, revision: 1
-    });
+    const widget = (id: string, kind: string, titleText: string, x: number, y: number, position: number, width = 320, height = 220): Block =>
+      createBlock({ id, type: "dashboard_widget", position: String(position * 1000).padStart(8, "0"),
+        properties: { dashboardWidget: { kind, title: titleText, scope: "activeDocument", layout: { x, y, width, height } } } });
     state.blocks = [
-      widget(`${requestedId}-widget-references`, "references", "实时引用", 32, 32),
-      widget(`${requestedId}-widget-backlinks`, "backlinks", "反向链接", 376, 32),
-      widget(`${requestedId}-widget-calendar`, "calendar", "日历", 32, 276, 320, 190)
+      widget(`${requestedId}-widget-references`, "references", "实时引用", 32, 32, 1),
+      widget(`${requestedId}-widget-backlinks`, "backlinks", "反向链接", 376, 32, 2),
+      widget(`${requestedId}-widget-calendar`, "calendar", "日历", 32, 276, 3, 320, 190)
     ];
   }
 
@@ -582,7 +571,7 @@ export class BrowserMockHost implements HostTransport {
       if (node.kind === "draw" && (!node.strokes?.length || node.strokes.some(stroke => stroke.points.length < 2))) throw new Error("Canvas 手绘内容无效");
       if (node.kind === "curve" && (!node.curve || !node.curve.start?.nodeId || !node.curve.end?.nodeId)) throw new Error("Canvas 曲线端点无效");
       if (node.kind === "curve" && node.curve && (!(["none", "end", "both", undefined] as unknown[]).includes(node.curve.arrow) || node.curve.controlPoints?.some(point => !Number.isFinite(point.x) || !Number.isFinite(point.y)))) throw new Error("Canvas 曲线控制点无效");
-      if (node.kind === "media" && !node.media?.url) throw new Error("Canvas 媒体地址无效");
+      if (node.kind === "media" && (node.block?.id !== node.id || node.block.type !== "media" || !node.block.content.media?.url)) throw new Error("Canvas 媒体块无效");
       if (node.kind === "curve" && node.curve && (!canonicalNodes.some(item => item.id === node.curve!.start.nodeId && item.kind !== "curve" && item.kind !== "draw") || !canonicalNodes.some(item => item.id === node.curve!.end.nodeId && item.kind !== "curve" && item.kind !== "draw"))) throw new Error("Canvas 曲线必须连接到块");
       if (node.kind === "curve" && node.curve?.branches?.some(branch => !canonicalNodes.some(item => item.id === branch.nodeId && item.kind !== "curve" && item.kind !== "draw"))) throw new Error("Canvas 曲线分支端点无效");
       if (node.kind === "canvas" && node.targetId && !this.canLinkCanvas(canvasId, node.targetId, nodes)) throw new Error("Canvas 不能形成直接或间接循环引用");
@@ -638,6 +627,12 @@ export class BrowserMockHost implements HostTransport {
         const previousBlock = current.nodes.find(node => node.block?.id === blockId)?.block;
         const nextLength = changed.block?.content.text?.length ?? changed.block?.content.markdown?.length ?? 0;
         const previousLength = previousBlock?.content.text?.length ?? previousBlock?.content.markdown?.length ?? 0;
+        const beforeCreation = history.entries[history.cursor - 1];
+        if (beforeCreation && !beforeCreation.nodes.some(node => node.block?.id === blockId)
+          && previousLength === 0 && snapshot.timestamp - current.timestamp < 5000) {
+          history.entries[history.cursor] = snapshot;
+          return;
+        }
         const group = this.canvasTextGroups.get(canvasId);
         const withinGroup = group && group.blockId === blockId && snapshot.timestamp - group.lastTimestamp < 5000 && Math.abs(nextLength - group.baselineLength) < 50;
         if (withinGroup) {

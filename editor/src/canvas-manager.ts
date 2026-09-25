@@ -1,5 +1,7 @@
 import type { CanvasCurve, CanvasDocument, CanvasNode, CanvasPoint, CanvasStroke, WorkspaceApi, WorkspaceDocument } from "./workspace-api";
 import { markdownFromContent, renderMarkdown } from "./markdown";
+import { createBlock } from "./document-model";
+import { DocumentSaveSession } from "./document-session";
 import { queryLinkSuggestions, headingInfo, type LinkSuggestion } from "./link-suggestions";
 import type { BlockContent, EditorCommand, EditorState, LinkToken, ReferenceInstance, ReferenceMode, MediaAsset } from "../../protocol/types";
 
@@ -32,6 +34,8 @@ export type CanvasManager = {
   insertCalendarLink(targetDocumentId: string, targetBlockId?: string, targetScope?: "block" | "heading", label?: string): boolean;
   insertLocationBlock(locationId: string): boolean;
 };
+
+type CanvasSaveSnapshot = { canvasId: string; nodes: CanvasNode[]; viewport: CanvasDocument["viewport"] };
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const uid = (prefix: string) => `${prefix}-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
@@ -89,8 +93,6 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   let current: CanvasDocument | null = null;
   let selected = new Set<string>();
   let renderToken = 0;
-  let saveTimer: ReturnType<typeof setTimeout> | null = null;
-  let saveTail = Promise.resolve();
   let libraryPoint: { x: number; y: number } | null = null;
   let suggestionPopup: HTMLElement | null = null;
   let suggestionInput: HTMLTextAreaElement | null = null;
@@ -101,7 +103,27 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   let composing = false;
   let modePopup: HTMLElement | null = null;
   let referenceTail = Promise.resolve();
-  let saveError: unknown = null;
+  const saveSession = new DocumentSaveSession<CanvasSaveSnapshot>(async snapshot => {
+    const latest = workspace.canvas(snapshot.canvasId);
+    if (!latest) throw new Error("Canvas 已被删除");
+    await workspace.execute({
+      type: "saveCanvas", canvasId: snapshot.canvasId, nodes: snapshot.nodes,
+      viewport: snapshot.viewport, mutationId: uid("canvas-mutation"), expectedVersion: latest.version
+    });
+    if (current?.id !== snapshot.canvasId) return;
+    const saved = workspace.canvas(snapshot.canvasId);
+    if (saved) {
+      current.version = saved.version;
+      current.canUndo = saved.canUndo;
+      current.canRedo = saved.canRedo;
+      updateHistoryButtons();
+      emitState();
+    }
+    callbacks.onWorkspaceChanged();
+  }, (phase, error) => {
+    saveState.textContent = phase === "saved" ? "已保存" : phase === "failed" ? "保存失败" : "保存中";
+    if (phase === "failed") callbacks.onError(error);
+  });
   let drawMode = false;
   let drawing: { pointerId: number; points: CanvasPoint[]; node: CanvasNode } | null = null;
   let curveMode = false;
@@ -213,7 +235,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       const blockId = uid("canvas-block");
       node = { id: blockId, kind: "block", x: nextPosition().x, y: nextPosition().y, width: 280, height: 180,
         zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1,
-        block: { id: blockId, parentId: null, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), type: "paragraph", content: { text: "", html: "", markdown: "" }, properties: {}, revision: 1 } };
+        block: createBlock({ id: blockId, position: String((current.nodes.length + 1) * 1000).padStart(8, "0") }) };
       current.nodes.push(node);
       selected = new Set([node.id]);
     }
@@ -247,8 +269,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const anchor = insertionNode();
     const point = anchor ? { x: anchor.x + anchor.width + 36, y: anchor.y } : nextPosition();
     const id = uid("canvas-location");
-    const block = { id, parentId: null, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), type: "location" as const,
-      content: { text: "", html: "", markdown: "" }, properties: { locationId }, revision: 1 };
+    const block = createBlock({ id, type: "location", position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), properties: { locationId } });
     current.nodes.push({ id, kind: "block", x: Math.round(point.x), y: Math.round(point.y), width: 320, height: 220,
       zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, block });
     selected = new Set([id]);
@@ -563,68 +584,24 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     return { x: right + 36, y: top };
   }
 
-  function queueSnapshot(canvasId: string, nodes: CanvasNode[], viewportState: CanvasDocument["viewport"]) {
-      saveState.textContent = "保存中";
-      saveTail = saveTail.catch(() => undefined).then(async () => {
-        saveError = null;
-        const latest = workspace.canvas(canvasId);
-        if (!latest) throw new Error("Canvas 已被删除");
-        await workspace.execute({
-          type: "saveCanvas",
-          canvasId,
-          nodes,
-          viewport: viewportState,
-          mutationId: uid("canvas-mutation"),
-          expectedVersion: latest.version
-        });
-        if (current?.id === canvasId) {
-          const saved = workspace.canvas(canvasId);
-          if (saved) {
-            current.version = saved.version;
-            current.canUndo = saved.canUndo;
-            current.canRedo = saved.canRedo;
-            updateHistoryButtons();
-            emitState();
-          }
-          saveState.textContent = "已保存";
-          callbacks.onWorkspaceChanged();
-        }
-      }).catch(error => {
-        saveError = error;
-        saveState.textContent = "保存失败";
-        callbacks.onError(error);
-      });
-  }
-
   function scheduleSave(delay = 0) {
     if (!current) return;
-    if (saveTimer) clearTimeout(saveTimer);
-    saveState.textContent = "保存中";
     // Publish the optimistic Canvas snapshot before the persistence debounce.
     // The right rail reads the same snapshot, so a newly typed link or todo
     // date is visible immediately and is then reconciled again by the ACK.
     emitState();
-    saveTimer = setTimeout(() => {
-      saveTimer = null;
-      if (!current) return;
-      queueSnapshot(current.id, structuredClone(current.nodes), structuredClone(current.viewport));
-    }, delay);
+    saveSession.schedule({ canvasId: current.id, nodes: structuredClone(current.nodes), viewport: structuredClone(current.viewport) }, delay);
   }
 
   async function flush() {
-    if (saveTimer && current) {
-      clearTimeout(saveTimer); saveTimer = null;
-      queueSnapshot(current.id, structuredClone(current.nodes), structuredClone(current.viewport));
-    }
-    await saveTail;
-    if (saveError) throw saveError;
+    await saveSession.flush();
   }
 
   function nodeLabel(node: CanvasNode, target?: WorkspaceDocument) {
     if (node.kind === "block") return node.block?.type === "heading" ? "标题块" : node.block?.type === "todo" ? "待办块" : node.block?.type === "location" ? "位置块" : "正文块";
     if (node.kind === "draw") return "手绘";
     if (node.kind === "curve") return "曲线";
-    if (node.kind === "media") return node.media?.name || "媒体";
+    if (node.kind === "media") return node.block?.content.media?.name || "媒体";
     if (!target) return "目标已删除";
     return target.title;
   }
@@ -1033,9 +1010,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     }
     if (node.kind === "media") {
       add("编辑说明", "✎", () => {
-        const value = window.prompt("媒体说明", node.caption ?? "");
+        const value = window.prompt("媒体说明", node.block?.content.caption ?? "");
         if (value === null) return;
-        node.caption = value.trim(); closeNodeMenu(); renderNodes(); scheduleSave();
+        if (node.block) { node.block.content.caption = value.trim(); node.block.revision += 1; }
+        closeNodeMenu(); renderNodes(); scheduleSave();
       });
     }
     add("删除此块", "×", () => removeNode(node.id), true);
@@ -1451,10 +1429,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           body.append(dates);
         }
         body.append(textarea, preview);
-      } else if (node.kind === "media" && node.media) {
-        const media = node.media;
+      } else if (node.kind === "media" && node.block?.content.media) {
+        const media = node.block.content.media;
         if (media.kind === "image") {
-          const image = document.createElement("img"); image.className = "canvas-media-preview"; image.src = media.url; image.alt = node.caption || media.name; body.append(image);
+          const image = document.createElement("img"); image.className = "canvas-media-preview"; image.src = media.url; image.alt = node.block.content.caption || media.name; body.append(image);
         } else if (media.kind === "video") {
           const video = document.createElement("video"); video.className = "canvas-media-preview"; video.src = media.url; video.controls = true; body.append(video);
         } else if (media.kind === "audio") {
@@ -1464,7 +1442,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         } else {
           const link = document.createElement("a"); link.className = "canvas-media-file"; link.href = media.url; link.download = media.name; link.textContent = `下载 ${media.name}`; body.append(link);
         }
-        if (node.caption) { const caption = document.createElement("div"); caption.className = "canvas-media-caption"; caption.textContent = node.caption; body.append(caption); }
+        if (node.block.content.caption) { const caption = document.createElement("div"); caption.className = "canvas-media-caption"; caption.textContent = node.block.content.caption; body.append(caption); }
       } else if (node.kind === "document" && target) {
         if (node.displayMode === "icon") {
           const icon = document.createElement("button");
@@ -1525,7 +1503,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const blockId = uid("canvas-block");
     const node: CanvasNode = {
       id: blockId, kind: "block", x: Math.round(point.x), y: Math.round(point.y), width: 280, height: 180, zIndex: maxZ + 1,
-      block: { id: blockId, parentId: null, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), type, content: { text: "", html: "", markdown: "", checked: type === "todo" ? false : undefined }, properties: type === "heading" ? { headingLevel: 1 } : type === "todo" ? { todoCreatedAt: todayIsoDate() } : {}, revision: 1 }
+      block: createBlock({ id: blockId, type, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), properties: type === "heading" ? { headingLevel: 1 } : {} })
     };
     current.nodes.push(node);
     selected = new Set([node.id]);
@@ -1678,7 +1656,8 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         const width = media.kind === "audio" ? 320 : 360;
         const height = media.kind === "audio" ? 120 : media.kind === "pdf" ? 300 : 240;
         const id = uid("canvas-media");
-        current.nodes.push({ id, kind: "media", x: Math.round(point.x + index * 24), y: Math.round(point.y + index * 24), width, height, zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, media });
+        current.nodes.push({ id, kind: "media", x: Math.round(point.x + index * 24), y: Math.round(point.y + index * 24), width, height, zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1,
+          block: createBlock({ id, type: "media", position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), content: { media } }) });
       }
       renderNodes(); scheduleSave();
     } catch (error) { callbacks.onError(error); }
@@ -1706,7 +1685,8 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const width = media.kind === "audio" ? 320 : 360;
     const height = media.kind === "audio" ? 120 : media.kind === "pdf" ? 300 : 240;
     const id = uid("canvas-media");
-    current.nodes.push({ id, kind: "media", x: Math.round(point.x), y: Math.round(point.y), width, height, zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, media });
+    current.nodes.push({ id, kind: "media", x: Math.round(point.x), y: Math.round(point.y), width, height, zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1,
+      block: createBlock({ id, type: "media", position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), content: { media } }) });
     selected = new Set([id]);
     renderNodes();
     scheduleSave();
@@ -1812,7 +1792,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const blockId = uid("canvas-reference");
     const node: CanvasNode = {
       id: blockId, kind: "block", x: Math.round(point.x), y: Math.round(point.y), width: 320, height: 150, zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1,
-      block: { id: blockId, parentId: null, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), type: "paragraph", content: { text: "[[", html: "[[", markdown: "[[" }, properties: {}, revision: 1 }
+      block: createBlock({ id: blockId, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), content: { text: "[[", html: "[[", markdown: "[[" } })
     };
     current.nodes.push(node);
     selected = new Set([node.id]);
@@ -1830,12 +1810,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     if (!current) return;
     try {
       await referenceTail;
-      if (saveTimer) {
-        clearTimeout(saveTimer);
-        saveTimer = null;
-        queueSnapshot(current.id, structuredClone(current.nodes), structuredClone(current.viewport));
-      }
-      await saveTail;
+      await flush();
       const latest = workspace.canvas(current.id);
       if (!latest) return;
       await workspace.execute({ type: direction === "undo" ? "undoCanvas" : "redoCanvas", canvasId: current.id, expectedVersion: latest.version });
@@ -2043,11 +2018,6 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   function close() {
     closeSuggestions(); modePopup?.remove(); modePopup = null; closeCurveStyleEditor(); closeNodeMenu(); hideIconPreview();
     drawMode = false; curveMode = false; pendingCurveEndpoint = null; drawing = null; viewport.classList.remove("draw-mode", "curve-mode");
-    if (saveTimer && current) {
-      clearTimeout(saveTimer);
-      saveTimer = null;
-      queueSnapshot(current.id, structuredClone(current.nodes), structuredClone(current.viewport));
-    }
     current = null;
     selected.clear();
     lastTextSelection = null;

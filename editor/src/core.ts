@@ -1,4 +1,5 @@
 import { queryLinkSuggestions, headingInfo, headingSection, type LinkSuggestion } from "./link-suggestions";
+import { createBlock as createCanonicalBlock } from "./document-model";
 import { sanitizeHtml, editableContent } from "./block-content";
 import type { BlockType, BlockContent, BlockProperties, Block, BlockComment, LinkToken, Note, Backlink, OverrideNotice, ReferenceOverride, ReferenceMode, ReferenceInstance, ReferenceTargetScope, EditorState, SaveMutation, RequestMap, StyleSheet, MediaAsset, MediaKind, DatabaseField, DatabaseSource, DatabaseRecord, DatabaseValue } from "../../protocol/types";
 import type { EditorHostApi } from "./editor-host-api";
@@ -22,6 +23,7 @@ export function mountEditor(host: EditorHostApi, ui: {
   canvasInsertCalendarLink?(targetDocumentId: string, targetBlockId?: string, targetScope?: ReferenceTargetScope, label?: string): boolean;
   canvasInsertLocationBlock?(locationId: string): boolean;
   surfaceStateChanged?(state: EditorState, surface: SurfaceKind): void;
+  beforeNavigation?(): Promise<void>;
 } = {}) {
 const titleInput = document.querySelector<HTMLInputElement>("#title")!;
 const blockSurface = document.querySelector<HTMLDivElement>("#blocks")!;
@@ -117,7 +119,7 @@ function post(message: Message, sourceDocumentId = state?.note.id): Promise<void
       handleSaveNack({ mutationId: (payload as SaveMutation).mutationId, error: error.message }));
   }
   if (type === "openDocument" || type === "navigateBack" || type === "navigateForward") {
-    return historyTail.then(() => flush()).then(() => host.request(type, payload as RequestMap[typeof type], sourceDocumentId))
+    return historyTail.then(() => flush()).then(() => ui.beforeNavigation?.()).then(() => host.request(type, payload as RequestMap[typeof type], sourceDocumentId))
       .then(() => undefined).catch(showError);
   }
   const owner = sourceDocumentId;
@@ -2666,15 +2668,7 @@ function updateTodoStatus(row: HTMLElement) {
 }
 
 function createBlock(type: BlockType = "paragraph", parentId: string | null = null): Block {
-  return {
-    id: newId(),
-    parentId,
-    position: "",
-    type,
-    content: { text: "", html: "", markdown: "", checked: false },
-    properties: type === "todo" ? { todoCreatedAt: todayIsoDate() } : {},
-    revision: 1
-  };
+  return createCanonicalBlock({ id: newId(), type, parentId, content: { checked: false } });
 }
 
 function removeOwnBlock(shell: HTMLElement | null) {
