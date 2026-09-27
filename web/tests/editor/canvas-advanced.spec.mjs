@@ -63,6 +63,33 @@ test("Canvas supports uploaded custom icons and curve branches", async ({ page }
   await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.filter(node => node.kind === "curve").length)).toBe(0);
 });
 
+test("Canvas branch tool creates a point and continues from it", async ({ page }) => {
+  await createCanvas(page, "曲线分支点");
+  await page.locator('[data-canvas-action="add"]').click();
+  await page.locator('[data-canvas-action="add"]').click();
+  await page.locator('[data-canvas-action="curve"]').click();
+  const blocks = page.locator(".canvas-node-text");
+  await blocks.nth(0).click();
+  await blocks.nth(1).click();
+  await page.locator(".canvas-curve-style").getByRole("button", { name: "双向箭头", exact: true }).click();
+  await page.locator(".canvas-curve-style").getByRole("button", { name: "插入控制点" }).click();
+  await expect(page.locator(".canvas-curve-guide")).toHaveCount(2);
+  await expect(page.locator('path.canvas-connection-visible[data-node-id^="canvas-curve"]').first()).toHaveAttribute("marker-start", "url(#canvas-arrow-start)");
+
+  await page.locator(".canvas-curve-style").getByRole("button", { name: "添加分支点" }).click();
+  await expect(page.locator(".canvas-branch-point-preview")).toBeVisible();
+  const viewport = page.locator(".canvas-viewport");
+  const rect = await viewport.boundingBox();
+  if (!rect) throw new Error("Canvas viewport is not visible");
+  await page.mouse.click(rect.x + 620, rect.y + 360);
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.filter(node => node.kind === "curve-point").length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "curve")?.curve?.branches?.length)).toBe(1);
+
+  await blocks.nth(0).click();
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.filter(node => node.kind === "curve").length)).toBe(2);
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.find(node => node.kind === "curve" && node.curve?.start.nodeId.startsWith("canvas-curve-point"))?.curve?.start.nodeId)).toMatch(/^canvas-curve-point/);
+});
+
 test("Canvas groups rapid text saves into one history entry", async ({ page }) => {
   await createCanvas(page, "历史分组画布");
   await page.locator('[data-canvas-action="add"]').click();

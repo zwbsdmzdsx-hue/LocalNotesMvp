@@ -45,6 +45,15 @@
 - 新功能或板块优先复用现有块类型、稳定 ID、宿主命令、保存与历史流程、渲染组件和数据模型；只有行为确实不同才增加特化字段或视图。不要为同一概念另建一套状态、存储或交互实现。
 - 复用会改变现有行为时，检查调用方和兼容入口，更新相应测试与文档；尚未覆盖的路径要明确记录，不能默认为已同步。
 
+## 新版网页端模块开发
+
+- 新文档类型先在 `editor/src/builtin-document-modules.ts` 注册创建入口、完整运行时生命周期和 `liveContext` 右栏状态能力；Dashboard 来源资格与 Canvas 插入形态由文档定义声明。打开、更新、关闭、排空保存、定位和历史由 `document-router.ts` 调度。不要在 `main.ts` 或工作区菜单增加平行的类型判断与保存路径。
+- 新块类型在 `editor/src/block-modules.ts` 同处定义工厂、标签、引用名称、只读与紧凑联想预览、定位、编辑器适配器、编辑快照读取、Canvas 特化预览/编辑能力及声明的日期、地点、搜索提取器。Canvas 的 `canvasTextValue`、`canvasReferenceEditable`、`canvasNodeDefaults`、标题卡标记、Dashboard 组件角色和读书笔记附着角色也必须随块定义注册，控制器不得重新列举块类型。编辑器适配器负责块行挂载与刷新；`canvasPreview`、`canvasDocumentPreview`、`canvasDecorate`、`canvasTextBehavior` 只描述块特化呈现和编辑规则，不持有 Canvas 的选择、拖拽或保存状态；快照读取只提供内容和属性，不新建保存路径。持久化对象只存可序列化数据，继续使用稳定的 `documentId`、`blockId` 和既有文档保存机制。
+- 新右栏面板通过 `module-registry.ts` 的 `PanelDefinition` 注册并由 `panel-host.ts` 创建标签和内容槽。面板只读取 `PanelContext`、块能力适配器及公共工作区命令，不读取别的模块的私有 DOM 或字段；必须实现挂载、更新、销毁。
+- 公共编辑器交互不随模块化迁移：块选择、拖拽事件与落点计算、键盘拆块、媒体拖放、剪贴板和 `[[` 联想仍由 `core.ts` 的统一交互层协调。只有不持有 DOM、选择状态、事件监听或保存队列的纯计算（例如拖拽摘要、块子树判断、列属性变换）才可放入共享工具文件；不得为缩短核心文件而新增交互控制器或第二套保存路径。
+- 改动公共块能力或面板条目时，运行 `web/tests/editor/module-contract.spec.mjs`、相关交互测试和 `npm run build:editor`。新增类型要补创建、切换、保存失败、引用／反链、右栏可见性和定位的实际操作测试。
+- 注册表只加载本应用可信代码，不把当前接口当作跨进程插件、安全沙箱或第三方代码加载器。具体接入步骤见 [MODULE_DEVELOPMENT_GUIDE.md](MODULE_DEVELOPMENT_GUIDE.md)。
+
 ## 数据与保存约束
 
 - SQLite 使用现有表。保留用户数据、稳定 ID、软删除语义、块树和实例归属。

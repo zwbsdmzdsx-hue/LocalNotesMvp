@@ -19,12 +19,16 @@ export type GeoLocation = {
   updatedAt: string;
   deletedAt?: string;
 };
-export type BlockType = "paragraph" | "heading" | "todo" | "reference" | "media" | "location" | "database_table" | "data_view" | "dashboard_widget";
-export type ReferenceTargetScope = "block" | "heading";
-export type LinkToken = { targetDocumentId?: string; targetBlockId?: string; targetScope?: ReferenceTargetScope; targetText: string; alias?: string; start: number; end: number };
+export type BlockType = "paragraph" | "heading" | "todo" | "reference" | "media" | "location" | "database_table" | "data_view" | "dashboard_widget" | "reading_book" | "reading_bookmark" | "reading_highlight" | "reading_note";
+export type ReadingRect = { x: number; y: number; width: number; height: number };
+export type ReadingAnchor = { bookId: string; page: number; x: number; y: number; rects?: ReadingRect[]; quote?: string };
+export type ReadingFormat = "pdf" | "markdown" | "text" | "word" | "presentation" | "code" | "unsupported";
+export type ReferenceTargetScope = "block" | "heading" | "record" | "cell";
+export type LinkToken = { targetDocumentId?: string; targetBlockId?: string; targetRecordId?: string; targetFieldKey?: string; targetScope?: ReferenceTargetScope; targetText: string; alias?: string; start: number; end: number };
 export type BlockContent = { text: string; html: string; markdown?: string; checked?: boolean; targetDocumentId?: string; links?: LinkToken[]; media?: MediaAsset; caption?: string };
 export type BlockCommentHistory = { id: string; action: "created" | "edited" | "deleted"; content: string; timestamp: string };
 export type BlockComment = { id: string; content: string; createdAt: string; updatedAt: string; deletedAt?: string; history: BlockCommentHistory[] };
+export type DashboardSettingValue = string | number | boolean | null;
 export type BlockProperties = {
   background?: string;
   textColor?: string;
@@ -48,6 +52,10 @@ export type BlockProperties = {
   /** Canonical persisted widths as CSS grid fractions for this column row. */
   columnWidths?: number[];
   databaseId?: string;
+  /** H1 block that names this sheet; the database ID owns its records. */
+  databaseSheetHeadingId?: string;
+  /** Last selected presentation for this table block. View definitions remain in databaseViews. */
+  databaseActiveViewId?: string;
   /** @deprecated Views are resolved from databaseId and databaseViews. Read only for old snapshots. */
   databaseViewId?: string;
   databaseSource?: "gfm" | "database";
@@ -64,6 +72,11 @@ export type BlockProperties = {
   todoDueAt?: string;
   /** ISO calendar date when a todo was actually completed. */
   todoCompletedAt?: string;
+  /** Reading annotations belong to a PDF book block in the same document. Coordinates are page-relative (0..1). */
+  readingAnchor?: ReadingAnchor;
+  readingColor?: string;
+  /** Rendering format selected from the attached file extension/MIME type. */
+  readingFormat?: ReadingFormat;
   /** Dashboard widget instance configuration. Result data is resolved at render time. */
   dashboardWidget?: {
     kind: string;
@@ -71,7 +84,12 @@ export type BlockProperties = {
     description?: string;
     scope: "activeDocument" | "document" | "notebook" | "workspace" | "database";
     sourceId?: string;
+    /** Used by the independent document filter widget; an empty list means all documents. */
+    documentIds?: string[];
     query?: Record<string, unknown>;
+    /** Public, serializable extension options; credentials must stay with a future host capability. */
+    externalSettings?: Record<string, DashboardSettingValue>;
+    view?: { columns?: string[]; groupBy?: string; seriesBy?: string; dateField?: string; dateGrain?: "day" | "month" };
     layout: { x: number; y: number; width: number; height: number; zIndex?: number };
     style?: { background?: string; color?: string; accent?: string; fontSize?: number };
   };
@@ -80,11 +98,11 @@ export type Block = { id: string; parentId: string | null; position: string; typ
 export type Note = { id: string; title: string; isSticky: boolean; clientVersion: number };
 export type StyleScope = "system" | "document" | "notebook";
 export type StyleSheet = { id: string; title: string; description: string; css: string; enabled: boolean; position: string; scope: StyleScope; };
-export type Backlink = { sourceDocumentId: string; sourceTitle: string; sourceBlockId: string; excerpt: string };
+export type Backlink = { sourceDocumentId: string; sourceTitle: string; sourceBlockId: string; targetBlockId?: string; targetRecordId?: string; targetFieldKey?: string; targetScope?: ReferenceTargetScope; targetTitle?: string; excerpt: string };
 export type OverrideNotice = { referenceInstanceId: string; targetBlockId: string; sourceUpdated: boolean; hostTitle: string; hostDocumentId: string; excerpt: string; kind: "content_style" | "hide" | "move" | "insert" };
 export type ReferenceOverride = { targetBlockId: string; patch: { content: BlockContent; properties: BlockProperties }; baseRevision: number };
 export type ReferenceMode = "inline" | "collapsed" | "sidebar" | "link";
-export type ReferenceInstance = { id: string; hostBlockId: string; targetDocumentId: string; targetBlockId?: string; targetScope?: ReferenceTargetScope; targetTitle: string; mode: ReferenceMode; broken?: boolean; blocks: Block[]; overrides: ReferenceOverride[]; hiddenBlockIds: string[] };
+export type ReferenceInstance = { id: string; hostBlockId: string; targetDocumentId: string; targetBlockId?: string; targetRecordId?: string; targetFieldKey?: string; targetScope?: ReferenceTargetScope; targetTitle: string; mode: ReferenceMode; broken?: boolean; blocks: Block[]; overrides: ReferenceOverride[]; hiddenBlockIds: string[] };
 export type LinkCatalogDocument = {
   id: string;
   title: string;
@@ -92,14 +110,16 @@ export type LinkCatalogDocument = {
   notebookId?: string;
   notebookName?: string;
   blocks?: Block[];
+  database?: { databaseId: string; fields: DatabaseField[]; records: DatabaseRecord[] };
+  databases?: Array<{ databaseId: string; fields: DatabaseField[]; records: DatabaseRecord[] }>;
 };
 export type DatabaseFieldType = "text" | "number" | "url" | "media" | "formula" | "rule" | "document_relation" | "record_relation" | "rollup";
 export type RollupFunction = "count" | "sum" | "avg" | "min" | "max" | "unique";
 export type DatabaseField = { id: string; databaseId: string; key: string; title: string; type: DatabaseFieldType; position: string; formula?: string; relationDatabaseId?: string; relationScope?: "document" | "record"; rollup?: RollupFunction; rollupFieldKey?: string; };
 export type DatabaseSource = { id: string; notebookId?: string; title: string; createdAt?: string; updatedAt?: string; fields: DatabaseField[]; recordCount: number; };
 export type DatabaseValue = string | number | boolean | string[] | MediaAsset | null;
-export type DatabaseRecord = { id: string; databaseId: string; position: string; sourceDocumentId?: string; sourceBlockId?: string; values: Record<string, DatabaseValue>; };
-export type DatabaseView = { id: string; databaseId: string; name: string; type: "table"; settings: { fieldKeys?: string[]; widths?: number[]; sort?: { key: string; direction: "asc" | "desc" }[]; filters?: Array<{ key: string; operator: "=" | "!=" | ">" | ">=" | "<" | "<=" | "contains"; value: DatabaseValue }>; groupBy?: string; }; };
+export type DatabaseRecord = { id: string; databaseId: string; position: string; sourceDocumentId?: string; sourceBlockId?: string; values: Record<string, DatabaseValue>; /** Parsed wiki links for text-like cells; values remains backward compatible. */ cellLinks?: Record<string, LinkToken[]>; };
+export type DatabaseView = { id: string; databaseId: string; name: string; type: "table" | "board" | "gallery"; settings: { fieldKeys?: string[]; widths?: number[]; sort?: { key: string; direction: "asc" | "desc" }[]; filters?: Array<{ key: string; operator: "=" | "!=" | ">" | ">=" | "<" | "<=" | "contains"; value: DatabaseValue }>; groupBy?: string; search?: string; }; };
 export type DataQuery = { table?: string[]; from: "current" | { notebookId: string }; where?: string; sort?: Array<{ key: string; direction: "asc" | "desc" }>; groupBy?: string; limit?: number; };
 export type FormulaError = { code: "syntax" | "type" | "unknown_property" | "cycle" | "runtime"; message: string; };
 export type DataQueryResult = { columns: Array<{ key: string; title: string; type: DatabaseFieldType }>; rows: Array<{ recordId: string; sourceDocumentId?: string; sourceBlockId?: string; values: Record<string, DatabaseValue | FormulaError>; grouped?: boolean; readonlyKeys?: string[]; }>; errors: FormulaError[]; };
@@ -111,7 +131,7 @@ export type SaveMutation = SaveDocumentPayload & { documentId: string; mutationI
 export const PROTOCOL_VERSION = 1 as const;
 export type ReferenceCommandMap = {
   /** Used when an ordinary [[...]] link explicitly chooses a live display mode; default insertion remains an ordinary link. */
-  createReference: { hostBlockId: string; targetDocumentId: string; targetBlockId?: string; targetScope?: ReferenceTargetScope };
+  createReference: { hostBlockId: string; targetDocumentId: string; targetBlockId?: string; targetRecordId?: string; targetFieldKey?: string; targetScope?: ReferenceTargetScope };
   setReferenceMode: { referenceInstanceId: string; mode: ReferenceMode };
   saveOverride: { historyGroup?: string; referenceInstanceId: string; targetBlockId: string; content: BlockContent; properties: BlockProperties };
   saveInstanceBlock: { historyGroup?: string; referenceInstanceId: string; block: Block };

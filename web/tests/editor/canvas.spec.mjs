@@ -94,6 +94,27 @@ test("documents can be dragged into a Canvas as resizable live previews", async 
   await expect(page.locator("#title")).toHaveValue("Beta");
 });
 
+test("Canvas insertion uses registered document labels and icons", async ({ page }) => {
+  page.once("dialog", dialog => dialog.accept("图表文档"));
+  await page.locator(".bk-strip.active .bookmark-add-document").click();
+  await page.getByRole("button", { name: "新建 Dashboard" }).click();
+  page.once("dialog", dialog => dialog.accept("资料书架"));
+  await page.locator(".bk-strip.active .bookmark-add-document").click();
+  await page.getByRole("button", { name: "新建读书笔记" }).click();
+  await createCanvas(page, "类型预览画布");
+  await page.locator('[data-canvas-action="insert"]').click();
+  const dashboard = page.locator(".canvas-library-list button", { hasText: "图表文档" });
+  const reading = page.locator(".canvas-library-list button", { hasText: "资料书架" });
+  await expect(dashboard.locator("span").first()).toHaveText("▦");
+  await expect(dashboard.locator("small")).toHaveText("Dashboard");
+  await expect(reading.locator("span").first()).toHaveText("▧");
+  await expect(reading.locator("small")).toHaveText("读书笔记");
+  await dashboard.click();
+  const node = page.locator(".canvas-node-document", { hasText: "图表文档" });
+  await expect(node).toBeVisible();
+  await expect(node.locator(".canvas-node-type-icon")).toHaveText("▦");
+});
+
 test("Canvas block grip opens a folded node menu and persists font size", async ({ page }) => {
   await createCanvas(page, "节点菜单画布");
   await page.locator('[data-canvas-action="add"]').click();

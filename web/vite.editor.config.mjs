@@ -10,7 +10,11 @@ export default defineConfig({
       marked: resolve(process.cwd(), "node_modules/marked/lib/marked.esm.js"),
       turndown: resolve(process.cwd(), "node_modules/turndown/lib/turndown.browser.es.js"),
       leaflet: resolve(process.cwd(), "node_modules/leaflet/dist/leaflet-src.esm.js"),
-      "maplibre-gl": resolve(process.cwd(), "node_modules/maplibre-gl/dist/maplibre-gl.mjs")
+      "maplibre-gl": resolve(process.cwd(), "node_modules/maplibre-gl/dist/maplibre-gl.mjs"),
+      echarts: resolve(process.cwd(), "node_modules/echarts/dist/echarts.esm.js"),
+      "pdfjs-dist": resolve(process.cwd(), "node_modules/pdfjs-dist/build/pdf.mjs"),
+      mammoth: resolve(process.cwd(), "node_modules/mammoth/lib/index.js"),
+      "pptx-preview": resolve(process.cwd(), "node_modules/pptx-preview/dist/pptx-preview.es.js")
     }
   },
   optimizeDeps: { exclude: ["maplibre-gl"] },

@@ -4,7 +4,7 @@ test('creates an editable database table and preserves its structure in source m
   await page.goto('/');
   await page.locator('#add-database').click();
   await expect(page.locator('[data-own-block][data-type="database_table"]')).toHaveCount(1);
-  await expect(page.locator('.database-table th')).toHaveCount(3);
+  await expect(page.locator('.database-table th[data-field-key]')).toHaveCount(3);
   await page.locator('.database-add-row').click();
   await expect(page.locator('.database-table tbody tr')).toHaveCount(1);
   const name = page.locator('.database-cell[data-field-key="name"]').first();
@@ -87,7 +87,7 @@ test('converts a GFM table in place and converts the same records back to Markdo
   await page.getByRole('menu').getByText('转换为普通数据表', { exact: true }).click();
   await expect(page.locator('[data-id="a1"][data-type="database_table"]')).toBeVisible();
   await expect(page.locator('[data-id="a1"] .database-table tbody tr')).toHaveCount(2);
-  await page.locator('[data-id="a1"] > .block-row > .grip').click();
+  await page.locator('[data-id="a1"] .database-table-actions').click();
   await page.getByRole('menu').getByText('转换为 Markdown 表格', { exact: true }).click();
   await page.locator('[data-editor-mode="source"]').click();
   await expect(page.locator('[data-id="a1"] .block-text')).toContainText('| 咖啡 | 28 |');
@@ -189,8 +189,29 @@ test('database sidebar is contextual and clears when the active table is deleted
   await expect(tab).toBeHidden();
   await expect(page.locator('#databases-section')).toBeHidden();
 
-  await table.locator('.delete-block').click();
+  await table.locator('.database-table-remove').click();
   await expect(table).toHaveCount(0);
   await expect(tab).toBeHidden();
   await expect(page.locator('#databases')).toBeEmpty();
+});
+
+test('database sidebar saves schema and query changes and exports CSV', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('#add-database').click();
+  const panel = page.locator('[data-slot="databases"]');
+  await expect(panel.locator('.database-context-panel')).toBeVisible();
+  await panel.getByRole('textbox', { name: '数据表名称' }).fill('项目清单');
+  await panel.getByRole('button', { name: '保存属性' }).click();
+  await expect.poll(() => page.evaluate(() => window.mockHost.state('alpha').databases.some(database => database.title === '项目清单'))).toBe(true);
+
+  const download = page.waitForEvent('download');
+  await panel.getByRole('button', { name: '导出 CSV' }).click();
+  expect((await download).suggestedFilename()).toMatch(/\.csv$/);
+
+  await page.locator('#add-query').click();
+  const query = panel.getByRole('textbox', { name: 'DQL 查询' });
+  await expect(query).toBeVisible();
+  await query.fill('FROM current\nLIMIT 1');
+  await panel.getByRole('button', { name: '保存并刷新' }).click();
+  await expect.poll(() => page.evaluate(() => window.mockHost.state('alpha').blocks.find(block => block.type === 'data_view')?.properties.dataQuery)).toBe('FROM current\nLIMIT 1');
 });

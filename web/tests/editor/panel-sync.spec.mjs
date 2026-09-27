@@ -35,6 +35,21 @@ test("Canvas references use the shared live reference panel", async ({ page }) =
   await expect(page.locator("#reference-sidebar-section")).toContainText("Beta");
 });
 
+test("Canvas selection can add a block comment from the shared right panel", async ({ page }) => {
+  await createCanvas(page, "注释同步画布");
+  await page.locator("[data-canvas-action=add]").click();
+  const card = page.locator(".canvas-node-text").last();
+  await card.locator("textarea").fill("画布注释目标");
+  await card.click();
+  await page.locator("[data-pane-btn=comments]").click();
+  const panel = page.locator('[data-slot="comments"]');
+  await expect(panel.locator(".comment-current-card")).toBeVisible();
+  await panel.locator(".comment-current-card textarea").fill("画布右栏注释");
+  await panel.locator(".comment-current-card").getByRole("button", { name: "添加注释" }).click();
+  await expect(panel.locator(".comment-block-card")).toContainText("画布右栏注释");
+  await expect.poll(() => page.evaluate(() => window.mockHost.canvas(window.mockHost.current)?.nodes.some(node => node.block?.properties.comments?.some(comment => comment.content === "画布右栏注释")))).toBe(true);
+});
+
 test("Canvas accepts calendar links and location blocks from the right rail", async ({ page }) => {
   await page.goto("/");
   // Seed a diary heading while the ordinary document editor owns the save

@@ -53,14 +53,17 @@ CSS 样式资源也通过 `executeCommand` 保存：`save-style` 携带 `id/titl
 
 数据库字段类型包含 `text`、`number`、`url`、`media`、`formula`、`rule`、`document_relation`、`record_relation` 和 `rollup`。`media` 值复用 `MediaAsset` JSON；上传仍先走 `storeMedia`，再由 `upsert-database-record` 保存。公式和规则字段在编辑模式显示运算结果，用户点击单元格时才编辑字段表达式；源码模式显示声明里的 `formula`，预览模式只显示结果。
 
+新版浏览器可创建 `WorkspaceItemKind="database"` 的数据表文档。目录中的数据库行和单元格是稳定引用目标：`#@recordId` 表示整行，`#@recordId.fieldKey` 表示字段值；两者的 `ReferenceTargetScope` 分别为 `record` 和 `cell`。文本/网址单元格可附带 `cellLinks`，其预览和反向链接沿用普通 Markdown 链接解析。
+
 Todo 块的 `todoCreatedAt`（记录创建日期）、`todoDueAt`（目标完成日期）和 `todoCompletedAt`（实际完成日期）属于块的 `BlockProperties`，随普通 `saveDocument`、历史、撤销和重做保存；它们不会写入待办的 Markdown 文本。新版浏览器日历直接从工作区待办块读取这些字段，只在目标日期显示状态点：未到期为黄色、逾期未完成为红色、已完成为绿色；创建日期不单独显示，日记点仍使用绿色圆点，不建立第二套日历数据源。正文同时保留三类日期，并显示提前完成的绿色勾、逾期完成的红色勾和逾期未完成的红色感叹号。
 
 地理位置通过 `GeoLocation` 目录统一保存，支持 `global` 和 `notebook` 两种 scope。位置目录由 `list-locations` 读取，写入使用 `create-location`、`update-location` 和 `delete-location`，携带 `mutationId` 与 `expectedLocationVersion`；删除为软删除。正文位置块使用 `type: "location"`，只保存 `properties.locationId` 和可选的 `locationLabelOverride`，名称、地址与坐标不复制到块内。地图管理使用 Leaflet + OpenStreetMap；浏览器定位、IP 粗定位和 Nominatim 反向地理编码都由用户主动触发或由地图选点防抖触发，失败时保留手动坐标。
 
 Canonical DTO 约束：标题块使用 `properties.headingLevel`（1 到 6），源码中的
 `#` 只负责序列化和解析；工具栏创建的无 `#` 标题仍由该属性明确表示为 H1。
-数据库正文块只绑定 `properties.databaseId`，视图通过 `databaseViews` 的
-`databaseId` 关联；`databaseViewId` 是旧快照兼容字段，新编辑器不会写入。
+数据库正文块通过 `properties.databaseId` 绑定记录源；数据表文档中的 Sheet 由 H1 块和 `database_table` 块组成，后者用 `databaseSheetHeadingId` 指向标题块。视图通过 `databaseViews` 的 `databaseId` 关联，同一源可有表格、看板、画廊视图。`DatabaseView.settings` 保存列、排序、筛选、查找和分组，块的 `databaseActiveViewId` 只保存上次选中的视图 ID。`databaseViewId` 是旧快照兼容字段，新编辑器不会写入。新版浏览器 Mock 已实现版本化的 `save-database-view` 和 `delete-database-view`；C# 宿主与 SQLite 尚未承接，不能把本段视为桌面端能力。
+
+Sheet 标签按标题块与表格块成对排序。移除 Sheet 只从文档块快照移除这一对块，保留记录源和引用目标；文档历史可恢复这对块。彻底清理无主数据源不属于当前浏览器功能。
 分栏只使用下方约定的 `columnGroup/column/columnWidths`，旧 `layout` 容器字段
 只在加载迁移时读取。
 
@@ -69,6 +72,8 @@ Canonical DTO 约束：标题块使用 `properties.headingLevel`（1 到 6），
 Canvas 当前属于新版浏览器的 `WorkspaceApi` 能力，不是已落地的 C# Host 命令。Canvas 项目以 `kind: "canvas"` 区分，自由正文和媒体节点都携带与正文相同的 `Block`；媒体资源及说明以 `block.content.media/caption` 为准，旧节点的 `media/caption` 只在读取时迁移。节点另存稳定 ID、坐标、尺寸、层级、视口、显示模式、Icon、字号、手绘笔画和 Bezier 曲线参数。曲线端点只能吸附到普通块四边中点，支持多个连接、颜色、粗细、实线/虚线/点线及中点描述；节点移动、调整尺寸、引用、手绘、曲线和视口进入浏览器 Canvas 历史。Canvas 文档/Canvas 节点是打开关系，不改变目录 `parentId`，并拒绝直接或间接循环。当前数据由 `BrowserMockHost` 内存保存，尚未写入 SQLite `views/placements/edges`，也没有新增桌面 `executeCommand`；后续接入必须先补齐正式 DTO、事务、版本和重启恢复契约。
 
 Dashboard 当前属于新版浏览器的 `WorkspaceApi` 能力，项目以 `kind: "dashboard"` 区分。组件使用 `Block.type: "dashboard_widget"`，其 `properties.dashboardWidget` 保存 `kind`、数据 `scope`、可选 `sourceId/query`、`description`、`style` 和 `layout`；组件渲染结果不进入快照。Dashboard 通过现有 `saveDocument` 保存标题和组件块，因此继续使用 `mutationId`、`clientVersion`、块 ID 归属和父树校验。浏览器端的 `DashboardWidgetRenderer` 注册表为后续组件扩展预留；当前内置查询指标和右栏各能力的摘要组件。该能力尚未新增 C# Host 命令或 SQLite 专用表，Mock 数据仍为页面内存。
+
+读书笔记当前属于新版浏览器的 `WorkspaceApi` 能力，项目以 `kind: "reading"` 区分。PDF 使用 `reading_book` 块并在 `content.media` 保存 `MediaAsset`；其子块 `reading_bookmark`、`reading_highlight`、`reading_note` 的 `parentId` 指向书籍块。子块的 `properties.readingAnchor` 保存 `{ bookId, page, x, y, rects?, quote? }`，坐标和选区矩形均相对 PDF 页面归一化至 0..1；高亮颜色保存在 `readingColor`。这些块随普通 `saveDocument` 快照、版本、历史及归属校验一起保存。当前只有浏览器 Mock 实现，尚未验证 C# Host 或 SQLite 对新块类型的落盘与重开。
 
 `saveDocument` is a serialized transaction. Its payload includes the document
 ID, mutation ID, client version, title, and block snapshot. The response always
@@ -130,6 +135,8 @@ written back in that form.
 另存一份状态。引用投影中的源块注释只读，不能借预览写回源文档。
 
 ## Reference presentation and placement
+
+新版浏览器 Mock 的跨文档类型块引用复用 `Block.content.links[]` 中的 `targetDocumentId` 和 `targetBlockId`，不另建 Canvas、Dashboard 或读书笔记专用引用表。反向链接由来源块 ID 和目标块 ID 查询得到，目标块筛选不依赖标题；书籍、PDF 标注和 Dashboard 组件均可作为来源或目标。此处说明浏览器内存实现，当前桌面 SQLite 入口尚未接入这些特化文档类型。
 
 `set-reference-mode` persists `inline` (expanded body), `collapsed` (folded
 body with a disclosure arrow), `link` (title only), or `sidebar`. The disclosure

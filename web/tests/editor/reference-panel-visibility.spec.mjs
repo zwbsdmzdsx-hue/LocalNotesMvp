@@ -68,6 +68,19 @@ test('body add/delete/hide/reset reference rows keeps selected panel visible thr
   await page.screenshot({ path: info.outputPath('reference-panel-after-row-operations.png'), fullPage: true });
 });
 
+test('inline detach remains available after the reference card refreshes', async ({ page }) => {
+  const ref = bodyReference(page);
+  await ref.locator('.add-sibling').first().click();
+  await expect(ref.locator('[data-scope-type="reference_instance"]')).toHaveCount(1);
+  await expect(ref.locator('.reference-card-summary .reference-detach')).toHaveCount(1);
+  await ref.locator('.reference-card-summary .reference-detach').click();
+  await expect(bodyReference(page)).toHaveCount(0);
+  await expect(page.locator('#reference-sidebar .reference-card')).toHaveCount(0);
+  await expect(page.locator('#blocks [data-own-block][data-type="paragraph"]')).not.toHaveCount(0);
+  await expect(page.locator('#blocks [data-own-block]:focus-within .block-text')).toHaveCount(1);
+  await assertPanel(page);
+});
+
 for (const action of ['删除引用', '断开引用（保留为正文）']) {
   test(`${action}: empty state and title remain visible after removal`, async ({ page }, info) => {
     await bodyReference(page).locator('.reference-heading .grip').click();

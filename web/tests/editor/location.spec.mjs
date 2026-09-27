@@ -39,6 +39,10 @@ test("新建位置、坐标输入和插入正文保持稳定 locationId", async 
   await expect(block.locator(".location-source")).toContainText(`id: ${locationId}`);
   await page.locator('[data-editor-mode="preview"]').click();
   await expect(block.locator(".location-body-map")).toBeVisible();
+  await panel.locator(`.location-card[data-location-id="${locationId}"]`).getByRole("button", { name: "编辑" }).click();
+  await panel.locator(".location-editor-form input").first().fill("广州越秀更新点");
+  await panel.getByRole("button", { name: "保存位置" }).click();
+  await expect(block.locator(".location-body-head")).toContainText("广州越秀更新点");
 });
 
 test("IP 定位不会自动请求，浏览器定位按钮可被用户主动触发", async ({ page }) => {

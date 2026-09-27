@@ -1,11 +1,12 @@
 import type { BrowserMockHost } from "./browser-mock-host";
 import type { WorkspaceApi, WorkspaceCommand } from "./workspace-api";
+import type { DocumentModule, ModuleRegistry } from "./module-registry";
 
 /** Browser adapter only. A native workspace adapter must implement the same interface. */
 export function createBrowserWorkspace(store: BrowserMockHost, session: {
   flush(): Promise<void>;
   reloadCurrent(): Promise<void>;
-}): WorkspaceApi {
+}, documentModules: ModuleRegistry<DocumentModule>): WorkspaceApi {
   let tail = Promise.resolve();
   function apply(command: WorkspaceCommand) {
     switch (command.type) {
@@ -23,9 +24,7 @@ export function createBrowserWorkspace(store: BrowserMockHost, session: {
       case "createBookmark": store.bookmarksPush(command.bookmark); break;
       case "createDocument": {
         const { id, title, kind = "document" } = command.document;
-        if (kind === "canvas") store.createCanvas(title, id, command.bookmarkId, command.parentId ?? null);
-        else if (kind === "dashboard") store.createDashboard(title, id, command.bookmarkId, command.parentId ?? null);
-        else store.createDocument(title, id, command.bookmarkId, command.parentId ?? null);
+        documentModules.require(kind).create({ id, title, bookmarkId: command.bookmarkId, parentId: command.parentId ?? null });
         break;
       }
       case "moveDocument": store.moveDocument(command.id, command.bookmarkId, command.parentId, command.index); break;

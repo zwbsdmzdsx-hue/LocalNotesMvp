@@ -1,11 +1,11 @@
 import type { Block, ReferenceInstance, HistoryModel, MediaAsset } from "../../protocol/types";
-import { createBlock } from "./document-model";
+import { createRegisteredBlock as createBlock } from "./block-modules";
 
 export type Notebook = { id: string; name: string };
 export type Bookmark = { id: string; notebookId: string; name: string; color: string };
-export type WorkspaceItemKind = "document" | "canvas" | "dashboard";
+export type WorkspaceItemKind = "document" | "canvas" | "dashboard" | "reading" | "database";
 export type WorkspaceDocument = { id: string; title: string; bookmarkId: string; parentId: string | null; position: number; kind: WorkspaceItemKind };
-export type CanvasNodeKind = "block" | "document" | "canvas" | "draw" | "curve" | "media";
+export type CanvasNodeKind = "block" | "document" | "canvas" | "draw" | "curve" | "curve-point" | "media";
 export type CanvasPoint = { x: number; y: number };
 export type CanvasStroke = { points: CanvasPoint[]; color: string; width: number };
 export type CanvasCurveEndpoint = { nodeId: string; side: "top" | "right" | "bottom" | "left" };
@@ -18,7 +18,7 @@ export type CanvasCurve = {
   width: number;
   dash: "solid" | "dashed" | "dotted";
   /** Arrowhead placement for the main path. Older curves default to none. */
-  arrow?: "none" | "end" | "both";
+  arrow?: "none" | "start" | "end" | "both";
   /** Additional points inserted between the legacy cubic handles. */
   controlPoints?: CanvasPoint[];
   /** Extra endpoints that branch from the same start node. */

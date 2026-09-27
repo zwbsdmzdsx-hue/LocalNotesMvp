@@ -1,0 +1,98 @@
+import { test, expect } from "@playwright/test";
+
+test("data table documents expose row and cell references", async ({ page }) => {
+  await page.goto("/");
+  await page.once("dialog", dialog => dialog.accept("项目数据表"));
+  await page.locator(".bk-strip.active .bookmark-add-document").click();
+  await page.getByRole("button", { name: "新建数据表" }).click();
+  await expect(page.locator("#title")).toHaveValue("项目数据表");
+  const table = page.locator('[data-own-block][data-type="database_table"]');
+  await table.locator(".database-add-row").click();
+  await table.locator('.database-cell[data-field-key="name"]').fill("第一条记录");
+  await table.locator('.database-cell[data-field-key="name"]').press("Tab");
+  await table.locator('.database-cell[data-field-key="status"]').fill("[[默认笔记本/Beta#^b1]]");
+  await table.locator('.database-cell[data-field-key="status"]').press("Tab");
+  await expect(page.locator("#status")).toContainText("已同步本地数据库", { timeout: 3000 });
+  await page.locator('[data-editor-mode="preview"]').click();
+  await expect(table.locator('tbody tr td[data-field-key="status"] .wiki-link')).toHaveAttribute("data-target-block-id", "b1");
+  await page.locator('[data-editor-mode="rich"]').click();
+
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  const block = page.locator('[data-id="a1"] > .block-row > .block-text');
+  await block.fill("[[默认笔记本/项目数据表/");
+  await expect(page.locator(".link-suggestion").filter({ hasText: "整行" }).filter({ hasText: "第一条记录" })).toBeVisible();
+  await page.locator(".link-suggestion").filter({ hasText: "整行" }).filter({ hasText: "第一条记录" }).click();
+  await expect(block.locator(".wiki-link")).toHaveAttribute("data-target-scope", "record");
+  await block.locator(".wiki-link").hover();
+  await expect(page.locator(".link-preview")).toContainText("第一条记录", { timeout: 1500 });
+  await page.mouse.move(5, 5);
+  await page.locator('.doc-item').filter({ hasText: "项目数据表" }).click();
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  await expect(block.locator('.wiki-link[data-target-scope="record"]')).toContainText("Beta");
+  await block.fill("[[默认笔记本/项目数据表/#@");
+  await expect(page.locator('.link-suggestion[data-kind="cell"][data-field-key="name"]')).toBeVisible();
+  await page.locator('.link-suggestion[data-kind="cell"][data-field-key="name"]').click();
+  await expect(block.locator(".wiki-link")).toHaveCount(1);
+});
+
+test("a whole-row link projects every field and can be removed after inline expansion", async ({ page }) => {
+  await page.goto("/");
+  await page.once("dialog", dialog => dialog.accept("引用目标表"));
+  await page.locator(".bk-strip.active .bookmark-add-document").click();
+  await page.getByRole("button", { name: "新建数据表" }).click();
+  const table = page.locator('[data-own-block][data-type="database_table"]');
+  await table.locator(".database-add-row").click();
+  await table.locator('.database-cell[data-field-key="name"]').fill("完整记录");
+  await table.locator('.database-cell[data-field-key="name"]').press("Tab");
+  await table.locator('.database-cell[data-field-key="status"]').fill("进行中");
+  await table.locator('.database-cell[data-field-key="status"]').press("Tab");
+  await expect(page.locator("#status")).toContainText("已同步本地数据库");
+
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  const block = page.locator('[data-id="a1"] > .block-row > .block-text');
+  await block.fill("前文 [[默认笔记本/引用目标表/");
+  await page.locator(".link-suggestion").filter({ hasText: "整行" }).filter({ hasText: "完整记录" }).click();
+  const link = block.locator(".wiki-link");
+  const recordId = await link.getAttribute("data-target-record-id");
+  expect(recordId).toBeTruthy();
+  await expect(link).toContainText("进行中");
+  await link.hover();
+  await expect(page.locator(".link-preview")).toContainText("进行中");
+  await page.mouse.move(5, 5);
+  await page.locator('[data-pane-btn="reference-sidebar"]').click();
+  const group = page.locator('.reference-document-group').filter({ hasText: "引用目标表" });
+  await expect(group.locator(".linked-reference-entry")).toHaveCount(1);
+  await group.locator(".linked-reference-entry .reference-mode-menu").click();
+  await page.getByRole("menu").getByText("正文直显", { exact: true }).click();
+  const card = page.locator('[data-id="a1"] > .reference-card:not(.sidebar)');
+  await expect(card).toContainText("完整记录");
+  await expect(card).toContainText("进行中");
+  await expect(group.locator(".reference-card.sidebar")).toHaveCount(1);
+  await card.locator(".reference-mode-menu").click();
+  await page.getByRole("menu").getByText("删除引用", { exact: true }).click();
+  await expect(page.locator('[data-id="a1"] > .reference-card:not(.sidebar)')).toHaveCount(0);
+  await expect(group.locator(".reference-card.sidebar, .linked-reference-entry")).toHaveCount(0);
+  await expect(block).toContainText("前文");
+  await expect(block.locator(".wiki-link")).toHaveCount(0);
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  await page.locator('.doc-item').filter({ hasText: "引用目标表" }).click();
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  await expect(block).toContainText("前文");
+  await expect(group.locator(".reference-card.sidebar, .linked-reference-entry")).toHaveCount(0);
+
+  await block.fill("再次引用 [[默认笔记本/引用目标表/");
+  await page.locator(".link-suggestion").filter({ hasText: "整行" }).filter({ hasText: "完整记录" }).click();
+  await expect(group.locator(".linked-reference-entry")).toHaveCount(1);
+  await group.locator(".linked-reference-entry .reference-mode-menu").click();
+  await page.getByRole("menu").getByText("正文直显", { exact: true }).click();
+  await card.getByRole("button", { name: "删除引用" }).click();
+  await expect(block).toContainText("再次引用");
+  await expect(block.locator(".wiki-link")).toHaveCount(0);
+  await expect(group.locator(".reference-card.sidebar, .linked-reference-entry")).toHaveCount(0);
+
+  await block.fill("[[默认笔记本/引用目标表/");
+  await page.locator(".link-suggestion").filter({ hasText: "整行" }).filter({ hasText: "完整记录" }).click();
+  await expect(group.locator(".linked-reference-entry")).toHaveCount(1);
+  await block.fill("引用已清除");
+  await expect(group.locator(".linked-reference-entry")).toHaveCount(0);
+});

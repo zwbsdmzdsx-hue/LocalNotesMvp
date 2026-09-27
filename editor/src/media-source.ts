@@ -1,5 +1,12 @@
 import type { MediaAsset } from "../../protocol/types";
 
+export async function fileToBase64(file: File) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  return btoa(binary);
+}
+
 export function mediaFromUrl(raw: string): MediaAsset {
   const parsed = new URL(raw.trim());
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("媒体地址必须使用 http 或 https");

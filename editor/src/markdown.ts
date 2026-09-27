@@ -17,6 +17,7 @@ turndown.addRule("wiki-link", {
     const title = element.dataset.targetTitle ?? element.dataset.title ?? content;
     const target = element.dataset.targetScope === "heading" && element.dataset.targetHeading
       ? `${title}#${element.dataset.targetHeading}`
+      : element.dataset.targetRecordId ? `${title}#@${element.dataset.targetRecordId}${element.dataset.targetFieldKey ? `.${element.dataset.targetFieldKey}` : ""}`
       : element.dataset.targetBlockId ? `${title}#^${element.dataset.targetBlockId}` : title;
     return content && content !== title ? `[[${target}|${content}]]` : `[[${target}]]`;
   }
@@ -49,13 +50,13 @@ function escapeAttribute(value: string) {
   return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-const wikiLinkPattern = /\[\[([^\]|#]+)(?:#\^([^\]|]+)|#([^\]|]+))?(?:\|([^\]]+))?\]\]/g;
+const wikiLinkPattern = /\[\[([^\]|#]+)(?:#\^([^\]|]+)|#@([^\.\]|]+)(?:\.([^\]|]+))?|#([^\]|]+))?(?:\|([^\]]+))?\]\]/g;
 
 export function updateWikiLinkAlias(source: string, occurrence: number, alias: string) {
   let index = 0;
-  return source.replace(wikiLinkPattern, (match, title: string, blockId?: string, heading?: string) => {
+  return source.replace(wikiLinkPattern, (match, title: string, blockId?: string, recordId?: string, fieldKey?: string, heading?: string) => {
     if (index++ !== occurrence) return match;
-    const target = `${title}${blockId ? `#^${blockId}` : heading ? `#${heading}` : ""}`;
+    const target = `${title}${blockId ? `#^${blockId}` : recordId ? `#@${recordId}${fieldKey ? `.${fieldKey}` : ""}` : heading ? `#${heading}` : ""}`;
     const label = alias.trim();
     return `[[${target}${label ? `|${label}` : ""}]]`;
   });
@@ -67,12 +68,14 @@ function protectWikiSyntax(source: string) {
     .replace(/!\[\[#\^([A-Za-z0-9_-]+)\]\]/g, (_match, id: string) =>
       `<span data-reference-host-id="${escapeAttribute(id)}"></span>`)
     .replace(wikiLinkPattern,
-      (_match, rawTitle: string, rawBlockId?: string, rawHeading?: string, rawAlias?: string) => {
+      (_match, rawTitle: string, rawBlockId?: string, rawRecordId?: string, rawFieldKey?: string, rawHeading?: string, rawAlias?: string) => {
         const title = rawTitle.trim();
-        const label = (rawAlias ?? rawHeading ?? title).trim();
+        const label = (rawAlias ?? rawHeading ?? (rawRecordId ? (rawFieldKey ? `${rawRecordId}.${rawFieldKey}` : rawRecordId) : title)).trim();
         const block = rawBlockId?.trim();
         const heading = rawHeading?.trim();
-        return `<span class="wiki-link" data-target-title="${escapeAttribute(title)}"${block ? ` data-target-block-id="${escapeAttribute(block)}"` : ""}${heading ? ` data-target-heading="${escapeAttribute(heading)}" data-target-scope="heading"` : ""}>${escapeAttribute(label)}</span>`;
+        const record = rawRecordId?.trim();
+        const field = rawFieldKey?.trim();
+        return `<span class="wiki-link" data-target-title="${escapeAttribute(title)}"${block ? ` data-target-block-id="${escapeAttribute(block)}"` : ""}${record ? ` data-target-record-id="${escapeAttribute(record)}" data-target-scope="${field ? "cell" : "record"}"${field ? ` data-target-field-key="${escapeAttribute(field)}"` : ""}` : ""}${heading ? ` data-target-heading="${escapeAttribute(heading)}" data-target-scope="heading"` : ""}>${escapeAttribute(label)}</span>`;
       });
 }
 
@@ -119,7 +122,7 @@ export function renderMarkdown(source: string) {
   const html = marked.parse(protectWikiSyntax(normalizeMarkdownSyntax(source)), { async: false, breaks: true, gfm: true }) as string;
   const clean = DOMPurify.sanitize(html, {
     ADD_TAGS: ["style"],
-    ADD_ATTR: ["data-reference-host-id", "data-target-title", "data-target-id", "data-target-block-id", "class", "id", "style"],
+    ADD_ATTR: ["data-reference-host-id", "data-target-title", "data-target-id", "data-target-block-id", "data-target-record-id", "data-target-field-key", "data-target-heading", "data-target-scope", "class", "id", "style"],
     FORBID_TAGS: ["script", "iframe", "object", "embed", "form", "base", "link", "meta"],
     FORBID_ATTR: ["srcdoc"]
   });

@@ -1,12 +1,14 @@
 import { headingSection } from "./link-suggestions";
+import { documentBacklinks } from "./block-references";
 import { EditorHistory } from "./history";
 import { orderBlockTree } from "./block-tree";
 import { normalizeCanvasNodes } from "./workspace-api";
-import { createBlock, createDocumentState } from "./document-model";
+import { createDocumentState } from "./document-model";
+import { blockModules, createRegisteredBlock as createBlock, databaseBlockRole, isReferenceInstanceHost } from "./block-modules";
 import type { Notebook, Bookmark, WorkspaceDocument, WorkspaceSnapshot, SearchHit, CalendarTodo, CanvasDocument, CanvasNode, CanvasNodeInput, CanvasViewport, WorkspaceItemKind } from "./workspace-api";
 import type { HostTransport } from "./editor-host-api";
 import { MockSaveStore } from "./mock-save-store";
-import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, StyleScope, MediaKind, DatabaseSource, DatabaseField, DatabaseRecord, GeoLocation, HistoryModel } from "../../protocol/types";
+import type { HostRequest, HostResponse, HostEvent, EditorState, RequestMap, BlockContent, BlockProperties, Backlink, OverrideNotice, BlockType, Block, StyleSheet, StyleScope, MediaKind, DatabaseSource, DatabaseField, DatabaseRecord, DatabaseView, GeoLocation, HistoryModel } from "../../protocol/types";
 import { parseDql, executeDql } from "./database-query";
 
 const block = (blockId: string, text: string) => ({ id: blockId, parentId: null, position: "00001000", type: "paragraph" as const, content: { text, html: text }, properties: {}, revision: 1 });
@@ -301,7 +303,7 @@ export class BrowserMockHost implements HostTransport {
     ]);
   }
   private allDocuments() {
-    return [...this.titleByDocument.entries()].filter(([id]) => this.itemKinds.get(id) !== "canvas").map(([id, title]) => ({ id, title }));
+    return [...this.titleByDocument.entries()].map(([id, title]) => ({ id, title }));
   }
   private documentLocation(id: string) {
     for (const [bookmarkId, ids] of this.documentByBookmark) {
@@ -315,12 +317,18 @@ export class BrowserMockHost implements HostTransport {
   private linkCatalog() {
     return this.allDocuments().map(({ id, title }) => {
       const { bookmark, notebook } = this.documentLocation(id);
+      const databaseIds = [...new Set(this.docs.get(id)?.blocks.filter(block => !!databaseBlockRole(block)).map(block => block.properties.databaseId).filter((value): value is string => !!value) ?? [])];
+      const databases = databaseIds.flatMap(databaseId => {
+        const database = this.databases.get(databaseId);
+        return database ? [{ databaseId, fields: structuredClone(database.source.fields), records: structuredClone(database.records) }] : [];
+      });
       return {
         id, title,
         path: [notebook?.name, bookmark?.name].filter(Boolean).join(" / "),
         notebookId: notebook?.id,
         notebookName: notebook?.name,
-        blocks: structuredClone(this.docs.get(id)?.blocks ?? [])
+        blocks: structuredClone(this.docs.get(id)?.blocks ?? []),
+        database: databases[0], databases
       };
     });
   }
@@ -481,7 +489,13 @@ export class BrowserMockHost implements HostTransport {
   /** Convenience for the in-browser shell to mint a new document and surface it under the active bookmark. */
   createDocument(title: string, requestedId?: string, bookmarkId = this.activeBookmarkId, parentId: string | null = null) {
     const id = requestedId ?? ("doc-" + Math.random().toString(36).slice(2, 8));
-    this.itemKinds.set(id, "document");
+    this.createWorkspaceItem(id, title, "document", bookmarkId, parentId);
+    return id;
+  }
+
+  private createWorkspaceItem(id: string, title: string, kind: WorkspaceItemKind, bookmarkId: string, parentId: string | null) {
+    if (this.titleByDocument.has(id)) throw new Error("工作区项目 ID 已存在");
+    this.itemKinds.set(id, kind);
     this.titleByDocument.set(id, title);
     const bookmark = this.bookmarks.find(item => item.id === bookmarkId);
     this.docs.set(id, createDocumentState(id, title, bookmark?.notebookId, this.globalSystemStyles));
@@ -489,27 +503,17 @@ export class BrowserMockHost implements HostTransport {
     const list = this.documentByBookmark.get(bookmarkId) ?? [];
     list.push(id);
     this.documentByBookmark.set(bookmarkId, list);
-    return id;
   }
 
   createCanvas(title: string, requestedId: string, bookmarkId = this.activeBookmarkId, parentId: string | null = null) {
-    if (this.titleByDocument.has(requestedId)) throw new Error("工作区项目 ID 已存在");
-    this.createDocument(title, requestedId, bookmarkId, parentId);
+    this.createWorkspaceItem(requestedId, title, "canvas", bookmarkId, parentId);
     const canvas = { id: requestedId, title, nodes: [] as CanvasNode[], viewport: { x: 0, y: 0, zoom: 1 }, version: 0 };
-    this.itemKinds.set(requestedId, "canvas");
-    this.titleByDocument.set(requestedId, title);
     this.canvases.set(requestedId, canvas);
     this.canvasHistories.set(requestedId, { entries: [{ id: `canvas-history-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`, timestamp: Date.now(), label: "创建 Canvas", title, nodes: [], viewport: structuredClone(canvas.viewport), references: [] }], cursor: 0 });
-    this.parentByDocument.set(requestedId, parentId);
-    const list = this.documentByBookmark.get(bookmarkId) ?? [];
-    if (!list.includes(requestedId)) list.push(requestedId);
-    this.documentByBookmark.set(bookmarkId, list);
   }
 
   createDashboard(title: string, requestedId: string, bookmarkId = this.activeBookmarkId, parentId: string | null = null) {
-    if (this.titleByDocument.has(requestedId)) throw new Error("工作区项目 ID 已存在");
-    this.createDocument(title, requestedId, bookmarkId, parentId);
-    this.itemKinds.set(requestedId, "dashboard");
+    this.createWorkspaceItem(requestedId, title, "dashboard", bookmarkId, parentId);
     const state = this.docs.get(requestedId)!;
     const widget = (id: string, kind: string, titleText: string, x: number, y: number, position: number, width = 320, height = 220): Block =>
       createBlock({ id, type: "dashboard_widget", position: String(position * 1000).padStart(8, "0"),
@@ -519,6 +523,30 @@ export class BrowserMockHost implements HostTransport {
       widget(`${requestedId}-widget-backlinks`, "backlinks", "反向链接", 376, 32, 2),
       widget(`${requestedId}-widget-calendar`, "calendar", "日历", 32, 276, 3, 320, 190)
     ];
+  }
+
+  createReading(title: string, requestedId: string, bookmarkId = this.activeBookmarkId, parentId: string | null = null) {
+    this.createWorkspaceItem(requestedId, title, "reading", bookmarkId, parentId);
+  }
+
+  createDatabase(title: string, requestedId: string, bookmarkId = this.activeBookmarkId, parentId: string | null = null) {
+    this.createWorkspaceItem(requestedId, title, "database", bookmarkId, parentId);
+    const databaseId = `db-${requestedId}`;
+    const fields: DatabaseField[] = [
+      { id: `${databaseId}-name`, databaseId, key: "name", title: "名称", type: "text", position: "00001000" },
+      { id: `${databaseId}-status`, databaseId, key: "status", title: "状态", type: "text", position: "00002000" },
+      { id: `${databaseId}-createdAt`, databaseId, key: "createdAt", title: "创建日期", type: "text", position: "00003000" }
+    ];
+    this.databases.set(databaseId, { source: { id: databaseId, notebookId: this.documentLocation(requestedId).notebook?.id, title, fields, recordCount: 0 }, records: [] });
+    const state = this.docs.get(requestedId)!;
+    const headingId = `${requestedId}-sheet-heading`;
+    state.blocks = [
+      demoBlock(headingId, "heading", "# Sheet 1", "00001000", { headingLevel: 1 }),
+      demoBlock(`${requestedId}-table`, "database_table", "", "00002000", { databaseId, databaseSource: "database", databaseSheetHeadingId: headingId })
+    ];
+    state.databaseViews = [{ id: `view-${databaseId}`, databaseId, name: "表格 1", type: "table", settings: { fieldKeys: fields.map(field => field.key) } }];
+    state.databases = [structuredClone(this.databases.get(databaseId)!.source)];
+    state.databaseRecords = { [databaseId]: [] };
   }
 
   canvas(id: string): CanvasDocument | undefined {
@@ -565,12 +593,13 @@ export class BrowserMockHost implements HostTransport {
       // canvases may store a 1×1 envelope even though the rendered path is
       // fully defined by its endpoints and control points. Enforce the card
       // minimum only for nodes whose frame is user-visible.
-      if (node.kind !== "curve" && (node.width < 80 || node.height < 64)) throw new Error("Canvas 节点尺寸无效");
+      if (node.kind !== "curve" && node.kind !== "curve-point" && (node.width < 80 || node.height < 64)) throw new Error("Canvas 节点尺寸无效");
+      if (node.kind === "curve-point" && (node.width < 12 || node.height < 12)) throw new Error("Canvas 分支点尺寸无效");
       if (node.kind === "block" && (!node.block || node.block.id !== node.id)) throw new Error("Canvas 正文块无效");
       if ((node.kind === "document" || node.kind === "canvas") && (!node.targetId || !this.titleByDocument.has(node.targetId))) throw new Error("Canvas 引用目标不存在");
       if (node.kind === "draw" && (!node.strokes?.length || node.strokes.some(stroke => stroke.points.length < 2))) throw new Error("Canvas 手绘内容无效");
       if (node.kind === "curve" && (!node.curve || !node.curve.start?.nodeId || !node.curve.end?.nodeId)) throw new Error("Canvas 曲线端点无效");
-      if (node.kind === "curve" && node.curve && (!(["none", "end", "both", undefined] as unknown[]).includes(node.curve.arrow) || node.curve.controlPoints?.some(point => !Number.isFinite(point.x) || !Number.isFinite(point.y)))) throw new Error("Canvas 曲线控制点无效");
+      if (node.kind === "curve" && node.curve && (!(["none", "start", "end", "both", undefined] as unknown[]).includes(node.curve.arrow) || node.curve.controlPoints?.some(point => !Number.isFinite(point.x) || !Number.isFinite(point.y)))) throw new Error("Canvas 曲线控制点无效");
       if (node.kind === "media" && (node.block?.id !== node.id || node.block.type !== "media" || !node.block.content.media?.url)) throw new Error("Canvas 媒体块无效");
       if (node.kind === "curve" && node.curve && (!canonicalNodes.some(item => item.id === node.curve!.start.nodeId && item.kind !== "curve" && item.kind !== "draw") || !canonicalNodes.some(item => item.id === node.curve!.end.nodeId && item.kind !== "curve" && item.kind !== "draw"))) throw new Error("Canvas 曲线必须连接到块");
       if (node.kind === "curve" && node.curve?.branches?.some(branch => !canonicalNodes.some(item => item.id === branch.nodeId && item.kind !== "curve" && item.kind !== "draw"))) throw new Error("Canvas 曲线分支端点无效");
@@ -583,8 +612,8 @@ export class BrowserMockHost implements HostTransport {
     document.blocks = canvas.nodes.flatMap(node => node.block ? [node.block] : []);
     document.references = document.references.filter(ref => {
       const block = document.blocks.find(block => block.id === ref.hostBlockId);
-      return block && (block.type === "reference" || block.content.links?.some(link =>
-        link.targetDocumentId === ref.targetDocumentId && link.targetBlockId === ref.targetBlockId && link.targetScope === ref.targetScope));
+      return block && (isReferenceInstanceHost(block) || block.content.links?.some(link =>
+        link.targetDocumentId === ref.targetDocumentId && link.targetBlockId === ref.targetBlockId && link.targetRecordId === ref.targetRecordId && link.targetFieldKey === ref.targetFieldKey && link.targetScope === ref.targetScope));
     });
     canvas.viewport = { x: Number(viewport.x) || 0, y: Number(viewport.y) || 0, zoom: Math.max(.25, Math.min(2.5, Number(viewport.zoom) || 1)) };
     canvas.version += 1;
@@ -693,23 +722,9 @@ export class BrowserMockHost implements HostTransport {
 
   todoDates(): CalendarTodo[] {
     const todos: CalendarTodo[] = [];
-    for (const [documentId, state] of this.docs) {
+    for (const state of this.docs.values()) {
       state.blocks.forEach(block => {
-        if (block.type !== "todo") return;
-        const createdAt = block.properties.todoCreatedAt;
-        const dueAt = block.properties.todoDueAt;
-        const completedAt = block.properties.todoCompletedAt;
-        if (createdAt || dueAt || completedAt) {
-          todos.push({
-            documentId,
-            blockId: block.id,
-            createdAt,
-            dueAt,
-            completedAt,
-            checked: block.content.checked === true,
-            text: (block.content.text || block.content.markdown || "").replace(/^\s*[-*+]\s+\[[ xX]\]\s*/, "").trim()
-          });
-        }
+        todos.push(...(blockModules.require(block.type).extract?.date?.(block, state) ?? []));
       });
     }
     return todos;
@@ -789,7 +804,7 @@ export class BrowserMockHost implements HostTransport {
     } else {
       const hostBlockId = `reference-${Math.random().toString(36).slice(2, 10)}`;
       const targetTitle = this.getDocumentTitle(sourceDocumentId);
-      target.blocks.push({ id: hostBlockId, parentId: null, position, type: "reference", content: { text: "", html: "" }, properties: {}, revision: 1 });
+      target.blocks.push(createBlock({ id: hostBlockId, position, type: "reference" }));
       target.references.push({
         id: `ref-${hostBlockId}`,
         hostBlockId,
@@ -837,48 +852,14 @@ export class BrowserMockHost implements HostTransport {
     this.locationVersion += 1;
   }
   private computeBacklinks(targetDocumentId: string): Backlink[] {
-    const out: Backlink[] = [];
-    for (const doc of this.docs.values()) {
-      if (doc.note.id === targetDocumentId) continue;
-      // Each reference instance whose targetDocumentId matches → backlink
-      for (const ref of doc.references) {
-        if (ref.targetDocumentId !== targetDocumentId) continue;
-        // Excerpt: use the first visible block content
-        const sourceDocTitle = doc.note.title;
-        let excerpt = ref.targetTitle;
-        let sourceBlockId: string | undefined;
-        const first = ref.blocks.find(b => b.scopeType !== "reference_instance");
-        if (first) {
-          excerpt = first.content.text || ref.targetTitle;
-          sourceBlockId = first.id;
-        }
-        out.push({
-          sourceDocumentId: doc.note.id,
-          sourceTitle: sourceDocTitle,
-          sourceBlockId: sourceBlockId ?? "",
-          excerpt: excerpt.slice(0, 80)
-        });
-      }
-      // Also wiki-style [[Title]] links between docs
-      for (const block of doc.blocks) {
-        const html = block.content.html || "";
-        const targetDoc = this.docs.get(targetDocumentId);
-        if (!targetDoc) continue;
-        const pattern = new RegExp(`\\[\\[${this.escapeRegex(targetDoc.note.title)}(?:#[^\\]|]+)?(?:\\|[^\\]]+)?\\]\\]`, "g");
-        if (pattern.test(html)) {
-          out.push({
-            sourceDocumentId: doc.note.id,
-            sourceTitle: doc.note.title,
-            sourceBlockId: block.id,
-            excerpt: (block.content.text || "").slice(0, 80)
-          });
-        }
-      }
-    }
-    return out;
-  }
-  private escapeRegex(s: string): string {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const snapshots = [...this.docs.values()].map(document => {
+      const clone = structuredClone(document);
+      const usedDatabaseIds = new Set(clone.blocks.filter(block => !!databaseBlockRole(block)).map(block => block.properties.databaseId).filter((id): id is string => !!id));
+      clone.databaseRecords = Object.fromEntries([...this.databases.entries()].filter(([id]) => usedDatabaseIds.has(id)).map(([id, item]) => [id, structuredClone(item.records)]));
+      clone.databases = [...this.databases.values()].filter(item => usedDatabaseIds.has(item.source.id)).map(item => structuredClone(item.source));
+      return clone;
+    });
+    return documentBacklinks(targetDocumentId, snapshots);
   }
   private computeOverrideNotices(targetDocumentId: string): OverrideNotice[] {
     const out: OverrideNotice[] = [];
@@ -948,10 +929,18 @@ export class BrowserMockHost implements HostTransport {
     for (const document of this.docs.values()) {
       for (const reference of document.references) {
         const source = this.docs.get(reference.targetDocumentId);
-        reference.broken = !source || !!reference.targetBlockId && !source.blocks.some(block => block.id === reference.targetBlockId);
+        const targetRecord = reference.targetRecordId ? [...this.databases.values()].flatMap(item => item.records).find(record => record.id === reference.targetRecordId) : undefined;
+        reference.broken = !source || !!reference.targetBlockId && !source.blocks.some(block => block.id === reference.targetBlockId) || !!reference.targetRecordId && !targetRecord;
         if (!source) { reference.blocks = []; continue; }
         reference.targetTitle = source.note.title;
-        const sourceBlocks = reference.targetBlockId
+        const sourceBlocks = targetRecord
+          ? (() => {
+              const database = this.databases.get(targetRecord.databaseId);
+              const fields = (database?.source.fields ?? []).filter(field => !reference.targetFieldKey || field.key === reference.targetFieldKey);
+              return [{ id: `record-reference-${targetRecord.id}`, parentId: null, position: "00001000", type: "paragraph" as const,
+                content: { text: fields.map(field => `${field.title}: ${String(targetRecord.values[field.key] ?? "")}`).join("\n"), html: "", markdown: fields.map(field => `**${field.title}:** ${String(targetRecord.values[field.key] ?? "")}`).join("\n\n") }, properties: {}, revision: 1 }];
+            })()
+          : reference.targetBlockId
           ? reference.targetScope === "heading"
             ? this.headingSection(source.blocks, reference.targetBlockId)
             : this.subtree(source.blocks, reference.targetBlockId)
@@ -1041,10 +1030,10 @@ export class BrowserMockHost implements HostTransport {
           case "navigateBack": if (this.index > 0) this.index--; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "navigateForward": if (this.index + 1 < this.history.length) this.index++; this.current = this.history[this.index]; this.respond(request, null); this.emitLoaded(); break;
           case "executeCommand": {
-            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; targetScope?: "block" | "heading"; content?: BlockContent; properties?: BlockProperties; style?: StyleSheet; styleId?: string; scope?: StyleScope; databaseId?: string; database?: DatabaseSource; fields?: DatabaseField[]; record?: DatabaseRecord; query?: string; location?: GeoLocation; locationId?: string; locationsScope?: "global" | "notebook"; mutationId?: string; expectedLocationVersion?: number };
+            const payload = request.payload as { operation?: string; referenceInstanceId?: string; mode?: string; hostBlockId?: string; targetDocumentId?: string; targetBlockId?: string; targetRecordId?: string; targetFieldKey?: string; targetScope?: "block" | "heading" | "record" | "cell"; content?: BlockContent; properties?: BlockProperties; style?: StyleSheet; styleId?: string; scope?: StyleScope; databaseId?: string; database?: DatabaseSource; fields?: DatabaseField[]; record?: DatabaseRecord; view?: DatabaseView; viewId?: string; query?: string; location?: GeoLocation; locationId?: string; locationsScope?: "global" | "notebook"; mutationId?: string; expectedLocationVersion?: number };
             const current = this.docs.get(request.sourceDocumentId ?? this.current)!;
             if (!current) throw new Error("文档不存在");
-            const databaseWrites = new Set(["create-database", "save-database-schema", "upsert-database-record", "delete-database-record"]);
+            const databaseWrites = new Set(["create-database", "save-database-schema", "upsert-database-record", "delete-database-record", "save-database-view", "delete-database-view"]);
             const locationWrites = new Set(["create-location", "update-location", "delete-location"]);
             const mutationId = typeof (payload as Record<string, unknown>).mutationId === "string" ? String((payload as Record<string, unknown>).mutationId) : "";
             const requestedVersion = Number((payload as Record<string, unknown>).clientVersion);
@@ -1092,6 +1081,7 @@ export class BrowserMockHost implements HostTransport {
             }
             if (payload.operation === "create-database") {
               const id = payload.database?.id ?? `db-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
+              if (this.databases.has(id)) throw new Error("数据库 ID 已存在");
               const source: DatabaseSource = { id, notebookId: current.note.workspaceId, title: payload.database?.title ?? "新数据库", fields: structuredClone(payload.fields ?? []), recordCount: 0 };
               source.fields = source.fields.map((field, index) => ({ ...field, id: field.id || `field-${id}-${index}`, databaseId: id, position: field.position || String((index + 1) * 1000).padStart(8, "0") }));
               this.databases.set(id, { source, records: [] });
@@ -1100,10 +1090,49 @@ export class BrowserMockHost implements HostTransport {
               this.respond(request, { state: this.state(current.note.id) });
               break;
             }
+            if (payload.operation === "save-database-view") {
+              const view = payload.view;
+              if (!view?.id || !view.databaseId || !view.name?.trim() || !["table", "board", "gallery"].includes(view.type) || !this.databases.has(view.databaseId)) throw new Error("无效的数据库视图");
+              const owned = current.blocks.some(block => databaseBlockRole(block) === "table" && block.properties.databaseId === view.databaseId);
+              if (!owned) throw new Error("视图不属于当前文档");
+              const keys = new Set(this.databases.get(view.databaseId)!.source.fields.map(field => field.key));
+              if (view.settings.fieldKeys?.some(key => !keys.has(key)) || view.settings.sort?.some(rule => !keys.has(rule.key) || !["asc", "desc"].includes(rule.direction)) ||
+                view.settings.filters?.some(filter => !keys.has(filter.key) || !["=", "!=", ">", ">=", "<", "<=", "contains"].includes(filter.operator)) ||
+                view.settings.groupBy && !keys.has(view.settings.groupBy)) throw new Error("视图包含不存在的字段或条件");
+              const list = current.databaseViews ??= [];
+              const previous = list.findIndex(item => item.id === view.id);
+              if (previous >= 0 && list[previous].databaseId !== view.databaseId) throw new Error("视图 ID 已属于其他数据表");
+              if (previous >= 0) list[previous] = structuredClone(view); else list.push(structuredClone(view));
+              finishDatabaseMutation();
+              this.documentHistory(current.note.id).record(this.historySnapshot(current.note.id), "更新数据视图");
+              this.respond(request, { state: this.state(current.note.id) });
+              break;
+            }
+            if (payload.operation === "delete-database-view") {
+              const list = current.databaseViews ?? [];
+              const view = list.find(item => item.id === payload.viewId && item.databaseId === payload.databaseId);
+              if (!view || list.filter(item => item.databaseId === view.databaseId).length <= 1) throw new Error("至少保留一个视图");
+              current.databaseViews = list.filter(item => item.id !== view.id);
+              finishDatabaseMutation();
+              this.documentHistory(current.note.id).record(this.historySnapshot(current.note.id), "删除数据视图");
+              this.respond(request, { state: this.state(current.note.id) });
+              break;
+            }
             if (payload.operation === "save-database-schema" && payload.databaseId) {
               const item = this.databases.get(payload.databaseId); if (!item) throw new Error("数据库不存在");
+              const oldKeys = item.source.fields.map(field => field.key);
               item.source = { ...item.source, title: payload.database?.title ?? item.source.title, fields: structuredClone(payload.fields ?? item.source.fields) };
               item.source.fields = item.source.fields.map((field, index) => ({ ...field, databaseId: item.source.id, position: field.position || String((index + 1) * 1000).padStart(8, "0") }));
+              const nextKeys = item.source.fields.map(field => field.key);
+              (current.databaseViews ?? []).filter(view => view.databaseId === item.source.id).forEach(view => {
+                const visible = view.settings.fieldKeys ?? oldKeys;
+                const added = nextKeys.filter(key => !oldKeys.includes(key));
+                view.settings.fieldKeys = visible.length === oldKeys.length && oldKeys.every(key => visible.includes(key))
+                  ? nextKeys : [...visible.filter(key => nextKeys.includes(key)), ...added];
+                view.settings.filters = view.settings.filters?.filter(filter => nextKeys.includes(filter.key));
+                view.settings.sort = view.settings.sort?.filter(sort => nextKeys.includes(sort.key));
+                if (view.settings.groupBy && !nextKeys.includes(view.settings.groupBy)) view.settings.groupBy = undefined;
+              });
               finishDatabaseMutation();
               this.respond(request, { state: this.state(current.note.id) });
               break;
@@ -1112,6 +1141,7 @@ export class BrowserMockHost implements HostTransport {
               const item = this.databases.get(payload.databaseId); if (!item) throw new Error("数据库不存在");
               const next = structuredClone(payload.record); const index = item.records.findIndex(record => record.id === next.id);
               if (index >= 0) item.records[index] = next; else item.records.push(next);
+              item.records.sort((a, b) => a.position.localeCompare(b.position));
               item.source.recordCount = item.records.length;
               finishDatabaseMutation();
               this.respond(request, { state: this.state(current.note.id) });
@@ -1180,6 +1210,7 @@ export class BrowserMockHost implements HostTransport {
               current.blocks = snapshot.state.blocks;
               current.blocks.forEach(b => b.revision = Math.max(b.revision, previous.get(b.id) ?? 0) + 1);
               current.references = snapshot.state.references;
+              current.databaseViews = snapshot.state.databaseViews;
               this.restoreVisibleLocations(current.note.workspaceId, snapshot.state.locations ?? []);
               this.setDocumentTitle(current.note.id, current.note.title);
               this.respond(request, { state: this.state(current.note.id) });
@@ -1209,15 +1240,26 @@ export class BrowserMockHost implements HostTransport {
               const target = this.docs.get(payload.targetDocumentId);
               const documentInfo = current.documents.find((item) => item.id === payload.targetDocumentId);
               if (target && !current.references.some(ref => ref.hostBlockId === payload.hostBlockId &&
-                  ref.targetDocumentId === payload.targetDocumentId && ref.targetBlockId === payload.targetBlockId && ref.targetScope === payload.targetScope)) current.references.push({
+                  ref.targetDocumentId === payload.targetDocumentId && ref.targetBlockId === payload.targetBlockId && ref.targetRecordId === payload.targetRecordId && ref.targetFieldKey === payload.targetFieldKey && ref.targetScope === payload.targetScope)) current.references.push({
                 id: current.references.some(ref => ref.id === `ref-${payload.hostBlockId}`) ? `ref-${crypto.randomUUID()}` : `ref-${payload.hostBlockId}`,
                 hostBlockId: payload.hostBlockId,
                 targetDocumentId: payload.targetDocumentId,
                 targetBlockId: payload.targetBlockId,
-                targetScope: payload.targetScope as "block" | "heading" | undefined,
+                targetRecordId: payload.targetRecordId,
+                targetFieldKey: payload.targetFieldKey,
+                targetScope: payload.targetScope,
                 targetTitle: documentInfo?.title ?? target.note.title,
                 mode: "inline",
-                blocks: structuredClone(payload.targetBlockId
+                blocks: structuredClone(payload.targetRecordId
+                  ? (() => {
+                      const database = [...this.databases.values()].find(item => item.records.some(record => record.id === payload.targetRecordId));
+                      const record = database?.records.find(item => item.id === payload.targetRecordId);
+                      if (!record) return [];
+                      const fields = database!.source.fields.filter(field => !payload.targetFieldKey || field.key === payload.targetFieldKey);
+                      return [{ id: `record-reference-${record.id}`, parentId: null, position: "00001000", type: "paragraph" as const,
+                        content: { text: fields.map(field => `${field.title}: ${String(record.values[field.key] ?? "")}`).join("\n"), html: "", markdown: fields.map(field => `**${field.title}:** ${String(record.values[field.key] ?? "")}`).join("\n\n") }, properties: {}, revision: 1 }];
+                    })()
+                  : payload.targetBlockId
                   ? payload.targetScope === "heading"
                     ? this.headingSection(target.blocks, payload.targetBlockId)
                     : this.subtree(target.blocks, payload.targetBlockId)
@@ -1286,7 +1328,8 @@ export class BrowserMockHost implements HostTransport {
             if (reference && payload.operation === "remove-reference") {
               const hostBlockId = reference.hostBlockId;
               current.references = current.references.filter(r => r.id !== reference.id);
-              current.blocks = current.blocks.filter(b => b.id !== hostBlockId);
+              if (current.blocks.some(block => block.id === hostBlockId && isReferenceInstanceHost(block)))
+                current.blocks = current.blocks.filter(b => b.id !== hostBlockId);
             }
             history.record(this.historySnapshot(current.note.id), "更新引用", (payload as { historyGroup?: string }).historyGroup);
             if (this.canvases.has(current.note.id)) {

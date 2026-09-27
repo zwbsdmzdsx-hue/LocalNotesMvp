@@ -1,14 +1,19 @@
 import type { CanvasCurve, CanvasDocument, CanvasNode, CanvasPoint, WorkspaceApi, WorkspaceDocument } from "./workspace-api";
 import { markdownFromContent, renderMarkdown, updateWikiLinkAlias } from "./markdown";
-import { createBlock } from "./document-model";
+import { blockBodyText, blockModules, blockSourcePrefix, blockSuggestionPreview, createRegisteredBlock as createBlock } from "./block-modules";
 import { DocumentSaveSession } from "./document-session";
 import { hasMediaTransfer, mediaFromTransfer, mediaFromUrl } from "./media-source";
-import { blockWikiLink, queryLinkSuggestions, headingInfo, type LinkSuggestion } from "./link-suggestions";
-import type { BlockContent, EditorCommand, EditorState, LinkToken, ReferenceInstance, ReferenceMode, MediaAsset } from "../../protocol/types";
+import { blockWikiLink, queryLinkSuggestions, suggestionWikiTarget, headingInfo, type LinkSuggestion } from "./link-suggestions";
+import { blockReferenceLabel } from "./block-references";
+import { renderMediaAsset } from "./media-editor";
+import { renderCanvasDocumentLine } from "./canvas-block-preview";
+import { headingLevel, isHeadingBlock } from "./heading-block-editor";
+import type { BlockContent, EditorCommand, EditorState, LinkToken, ReferenceInstance, ReferenceMode, ReferenceTargetScope, MediaAsset } from "../../protocol/types";
+import type { CanvasConfigPanelModel } from "./canvas-config-panel";
+import type { DocumentModule, ModuleRegistry } from "./module-registry";
 
 type CanvasCallbacks = {
   onOpenDocument(documentId: string, blockId?: string): void;
-  onOpenCanvas(canvasId: string): void;
   onError(error: unknown): void;
   onWorkspaceChanged(): void;
   onLoadDocumentPreview(documentId: string): Promise<EditorState>;
@@ -20,6 +25,9 @@ type CanvasCallbacks = {
   onHistoryChanged?(model: NonNullable<CanvasDocument["history"]>): void;
   onActiveBlockChanged?(block?: import("../../protocol/types").Block): void;
   onObjectSelection?(selected: boolean, activate?: boolean): void;
+  onConfigSelection?(model: CanvasConfigPanelModel | null): void;
+  onConfigCurveDismiss?(): void;
+  onShowBacklinks?(blockId: string): void;
 };
 
 export type CanvasManager = {
@@ -27,13 +35,14 @@ export type CanvasManager = {
   close(): void;
   isOpen(): boolean;
   activeId(): string | null;
+  focusBlock(blockId: string): void;
   flush(): Promise<void>;
   refreshReferences(): void;
   undo(): Promise<void>;
   redo(): Promise<void>;
   restoreHistory(entryId: string): Promise<void>;
   applyEditorState(state: EditorState, persist?: boolean): void;
-  insertCalendarLink(targetDocumentId: string, targetBlockId?: string, targetScope?: "block" | "heading", label?: string): boolean;
+  insertCalendarLink(targetDocumentId: string, targetBlockId?: string, targetScope?: ReferenceTargetScope, label?: string): boolean;
   insertLocationBlock(locationId: string): boolean;
 };
 
@@ -42,18 +51,7 @@ type CanvasSaveSnapshot = { canvasId: string; nodes: CanvasNode[]; viewport: Can
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const uid = (prefix: string) => `${prefix}-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
 
-function todayIsoDate() {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-}
-
-function todoStatus(checked: boolean, dueAt?: string, completedAt?: string) {
-  if (checked) return dueAt && (completedAt || todayIsoDate()) > dueAt ? "complete-late" : "complete-early";
-  if (dueAt && todayIsoDate() > dueAt) return "overdue";
-  return dueAt ? "pending" : "none";
-}
-
-export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCallbacks): CanvasManager {
+export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCallbacks, documentModules: ModuleRegistry<DocumentModule>): CanvasManager {
   const host = document.querySelector<HTMLElement>(".workspace")!;
   const editor = host.querySelector<HTMLElement>(".editor")!;
   const view = document.createElement("section");
@@ -90,9 +88,13 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   const title = view.querySelector<HTMLInputElement>(".canvas-title")!;
   const saveState = view.querySelector<HTMLElement>(".canvas-save-state")!;
   const zoomLabel = view.querySelector<HTMLOutputElement>(".canvas-zoom")!;
-  const inspector = document.querySelector<HTMLElement>('[data-slot="canvas-config"]')!;
   const undo = view.querySelector<HTMLButtonElement>("[data-canvas-action=undo]")!;
   const redo = view.querySelector<HTMLButtonElement>("[data-canvas-action=redo]")!;
+  let branchPointPreview: HTMLElement | null = document.createElement("div");
+  branchPointPreview.className = "canvas-branch-point-preview";
+  branchPointPreview.hidden = true;
+  branchPointPreview.setAttribute("aria-hidden", "true");
+  viewport.append(branchPointPreview);
   let current: CanvasDocument | null = null;
   let selected = new Set<string>();
   let renderToken = 0;
@@ -131,6 +133,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   let curveMode = false;
   let pendingCurveEndpoint: { nodeId: string; side: CanvasCurve["start"]["side"] } | null = null;
   let branchCurveNode: CanvasNode | null = null;
+  let consumeCanvasClick = false;
   let nodeMenuPopup: HTMLElement | null = null;
   let nodeMenuDismiss: ((event: PointerEvent) => void) | null = null;
   let iconPreviewPopup: HTMLElement | null = null;
@@ -202,10 +205,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   const item = (id: string | undefined) => workspace.snapshot().documents.find(entry => entry.id === id);
 
   function displayedText(block: NonNullable<CanvasNode["block"]>) {
-    const source = block.content.markdown ?? block.content.text ?? "";
-    if (block.type === "heading") return source.replace(/^#{1,6}\s+/, "");
-    if (block.type === "todo") return source.replace(/^[-*+]\s+\[[ xX]\]\s+/, "");
-    return source;
+    return blockBodyText(block);
   }
 
   function insertionNode() {
@@ -226,7 +226,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     }
   }
 
-  function insertCalendarLink(targetDocumentId: string, targetBlockId?: string, targetScope?: "block" | "heading", label = "日记") {
+  function insertCalendarLink(targetDocumentId: string, targetBlockId?: string, targetScope?: ReferenceTargetScope, label = "日记") {
     if (!current || !catalog) return false;
     const target = catalog.documents.find(document => document.id === targetDocumentId);
     if (!target) return false;
@@ -249,7 +249,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const sourceTarget = `${notebook}${target.title}${targetBlockId ? targetScope === "heading" ? `#${label}` : `#^${targetBlockId}` : ""}`;
     const replacement = `[[${sourceTarget}|📅 ${label}]]`;
     const nextValue = value.slice(0, start) + replacement + value.slice(end);
-    const prefix = block.type === "heading" ? `${"#".repeat(block.properties.headingLevel ?? 1)} ` : block.type === "todo" ? `- [${block.content.checked ? "x" : " "}] ` : "";
+    const prefix = blockSourcePrefix(block);
     if (block.parentId) updateHeadingChild(node, nextValue);
     else block.content = callbacks.contentFromMarkdown(`${prefix}${nextValue}`, block.content);
     block.content.links = [...(block.content.links ?? []), { targetDocumentId, targetBlockId, targetScope, targetText: `${notebook}${target.title}`, alias: `📅 ${label}`, start, end: start + replacement.length }];
@@ -309,8 +309,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const query = activeQuery(input);
     if (!query || !catalog) { closeSuggestions(); return; }
     const result = queryLinkSuggestions(query.query, catalog,
-      blocks => blocks.slice(0, 1).map(block => renderMarkdown(markdownFromContent(block.content)) ||
-        (block.type === "database_table" ? "▦ 数据库表" : block.type === "media" ? "▧ 媒体" : block.type === "data_view" ? "▦ 查询视图" : "📍 位置")).join(""));
+      blocks => blocks.slice(0, 1).map(block => blockSuggestionPreview(block, catalog!)).join(""));
     // Keep direct document-name completion as a shortcut, while hierarchical
     // notebook/document/block queries share exactly the document resolver.
     if (!query.query.includes("/") && !query.query.includes("#")) {
@@ -347,6 +346,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         const line = document.createElement("span"); line.className = "link-suggestion-block-line";
         line.innerHTML = candidate.preview || renderMarkdown(candidate.label);
         button.append(line);
+      } else if (candidate.kind === "record" || candidate.kind === "cell") {
+        const label = document.createElement("strong"); label.textContent = candidate.title;
+        const meta = document.createElement("small"); meta.textContent = candidate.meta;
+        button.append(label, meta);
       } else {
         const label = document.createElement("strong"); label.textContent = candidate.title;
         const meta = document.createElement("small"); meta.textContent = candidate.meta;
@@ -365,8 +368,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const query = activeQuery(input);
     if (!query || !node.block) return;
     if (candidate.kind === "notebook" || candidate.kind === "document") {
-      const trail = candidate.kind === "notebook" ? candidate.title : candidate.notebookName + "/" + candidate.title;
-      input.setRangeText("[[" + trail + "/", query.start, query.end, "end");
+      input.setRangeText("[[" + suggestionWikiTarget(candidate).text, query.start, query.end, "end");
       input.dispatchEvent(new Event("input", { bubbles: true }));
       input.focus();
       return;
@@ -374,11 +376,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const doc = catalog?.documents.find(doc => doc.id === candidate.id);
     if (!doc) return;
     // IDs are authoritative in links; text remains a reviewable Markdown label.
-    const targetText = (doc.notebookName ? doc.notebookName + "/" : "") + doc.title;
-    const source = "[[" + targetText + (candidate.scope === "heading" ? "#" + candidate.label : candidate.blockId ? "#^" + candidate.blockId : "") + "]]";
+    const source = "[[" + suggestionWikiTarget(candidate, { headingByTitle: true }).text;
     // Direct title shortcut preserves existing compact Markdown, but still binds ID.
-    const replacement = !query.query.includes("/") && !candidate.blockId ? "[[" + doc.title + "]]" : source;
-    const token: LinkToken = { targetDocumentId: doc.id, targetBlockId: candidate.blockId, targetScope: candidate.scope,
+    const replacement = !query.query.includes("/") && candidate.kind === "target" && !candidate.blockId ? "[[" + doc.title + "]]" : source;
+    const token: LinkToken = { targetDocumentId: doc.id, targetBlockId: (candidate.kind === "target" || candidate.kind === "heading") ? candidate.blockId : undefined, targetRecordId: candidate.kind === "record" || candidate.kind === "cell" ? candidate.recordId : undefined, targetFieldKey: candidate.kind === "cell" ? candidate.fieldKey : undefined, targetScope: candidate.scope,
       targetText: replacement.slice(2, -2).split("#")[0], start: query.start, end: query.start + replacement.length };
     input.setRangeText(replacement, query.start, query.end, "end");
     node.block.content.links = [...(node.block.content.links ?? []), token];
@@ -509,7 +510,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
             body.replaceChildren(callbacks.renderProjection(reference, context));
             body.querySelectorAll<HTMLElement>(".preview-block").forEach(row => {
               const block = reference.blocks.find(block => block.id === row.dataset.blockId);
-              if (!block || !["paragraph", "heading", "todo"].includes(block.type)) return;
+              if (!block || !blockModules.require(block.type).canvasReferenceEditable) return;
               row.title = "双击编辑此处引用内容（不修改源块）";
               row.ondblclick = event => {
                 if ((event.target as Element).closest("textarea, button, a, input, .wiki-link")) return;
@@ -541,7 +542,8 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         link.replaceWith(card);
       } else {
         link.title = "打开 " + target.title + " · 右键选择引用显示方式";
-        link.onclick = event => { event.preventDefault(); event.stopPropagation(); target.kind === "canvas" ? callbacks.onOpenCanvas(target.id) : callbacks.onOpenDocument(target.id, token.targetBlockId); };
+        link.onclick = event => { event.preventDefault(); event.stopPropagation(); callbacks.onOpenDocument(target.id,
+          documentModules.require(target.kind).canvasLink?.nodeKind === "canvas" ? undefined : token.targetBlockId); };
         if (node) link.oncontextmenu = event => { event.preventDefault(); event.stopPropagation(); showReferenceModes(link, node, token); };
       }
     });
@@ -620,9 +622,11 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   }
 
   function nodeTypeLabel(node: CanvasNode, target?: WorkspaceDocument) {
-    if (node.kind === "block") return node.block?.type === "heading" ? "标题块" : node.block?.type === "todo" ? "待办块" : node.block?.type === "location" ? "位置块" : "正文块";
+    if (node.kind === "block" && node.block) return blockModules.require(node.block.type).typeLabel ?? "正文块";
+    if (node.kind === "block") return "正文块";
     if (node.kind === "draw") return "手绘";
     if (node.kind === "curve") return "曲线";
+    if (node.kind === "curve-point") return "分支点";
     if (node.kind === "media") return node.block?.content.media?.name || "媒体";
     if (!target) return "目标已删除";
     return target.title;
@@ -633,13 +637,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   }
 
   function nodeIcon(node: CanvasNode, target?: WorkspaceDocument) {
-    if (node.kind === "block") {
-      if (node.block?.type === "heading") return "H";
-      if (node.block?.type === "todo") return "☑";
-      if (node.block?.type === "location") return "⌖";
-      return "≡";
-    }
-    return ({ media: "▧", document: target?.kind === "dashboard" ? "▦" : "▤", canvas: "◇", draw: "✎", curve: "⌁", text: "≡" } as Record<string, string>)[node.kind] ?? "◇";
+    if (node.kind === "block" && node.block) return blockModules.require(node.block.type).icon?.(node.block) ?? "≡";
+    if (node.kind === "block") return "≡";
+    if (target && (node.kind === "document" || node.kind === "canvas")) return documentModules.require(target.kind).createIcon;
+    return ({ media: "▧", document: "▤", canvas: "◇", draw: "✎", curve: "⌁", "curve-point": "•", text: "≡" } as Record<string, string>)[node.kind] ?? "◇";
   }
 
   function renderCanvasThumbnail(container: HTMLElement, targetId: string) {
@@ -680,34 +681,13 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       const documentState = await callbacks.onLoadDocumentPreview(documentId);
       if (token !== renderToken || !container.isConnected) return;
       const fragment = document.createDocumentFragment();
-      const collapsed = new Set<string>(documentState.blocks.filter(block => block.type === "heading" && block.properties.headingCollapsed).map(block => block.id));
+      const collapsed = new Set<string>(documentState.blocks.filter(block => isHeadingBlock(block) && block.properties.headingCollapsed).map(block => block.id));
       for (const block of documentState.blocks.slice(0, 12)) {
-        const line = document.createElement("div");
-        line.className = `canvas-document-line type-${block.type}`;
-        line.dataset.blockId = block.id;
-        const level = block.type === "heading" ? (block.properties.headingLevel ?? 1) : undefined;
-        if (level !== undefined) {
-          const toggle = document.createElement("button");
-          toggle.type = "button";
-          toggle.className = "canvas-heading-collapse-toggle";
-          toggle.textContent = collapsed.has(block.id) ? "▸" : "▾";
-          toggle.setAttribute("aria-expanded", String(!collapsed.has(block.id)));
-          toggle.setAttribute("aria-label", collapsed.has(block.id) ? "展开标题内容" : "折叠标题内容");
-          toggle.onclick = event => {
-            event.stopPropagation();
-            if (collapsed.has(block.id)) collapsed.delete(block.id); else collapsed.add(block.id);
-            applyCanvasPreviewHeadingCollapse(container, documentState.blocks.slice(0, 12), collapsed);
-          };
-          line.append(toggle);
-        }
-        const content = document.createElement("span");
-        if (block.type === "media" && block.content.media) {
-          content.className = "canvas-document-media-line";
-          content.append(renderCanvasMedia(block.content.media, block.content.caption));
-        } else {
-          content.innerHTML = renderMarkdown(markdownFromContent(block.content));
-        }
-        line.append(content);
+        const specializedPreview = blockModules.require(block.type).canvasDocumentPreview?.(block, documentState);
+        const line = renderCanvasDocumentLine(block, documentState, collapsed, specializedPreview, blockId => {
+          if (collapsed.has(blockId)) collapsed.delete(blockId); else collapsed.add(blockId);
+          applyCanvasPreviewHeadingCollapse(container, documentState.blocks.slice(0, 12), collapsed);
+        });
         fragment.append(line);
       }
       container.replaceChildren(fragment);
@@ -718,58 +698,12 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     }
   }
 
-  function renderCanvasMedia(asset: MediaAsset, caption?: string): HTMLElement {
-    const wrapper = document.createElement("figure");
-    wrapper.className = "canvas-media-preview canvas-document-media";
-    let media: HTMLElement;
-    if (asset.kind === "image") {
-      const image = document.createElement("img");
-      image.src = asset.url;
-      image.alt = caption || asset.name;
-      image.loading = "lazy";
-      media = image;
-    } else if (asset.kind === "video") {
-      const video = document.createElement("video");
-      video.src = asset.url;
-      video.controls = true;
-      video.preload = "metadata";
-      video.playsInline = true;
-      media = video;
-    } else if (asset.kind === "audio") {
-      const audio = document.createElement("audio");
-      audio.src = asset.url;
-      audio.controls = true;
-      audio.preload = "metadata";
-      media = audio;
-    } else if (asset.kind === "pdf") {
-      const frame = document.createElement("iframe");
-      frame.src = asset.url;
-      frame.title = asset.name;
-      frame.loading = "lazy";
-      media = frame;
-    } else {
-      const link = document.createElement("a");
-      link.href = asset.url;
-      link.download = asset.name;
-      link.textContent = `下载 ${asset.name}`;
-      media = link;
-    }
-    media.classList.add("canvas-media-player");
-    wrapper.append(media);
-    if (caption) {
-      const figcaption = document.createElement("figcaption");
-      figcaption.textContent = caption;
-      wrapper.append(figcaption);
-    }
-    return wrapper;
-  }
-
   function applyCanvasPreviewHeadingCollapse(container: HTMLElement, blocks: import("../../protocol/types").Block[], collapsed: Set<string>) {
     let collapsedLevel: number | null = null;
     container.querySelectorAll<HTMLElement>(":scope > .canvas-document-line").forEach(line => {
       const block = blocks.find(item => item.id === line.dataset.blockId);
       if (!block) return;
-      const level = block.type === "heading" ? (block.properties.headingLevel ?? 1) : undefined;
+      const level = headingLevel(block);
       if (level !== undefined && collapsedLevel !== null && level <= collapsedLevel) collapsedLevel = null;
       const hidden = collapsedLevel !== null;
       line.hidden = hidden;
@@ -1046,9 +980,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         const link = blockWikiLink(notebook, owner?.title ?? current?.title ?? "Canvas", node.id);
         void navigator.clipboard?.writeText(link).catch(callbacks.onError);
       });
+      add("查看引用此块", "↗", () => { closeNodeMenu(); callbacks.onShowBacklinks?.(node.block!.id); });
       add("编辑块内容", "✎", () => { closeNodeMenu(); focusNodeEditor(node); });
       if (node.block.parentId) add("下方新增段落", "+", () => { closeNodeMenu(); addHeadingChild(node.block!.parentId!, node.id); });
-      else if (node.block.type === "heading") add("新增段落", "+", () => { closeNodeMenu(); addHeadingChild(node.id); });
+      else if (isHeadingBlock(node.block)) add("新增段落", "+", () => { closeNodeMenu(); addHeadingChild(node.id); });
       add("增大字号", "A+", () => setNodeFontSize(node, 2));
       add("减小字号", "A−", () => setNodeFontSize(node, -2));
       add("重置字号", "A", () => setNodeFontSize(node, null));
@@ -1097,12 +1032,13 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
 
   function openTarget(target: WorkspaceDocument | undefined) {
     if (!target) return;
-    target.kind === "canvas" ? callbacks.onOpenCanvas(target.id) : callbacks.onOpenDocument(target.id);
+    callbacks.onOpenDocument(target.id);
   }
 
   function endpointPoint(endpoint: CanvasCurve["start"]): CanvasPoint | null {
     const node = current?.nodes.find(candidate => candidate.id === endpoint.nodeId && candidate.kind !== "curve" && candidate.kind !== "draw");
     if (!node) return null;
+    if (node.kind === "curve-point") return { x: node.x + node.width / 2, y: node.y + node.height / 2 };
     if (endpoint.side === "top") return { x: node.x + node.width / 2, y: node.y };
     if (endpoint.side === "right") return { x: node.x + node.width, y: node.y + node.height / 2 };
     if (endpoint.side === "bottom") return { x: node.x + node.width / 2, y: node.y + node.height };
@@ -1110,6 +1046,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   }
 
   function nearestEdge(node: CanvasNode, point: CanvasPoint): CanvasCurve["start"] {
+    if (node.kind === "curve-point") return { nodeId: node.id, side: "top" };
     const candidates: Array<{ side: CanvasCurve["start"]["side"]; point: CanvasPoint }> = [
       { side: "top", point: { x: node.x + node.width / 2, y: node.y } },
       { side: "right", point: { x: node.x + node.width, y: node.y + node.height / 2 } },
@@ -1157,21 +1094,32 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     svg.setAttribute("width", "10000"); svg.setAttribute("height", "10000");
     svg.style.pointerEvents = "none";
     const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
-    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
-    marker.id = "canvas-arrow"; marker.setAttribute("markerWidth", "8"); marker.setAttribute("markerHeight", "8"); marker.setAttribute("refX", "7"); marker.setAttribute("refY", "4"); marker.setAttribute("orient", "auto");
-    const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path"); arrow.setAttribute("d", "M0,0 L8,4 L0,8 z"); arrow.setAttribute("fill", "context-stroke"); marker.append(arrow); defs.append(marker); svg.append(defs);
+    const makeMarker = (id: string, orient: string) => {
+      const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+      marker.id = id; marker.setAttribute("markerWidth", "8"); marker.setAttribute("markerHeight", "8"); marker.setAttribute("refX", "7"); marker.setAttribute("refY", "4"); marker.setAttribute("orient", orient);
+      const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path"); arrow.setAttribute("d", "M0,0 L8,4 L0,8 z"); arrow.setAttribute("fill", "context-stroke"); marker.append(arrow); return marker;
+    };
+    defs.append(makeMarker("canvas-arrow-end", "auto"), makeMarker("canvas-arrow-start", "auto-start-reverse")); svg.append(defs);
     const addPath = (node: CanvasNode, pathData: string, stroke: string, width: number, dash: string, hit = false, arrow: "start" | "end" | "both" | "none" = "none") => {
       const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
       path.setAttribute("d", pathData); path.setAttribute("fill", "none"); path.setAttribute("stroke", hit ? "transparent" : stroke); path.setAttribute("stroke-width", String(hit ? Math.max(16, width + 12) : width));
       path.setAttribute("stroke-linecap", "round"); path.setAttribute("stroke-linejoin", "round"); if (dash !== "none") path.setAttribute("stroke-dasharray", dash);
       if (!hit && arrow !== "none") {
-        if (arrow === "end" || arrow === "both") path.setAttribute("marker-end", "url(#canvas-arrow)");
-        if (arrow === "start" || arrow === "both") path.setAttribute("marker-start", "url(#canvas-arrow)");
+        if (arrow === "end" || arrow === "both") path.setAttribute("marker-end", "url(#canvas-arrow-end)");
+        if (arrow === "start" || arrow === "both") path.setAttribute("marker-start", "url(#canvas-arrow-start)");
       }
-      path.dataset.nodeId = node.id; path.style.pointerEvents = hit ? "stroke" : "none";
+      path.dataset.nodeId = node.id; path.style.pointerEvents = hit ? "stroke" : (branchCurveNode?.id === node.id ? "stroke" : "none");
       if (!hit) path.classList.add("canvas-connection-visible");
-      path.addEventListener("click", event => { event.stopPropagation(); selectNode(node.id, (event as MouseEvent).shiftKey); });
+      path.addEventListener("click", event => {
+        event.stopPropagation();
+        if (branchCurveNode?.curve && node.id === branchCurveNode.id) {
+          createBranchPoint(worldPoint((event as MouseEvent).clientX, (event as MouseEvent).clientY));
+          return;
+        }
+        selectNode(node.id, (event as MouseEvent).shiftKey);
+      });
       svg.append(path);
+      return path;
     };
     for (const node of current.nodes) {
       if (node.kind === "draw" && node.strokes) {
@@ -1192,7 +1140,8 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         if (!branchEnd) continue;
         const branchPath = curvePathData(start, branchEnd, curve);
         hitPaths.push(branchPath);
-        addPath(node, branchPath, curve.color, curve.width, curveDash(curve.dash), false, "end");
+        const branchVisible = addPath(node, branchPath, curve.color, curve.width, curveDash(curve.dash), false, "end");
+        branchVisible.dataset.branchPath = "true";
       }
       hitPaths.forEach(path => addPath(node, path, "transparent", curve.width, "none", true));
       if (curve.label?.trim()) {
@@ -1226,8 +1175,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
             window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
           });
           svg.append(handle);
-          const guide = document.createElementNS("http://www.w3.org/2000/svg", "line");
-          guide.setAttribute("x1", String(index === 0 ? start.x : end.x)); guide.setAttribute("y1", String(index === 0 ? start.y : end.y)); guide.setAttribute("x2", String(point.x)); guide.setAttribute("y2", String(point.y)); guide.setAttribute("class", "canvas-curve-guide"); guide.style.pointerEvents = "none"; svg.insertBefore(guide, handle);
+          if (index < 2) {
+            const guide = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            guide.setAttribute("x1", String(index === 0 ? start.x : end.x)); guide.setAttribute("y1", String(index === 0 ? start.y : end.y)); guide.setAttribute("x2", String(point.x)); guide.setAttribute("y2", String(point.y)); guide.setAttribute("class", "canvas-curve-guide"); guide.style.pointerEvents = "none"; svg.insertBefore(guide, handle);
+          }
         });
       }
     }
@@ -1401,22 +1352,22 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       textarea.className = "canvas-note-text";
       textarea.setAttribute("aria-label", "标题块段落");
       const source = markdownFromContent(child.block!.content);
-      textarea.value = child.block!.type === "heading"
-        ? `${"#".repeat(Math.max(1, (child.block!.properties.headingLevel ?? 2) - 1))} ${source.replace(/^#{1,6}\s+/, "")}`
-        : source;
+      textarea.value = blockModules.require(child.block!.type).canvasTextValue?.(child.block!) ?? source;
       const preview = document.createElement("div");
       preview.className = "canvas-note-preview";
       renderInlineLinks(preview, source, child);
       content.classList.toggle("canvas-note-editing", !textarea.value.trim());
       preview.hidden = content.classList.contains("canvas-note-editing");
       const commit = () => { renderInlineLinks(preview, updateHeadingChild(child, textarea.value), child); scheduleSave(450); };
+      // Children inside a heading card use the heading-card editor behavior even
+      // when the current paragraph has temporarily converted to plain text.
+      const canvasTextBehavior = blockModules.require("heading").canvasTextBehavior?.({
+        block: child.block!, nodeId: child.id, parentId: parent.id, textarea, commit,
+        splitLines: splitHeadingLines, splitAtCaret: splitHeadingAtCaret
+      });
       bindCanvasTextEditor(child, textarea, content, preview,
-        () => {
-          if (splitHeadingLines(parent.id, child.id, textarea, commit)) return true;
-          commit();
-          return false;
-        },
-        () => splitHeadingAtCaret(parent.id, child.id, textarea, commit));
+        canvasTextBehavior?.onChange ?? (() => { commit(); return false; }),
+        canvasTextBehavior?.onEnter);
       content.append(textarea, preview);
       row.append(grip, content);
       list.append(row);
@@ -1442,7 +1393,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       // Keep the historical `.canvas-node-text` hook for existing integrations
       // while the semantic class now reflects the canonical Block-backed kind.
       const kindClass = node.kind === "block" ? "canvas-node-block canvas-node-text" : `canvas-node-${node.kind}`;
-      element.className = `canvas-node ${kindClass}${node.block?.type === "heading" ? " canvas-heading-card" : ""}${node.displayMode === "icon" ? " icon-mode" : ""}${node.referenceDisplay === "icon" ? " reference-icon-mode" : ""}${selected.has(node.id) ? " selected" : ""}`;
+      element.className = `canvas-node ${kindClass}${node.block && isHeadingBlock(node.block) ? " canvas-heading-card" : ""}${node.displayMode === "icon" ? " icon-mode" : ""}${node.referenceDisplay === "icon" ? " reference-icon-mode" : ""}${selected.has(node.id) ? " selected" : ""}`;
       element.dataset.nodeId = node.id;
       element.style.left = `${node.x}px`;
       element.style.top = `${node.y}px`;
@@ -1466,6 +1417,25 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
         selectNode(node.id, event.shiftKey);
       };
 
+      if (node.kind === "curve-point") {
+        element.classList.add("canvas-curve-point-node");
+        element.setAttribute("aria-label", "分支点");
+        element.title = "分支点：可连接曲线";
+        element.addEventListener("pointerdown", event => {
+          if (event.button === 0 && !curveMode) beginMove(event, node.id);
+        });
+        element.onclick = event => {
+          event.stopPropagation();
+          if (curveMode) { pickCurveEndpoint(node, event); return; }
+          selectNode(node.id, event.shiftKey);
+        };
+        const dot = document.createElement("span");
+        dot.className = "canvas-curve-point-dot";
+        dot.textContent = "•";
+        element.append(dot);
+        stage.append(element);
+        continue;
+      }
       const head = document.createElement("header");
       head.className = "canvas-node-head";
       const grip = document.createElement("button");
@@ -1555,133 +1525,49 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
           if (targetDoc) callbacks.onOpenDocument(targetDoc.id, token?.targetBlockId);
         };
         body.append(icon);
-      } else if (node.kind === "block" && node.block?.type === "location") {
-        const location = catalog?.locations?.find(candidate => candidate.id === node.block!.properties.locationId);
-        const card = document.createElement("div");
-        card.className = "canvas-location-preview";
-        const heading = document.createElement("strong"); heading.textContent = location?.name ?? "位置已删除";
-        card.append(heading);
-        const address = document.createElement("p"); address.textContent = location?.address || "未填写地址"; card.append(address);
-        if (location) {
-          const coordinates = document.createElement("small");
-          coordinates.textContent = `${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`;
-          card.append(coordinates);
-        }
-        body.append(card);
+      } else if (node.kind === "block" && node.block && blockModules.require(node.block.type).canvasPreview && catalog) {
+        body.append(blockModules.require(node.block.type).canvasPreview!(node.block, catalog));
       } else if (node.kind === "block" && node.block) {
         const textarea = document.createElement("textarea");
         textarea.className = "canvas-note-text";
         textarea.placeholder = "写下想法，输入 [[ 插入引用...";
-        const storedText = node.block.content.markdown ?? node.block.content.text ?? "";
-        textarea.value = node.block.type === "heading"
-          ? storedText.replace(/^#{1,6}\s+/, "")
-          : node.block.type === "todo"
-            ? storedText.replace(/^[-*+]\s+\[[ xX]\]\s+/, "")
-            : storedText;
+        textarea.value = blockBodyText(node.block);
         const preview = document.createElement("div");
         preview.className = "canvas-note-preview";
         body.classList.toggle("canvas-note-editing", !textarea.value.trim());
         const syncPreview = () => {
-          const prefix = node.block!.type === "heading"
-            ? `${"#".repeat(node.block!.properties.headingLevel ?? 1)} `
-            : node.block!.type === "todo"
-              ? `- [${node.block!.content.checked ? "x" : " "}] `
-              : "";
+          const prefix = blockSourcePrefix(node.block!);
           node.block!.content = callbacks.contentFromMarkdown(`${prefix}${textarea.value}`, node.block!.content);
           node.block!.revision += 1;
           renderInlineLinks(preview, `${prefix}${textarea.value}`, node);
           preview.hidden = body.classList.contains("canvas-note-editing");
           scheduleSave(450);
         };
-        bindCanvasTextEditor(node, textarea, body, preview, () => {
-          if (node.block?.type === "heading" && splitHeadingLines(node.id, node.id, textarea, syncPreview)) return true;
-          syncPreview();
-          return false;
-        }, node.block.type === "heading" ? () => splitHeadingAtCaret(node.id, node.id, textarea, syncPreview) : undefined,
-        syncPreview);
-        const initialPrefix = node.block.type === "heading"
-          ? `${"#".repeat(node.block.properties.headingLevel ?? 1)} `
-          : node.block.type === "todo"
-            ? `- [${node.block.content.checked ? "x" : " "}] `
-            : "";
+        const canvasTextBehavior = blockModules.require(node.block.type).canvasTextBehavior?.({
+          block: node.block,
+          nodeId: node.id,
+          parentId: node.block.parentId ?? node.id,
+          textarea,
+          commit: syncPreview,
+          splitLines: splitHeadingLines,
+          splitAtCaret: splitHeadingAtCaret
+        });
+        bindCanvasTextEditor(node, textarea, body, preview,
+          canvasTextBehavior?.onChange ?? (() => { syncPreview(); return false; }),
+          canvasTextBehavior?.onEnter,
+          syncPreview);
+        const initialPrefix = blockSourcePrefix(node.block);
         renderInlineLinks(preview, `${initialPrefix}${textarea.value}`, node);
         preview.hidden = body.classList.contains("canvas-note-editing");
-        if (node.block.type === "todo") {
-          const checkbox = document.createElement("input");
-          checkbox.type = "checkbox";
-          checkbox.className = "canvas-todo-check";
-          checkbox.checked = !!node.block.content.checked;
-          checkbox.setAttribute("aria-label", "完成待办");
-          checkbox.onchange = () => {
-            node.block!.content.checked = checkbox.checked;
-            node.block!.properties.todoCompletedAt = checkbox.checked
-              ? (node.block!.properties.todoCompletedAt || todayIsoDate())
-              : undefined;
-            const completedInput = body.querySelector<HTMLInputElement>(".todo-completed-date");
-            if (completedInput) completedInput.value = node.block!.properties.todoCompletedAt ?? "";
-            const indicator = body.querySelector<HTMLElement>(".canvas-todo-status");
-            const status = todoStatus(checkbox.checked, node.block!.properties.todoDueAt, node.block!.properties.todoCompletedAt);
-            if (indicator) {
-              indicator.className = `canvas-todo-status todo-status-${status}`;
-              indicator.textContent = status === "complete-early" || status === "complete-late" ? "✓" : status === "overdue" ? "!" : status === "pending" ? "○" : "";
-            }
-            syncPreview();
-          };
-          body.prepend(checkbox);
-          const dates = document.createElement("span");
-          dates.className = "canvas-todo-dates";
-          dates.setAttribute("aria-label", "待办日期");
-          const dateControl = (className: string, labelText: string, value: string | undefined, disabled = false) => {
-            const label = document.createElement("label");
-            label.title = labelText;
-            const caption = document.createElement("span"); caption.textContent = labelText;
-            const input = document.createElement("input");
-            input.type = "date"; input.className = className; input.setAttribute("aria-label", labelText); input.value = value ?? ""; input.disabled = disabled;
-            input.addEventListener("change", () => {
-              const property = className === "todo-created-date" ? "todoCreatedAt" : className === "todo-due-date" ? "todoDueAt" : "todoCompletedAt";
-              const next = input.value || undefined;
-              node.block!.properties[property] = next;
-              if (property === "todoCompletedAt") {
-                node.block!.content.checked = !!next;
-                checkbox.checked = !!next;
-              }
-              const indicator = body.querySelector<HTMLElement>(".canvas-todo-status");
-              const status = todoStatus(!!node.block!.content.checked, node.block!.properties.todoDueAt, node.block!.properties.todoCompletedAt);
-              if (indicator) {
-                indicator.className = `canvas-todo-status todo-status-${status}`;
-                indicator.textContent = status === "complete-early" || status === "complete-late" ? "✓" : status === "overdue" ? "!" : status === "pending" ? "○" : "";
-              }
-              if (property === "todoCompletedAt") syncPreview();
-              scheduleSave(0);
-            });
-            label.append(caption, input); dates.append(label);
-          };
-          dateControl("todo-created-date", "创建", node.block.properties.todoCreatedAt);
-          dateControl("todo-due-date", "应完成", node.block.properties.todoDueAt);
-          dateControl("todo-completed-date", "完成", node.block.properties.todoCompletedAt);
-          const status = document.createElement("span");
-          status.className = "canvas-todo-status";
-          const todoState = todoStatus(!!node.block.content.checked, node.block.properties.todoDueAt, node.block.properties.todoCompletedAt);
-          status.classList.add(`todo-status-${todoState}`);
-          status.textContent = todoState === "complete-early" || todoState === "complete-late" ? "✓" : todoState === "overdue" ? "!" : todoState === "pending" ? "○" : "";
-          dates.prepend(status);
-          body.append(dates);
-        }
         body.append(textarea, preview);
-        if (node.block.type === "heading") renderHeadingChildren(node, body);
-      } else if (node.kind === "media" && node.block?.content.media) {
-        const media = node.block.content.media;
-        if (media.kind === "image") {
-          const image = document.createElement("img"); image.className = "canvas-media-preview"; image.src = media.url; image.alt = node.block.content.caption || media.name; body.append(image);
-        } else if (media.kind === "video") {
-          const video = document.createElement("video"); video.className = "canvas-media-preview"; video.src = media.url; video.controls = true; body.append(video);
-        } else if (media.kind === "audio") {
-          const audio = document.createElement("audio"); audio.className = "canvas-media-preview"; audio.src = media.url; audio.controls = true; body.append(audio);
-        } else if (media.kind === "pdf") {
-          const frame = document.createElement("iframe"); frame.className = "canvas-media-pdf"; frame.src = media.url; frame.title = media.name; body.append(frame);
-        } else {
-          const link = document.createElement("a"); link.className = "canvas-media-file"; link.href = media.url; link.download = media.name; link.textContent = `下载 ${media.name}`; body.append(link);
-        }
+        blockModules.require(node.block.type).canvasDecorate?.(body, node.block, {
+          syncPreview,
+          scheduleSave,
+          renderChildren: () => renderHeadingChildren(node, body)
+        });
+      } else if (node.kind === "media" && node.block) {
+        const preview = node.block.content.media ? renderMediaAsset(node.block.content.media, { variant: "canvas", alt: node.block.content.caption || node.block.content.media.name }) : null;
+        if (preview) body.append(preview);
         if (node.block.content.caption) { const caption = document.createElement("div"); caption.className = "canvas-media-caption"; caption.textContent = node.block.content.caption; body.append(caption); }
       } else if (node.kind === "document" && target) {
         if (node.displayMode === "icon") {
@@ -1746,8 +1632,10 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     const maxZ = Math.max(0, ...current.nodes.map(node => node.zIndex));
     const blockId = uid("canvas-block");
     const node: CanvasNode = {
-      id: blockId, kind: "block", x: Math.round(point.x), y: Math.round(point.y), width: type === "heading" ? 300 : 260, height: type === "heading" ? 125 : 110, zIndex: maxZ + 1,
-      block: createBlock({ id: blockId, type, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), properties: type === "heading" ? { headingLevel: 1 } : {} })
+      id: blockId, kind: "block", x: Math.round(point.x), y: Math.round(point.y),
+      width: blockModules.require(type).canvasNodeDefaults?.width ?? 260,
+      height: blockModules.require(type).canvasNodeDefaults?.height ?? 110, zIndex: maxZ + 1,
+      block: createBlock({ id: blockId, type, position: String((current.nodes.length + 1) * 1000).padStart(8, "0"), properties: structuredClone(blockModules.require(type).canvasNodeDefaults?.properties ?? {}) })
     };
     current.nodes.push(node);
     selected = new Set([node.id]);
@@ -1762,7 +1650,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   function toggleDrawMode() {
     closeCurveStyleEditor();
     drawMode = !drawMode;
-    curveMode = false; pendingCurveEndpoint = null; branchCurveNode = null;
+    curveMode = false; pendingCurveEndpoint = null; branchCurveNode = null; branchPointPreview!.hidden = true;
     viewport.classList.toggle("draw-mode", drawMode);
     viewport.classList.remove("curve-mode");
     updateCanvasModeButtons();
@@ -1772,7 +1660,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   function toggleCurveMode() {
     closeCurveStyleEditor();
     curveMode = !curveMode;
-    drawMode = false; pendingCurveEndpoint = null; branchCurveNode = null;
+    drawMode = false; pendingCurveEndpoint = null; branchCurveNode = null; branchPointPreview!.hidden = true;
     viewport.classList.toggle("curve-mode", curveMode);
     viewport.classList.remove("draw-mode");
     library.hidden = true;
@@ -1797,8 +1685,9 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       if (!duplicate && endpoint.nodeId !== curve.start.nodeId && endpoint.nodeId !== curve.end.nodeId) {
         curve.branches = [...(curve.branches ?? []), endpoint];
         branchCurveNode = null;
-        curveMode = false;
-        viewport.classList.remove("curve-mode");
+        pendingCurveEndpoint = endpoint;
+        curveMode = true;
+        branchPointPreview!.hidden = false;
         updateCanvasModeButtons();
         renderNodes();
         scheduleSave();
@@ -1829,146 +1718,100 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     renderNodes(); scheduleSave(); renderSelectionInspector(true);
   }
 
+  function createCurveEndpointAt(point: CanvasPoint) {
+    if (!current || !pendingCurveEndpoint) return;
+    const id = uid("canvas-curve-point");
+    const pointNode: CanvasNode = {
+      id, kind: "curve-point", x: Math.round(point.x - 8), y: Math.round(point.y - 8), width: 16, height: 16,
+      zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, name: "分支点"
+    };
+    current.nodes.push(pointNode);
+    const startPoint = endpointPoint(pendingCurveEndpoint) ?? point;
+    const endEndpoint: CanvasCurve["end"] = { nodeId: id, side: "top" };
+    const curve: CanvasCurve = {
+      start: pendingCurveEndpoint, end: endEndpoint,
+      control1: { x: startPoint.x + (point.x - startPoint.x) / 3, y: startPoint.y },
+      control2: { x: point.x - (point.x - startPoint.x) / 3, y: point.y },
+      color: "#175cd3", width: 2, dash: "solid"
+    };
+    const curveId = uid("canvas-curve");
+    current.nodes.push({ id: curveId, kind: "curve", x: Math.min(startPoint.x, point.x), y: Math.min(startPoint.y, point.y), width: Math.max(80, Math.abs(point.x - startPoint.x)), height: Math.max(64, Math.abs(point.y - startPoint.y)), zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, curve });
+    selected = new Set([curveId]);
+    pendingCurveEndpoint = null; curveMode = false; branchCurveNode = null; branchPointPreview!.hidden = true;
+    viewport.classList.remove("curve-mode"); updateCanvasModeButtons();
+    renderNodes(); scheduleSave(); renderSelectionInspector(true);
+  }
+
+  function createBranchPoint(point: CanvasPoint) {
+    if (!current) return;
+    const id = uid("canvas-curve-point");
+    const node: CanvasNode = {
+      id, kind: "curve-point", x: Math.round(point.x - 8), y: Math.round(point.y - 8), width: 16, height: 16,
+      zIndex: Math.max(0, ...current.nodes.map(item => item.zIndex)) + 1, name: "分支点"
+    };
+    current.nodes.push(node);
+    if (branchCurveNode?.curve) {
+      const curve = branchCurveNode.curve;
+      curve.branches = [...(curve.branches ?? []), { nodeId: id, side: "top" }];
+      branchCurveNode = null;
+    }
+    pendingCurveEndpoint = { nodeId: id, side: "top" };
+    curveMode = true;
+    viewport.classList.add("curve-mode");
+    branchPointPreview!.hidden = false;
+    saveState.textContent = "分支点已放置：点击另一个对象连接曲线";
+    selected = new Set([id]);
+    renderNodes();
+    renderSelectionInspector(true);
+    scheduleSave();
+  }
+
   function closeCurveStyleEditor() {
-    inspector.querySelector(".canvas-curve-style")?.remove();
+    callbacks.onConfigCurveDismiss?.();
   }
 
   function renderSelectionInspector(activate = false) {
-    inspector.replaceChildren();
     const nodes = current?.nodes.filter(node => selected.has(node.id)) ?? [];
     callbacks.onObjectSelection?.(nodes.length > 0, activate);
-    if (!nodes.length) return;
-    if (nodes.length > 1) {
-      const summary = document.createElement("p"); summary.className = "canvas-inspector-summary";
-      summary.textContent = `已选中 ${nodes.length} 个对象`;
-      inspector.append(summary);
-      return;
-    }
-    const node = nodes[0];
-    const section = document.createElement("div"); section.className = "canvas-object-settings";
-    const kind = document.createElement("small"); kind.textContent = nodeTypeLabel(node, item(node.targetId)); section.append(kind);
-    const field = (label: string, value: string, apply: (value: string) => void, type = "text") => {
-      const row = document.createElement("label"); row.textContent = label;
-      const input = document.createElement("input"); input.type = type; input.value = value;
-      input.addEventListener("change", () => apply(input.value)); row.append(input); section.append(row);
-    };
-    field("名称", node.name ?? "", value => { node.name = value.trim() || undefined; renderNodes(); scheduleSave(); });
-    if (node.kind !== "curve" && node.kind !== "draw" && !node.block?.parentId) {
-      for (const [label, key] of [["X", "x"], ["Y", "y"], ["宽度", "width"], ["高度", "height"]] as const) {
-        field(label, String(node[key]), value => {
-          const number = Number(value);
-          if (!Number.isFinite(number)) return;
-          node[key] = Math.round(key === "width" ? clamp(number, 180, 900) : key === "height" ? clamp(number, 110, 760) : number);
-          renderNodes(); scheduleSave();
-        }, "number");
-      }
-    }
-    if (node.kind === "media" && node.block) {
-      field("说明", node.block.content.caption ?? "", value => {
-        node.block!.content.caption = value;
-        node.block!.revision += 1;
-        renderNodes(); scheduleSave();
-      });
-    }
-    if (node.block) {
-      field("字号", String(node.fontSize ?? 14), value => {
-        const size = Number(value);
-        if (!Number.isFinite(size)) return;
-        node.fontSize = Math.round(clamp(size, 10, 48));
-        renderNodes(); scheduleSave();
-      }, "number");
-    }
-    const selectField = (label: string, value: string, options: [string, string][], apply: (value: string) => void) => {
-      const row = document.createElement("label"); row.textContent = label;
-      const select = document.createElement("select");
-      options.forEach(([id, text]) => { const option = document.createElement("option"); option.value = id; option.textContent = text; select.append(option); });
-      select.value = value;
-      select.onchange = () => apply(select.value);
-      row.append(select); section.append(row);
-    };
-    if (isReferenceBlock(node)) {
-      selectField("引用显示", node.referenceDisplay ?? "preview", [["preview", "正文预览"], ["icon", "图标"]], value => setReferenceDisplay(node, value as "preview" | "icon"));
-    } else if (node.kind === "document" || node.kind === "canvas") {
-      selectField("显示方式", node.displayMode ?? "preview", [["preview", "内容缩略图"], ["icon", "图标"]], value => {
-        if (node.displayMode !== value) toggleCanvasMode(node);
-      });
-    }
-    if (isReferenceBlock(node) || node.kind === "document" || node.kind === "canvas") {
-      field("图标字符或地址", node.referenceIcon ?? "", value => {
-        node.referenceIcon = value.trim() || undefined;
-        renderNodes(); scheduleSave();
-      });
-      const upload = document.createElement("button"); upload.type = "button"; upload.className = "canvas-inspector-upload";
-      upload.textContent = "上传图标"; upload.onclick = () => { void uploadNodeIcon(node); };
-      section.append(upload);
-    }
-    inspector.append(section);
-    if (node.curve) showCurveStyleEditor(node);
-  }
-
-  function showCurveStyleEditor(node: CanvasNode) {
-    if (!node.curve) return;
-    closeCurveStyleEditor();
-    const popup = document.createElement("div"); popup.className = "canvas-curve-style"; popup.setAttribute("aria-label", "曲线样式");
-    const heading = document.createElement("strong"); heading.textContent = "曲线样式"; popup.append(heading);
-    const colorLabel = document.createElement("label"); colorLabel.textContent = "颜色 ";
-    const color = document.createElement("input"); color.type = "color"; color.value = node.curve.color; colorLabel.append(color);
-    const widthLabel = document.createElement("label"); widthLabel.textContent = "粗细 ";
-    const width = document.createElement("input"); width.type = "range"; width.min = "1"; width.max = "10"; width.value = String(node.curve.width);
-    const output = document.createElement("output"); output.value = `${node.curve.width}px`; widthLabel.append(width, output);
-    const dashLabel = document.createElement("label"); dashLabel.textContent = "线型 ";
-    const dash = document.createElement("select");
-    [["solid", "实线"], ["dashed", "虚线"], ["dotted", "点线"]].forEach(([value, label]) => { const option = document.createElement("option"); option.value = value; option.textContent = label; dash.append(option); });
-    dash.value = node.curve.dash; dashLabel.append(dash);
-    const endpointField = (label: string, key: "start" | "end") => {
-      const row = document.createElement("label"); row.textContent = label;
-      const select = document.createElement("select"); select.dataset.endpoint = key;
-      [["top", "上边"], ["right", "右边"], ["bottom", "下边"], ["left", "左边"]].forEach(([value, text]) => {
-        const option = document.createElement("option"); option.value = value; option.textContent = text; select.append(option);
-      });
-      select.value = node.curve![key].side;
-      select.onchange = () => {
-        const previous = endpointPoint(node.curve![key]);
-        node.curve![key].side = select.value as CanvasCurve["start"]["side"];
-        const next = endpointPoint(node.curve![key]);
+    if (!nodes.length) { callbacks.onConfigSelection?.(null); return; }
+    callbacks.onConfigSelection?.({
+      nodes,
+      label: node => nodeTypeLabel(node, item(node.targetId)),
+      isReference: isReferenceBlock,
+      commitNode: () => { renderNodes(); scheduleSave(); },
+      commitCurve: delay => { renderConnections(); scheduleSave(delay); },
+      setReferenceDisplay,
+      toggleCanvasMode,
+      uploadNodeIcon,
+      setCurveEndpoint(node, key, side) {
+        if (!node.curve) return;
+        const previous = endpointPoint(node.curve[key]);
+        node.curve[key].side = side;
+        const next = endpointPoint(node.curve[key]);
         if (previous && next) {
-          const control = key === "start" ? node.curve!.control1 : node.curve!.control2;
+          const control = key === "start" ? node.curve.control1 : node.curve.control2;
           control.x += next.x - previous.x;
           control.y += next.y - previous.y;
         }
         renderConnections(); scheduleSave(0);
-      };
-      row.append(select); return row;
-    };
-    const arrowLabel = document.createElement("label"); arrowLabel.textContent = "箭头 ";
-    const arrow = document.createElement("div"); arrow.className = "canvas-arrow-options";
-    let arrowValue: CanvasCurve["arrow"] = node.curve.arrow ?? "none";
-    [["none", "无箭头"], ["end", "终点箭头"], ["both", "双向箭头"]].forEach(([value, label]) => {
-      const option = document.createElement("button"); option.type = "button"; option.textContent = label; option.dataset.arrow = value; option.setAttribute("aria-pressed", String(value === arrowValue));
-      option.onclick = () => { arrowValue = value as CanvasCurve["arrow"]; arrow.querySelectorAll("button").forEach(item => item.setAttribute("aria-pressed", String(item === option))); update(); };
-      arrow.append(option);
+      },
+      insertControlPoint(node) {
+        if (!node.curve) return;
+        const start = endpointPoint(node.curve.start); const end = endpointPoint(node.curve.end);
+        if (!start || !end) return;
+        const point = curvePointAt(start, node.curve.control1, node.curve.control2, end);
+        node.curve.controlPoints = [...(node.curve.controlPoints ?? []), point];
+        renderConnections(); scheduleSave(0);
+      },
+      beginBranch(node) {
+        branchCurveNode = node; curveMode = true; drawMode = false; pendingCurveEndpoint = null;
+        viewport.classList.add("curve-mode"); branchPointPreview!.hidden = false;
+        updateCanvasModeButtons();
+        saveState.textContent = "分支模式：移动鼠标预览分支点，点击曲线或空白处放置";
+      },
+      removeNode
     });
-    arrowLabel.append(arrow);
-    const description = document.createElement("label"); description.textContent = "描述 ";
-    const descriptionInput = document.createElement("input"); descriptionInput.type = "text"; descriptionInput.value = node.curve.label ?? ""; descriptionInput.placeholder = "连接说明"; descriptionInput.maxLength = 120; description.append(descriptionInput);
-    popup.append(endpointField("起点连接", "start"), endpointField("终点连接", "end"), colorLabel, widthLabel, dashLabel, arrowLabel, description);
-    const update = () => { node.curve!.color = color.value; node.curve!.width = Number(width.value); node.curve!.dash = dash.value as CanvasCurve["dash"]; node.curve!.arrow = arrowValue; node.curve!.label = descriptionInput.value.trim() || undefined; output.value = `${node.curve!.width}px`; renderConnections(); scheduleSave(120); };
-    color.oninput = width.oninput = dash.oninput = descriptionInput.oninput = update;
-    const control = document.createElement("button"); control.type = "button"; control.textContent = "插入控制点"; control.onclick = () => {
-      const start = endpointPoint(node.curve!.start); const end = endpointPoint(node.curve!.end);
-      if (!start || !end) return;
-      const point = curvePointAt(start, node.curve!.control1, node.curve!.control2, end);
-      node.curve!.controlPoints = [...(node.curve!.controlPoints ?? []), point];
-      renderConnections(); scheduleSave(0);
-    };
-    const branch = document.createElement("button"); branch.type = "button"; branch.textContent = "添加分支点"; branch.onclick = () => {
-      branchCurveNode = node; curveMode = true; drawMode = false; pendingCurveEndpoint = null; viewport.classList.add("curve-mode"); updateCanvasModeButtons(); saveState.textContent = "分支模式：点击要连接的块";
-    };
-    const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger"; remove.textContent = "删除曲线"; remove.onclick = () => removeNode(node.id);
-    popup.append(control, branch, remove);
-    inspector.append(popup);
   }
-
   async function insertMediaFiles(files: readonly File[], point = nextPosition()) {
     if (!current || !callbacks.storeMedia) return;
     try {
@@ -2017,15 +1860,15 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     if (!current) return;
     const target = item(targetId);
     if (!target) return;
-    if (target.kind === "canvas" && !workspace.canLinkCanvas(current.id, target.id)) {
+    const presentation = documentModules.require(target.kind).canvasLink ?? { nodeKind: "document" as const, width: 320, height: 240 };
+    if (presentation.nodeKind === "canvas" && !workspace.canLinkCanvas(current.id, target.id)) {
       callbacks.onError(new Error("这个 Canvas 引用会形成循环，已阻止插入"));
       return;
     }
     const maxZ = Math.max(0, ...current.nodes.map(node => node.zIndex));
-    const width = target.kind === "canvas" ? 300 : 320;
-    const height = target.kind === "canvas" ? 210 : 240;
+    const { width, height } = presentation;
     const node: CanvasNode = {
-      id: uid("canvas-link"), kind: target.kind === "canvas" ? "canvas" : "document", targetId: target.id,
+      id: uid("canvas-link"), kind: presentation.nodeKind, targetId: target.id,
       x: Math.round(point.x - (centerOnPoint ? width / 2 : 0)), y: Math.round(point.y - (centerOnPoint ? height / 2 : 0)), width,
       height, zIndex: maxZ + 1, displayMode: "preview"
     };
@@ -2053,10 +1896,13 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
       list.replaceChildren();
       const query = search.value.trim().toLocaleLowerCase();
       entries.filter(entry => !query || entry.title.toLocaleLowerCase().includes(query)).forEach(entry => {
+        const module = documentModules.require(entry.kind);
         const button = document.createElement("button");
         button.type = "button";
-        button.innerHTML = `<span aria-hidden="true">${entry.kind === "canvas" ? "◇" : "▤"}</span><span></span><small>${entry.kind === "canvas" ? "Canvas" : "文档"}</small>`;
+        button.innerHTML = "<span aria-hidden=\"true\"></span><span></span><small></small>";
+        button.querySelectorAll("span")[0].textContent = module.createIcon;
         button.querySelectorAll("span")[1].textContent = entry.title;
+        button.querySelector("small")!.textContent = module.createLabel.replace(/^新建/, "");
         button.onclick = () => addReference(entry.id, libraryPoint ?? nextPosition());
         list.append(button);
       });
@@ -2185,8 +2031,28 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
   };
 
   viewport.onclick = event => {
+    if (consumeCanvasClick) { consumeCanvasClick = false; return; }
+    if (branchCurveNode?.curve && !(event.target as Element).closest(".canvas-node,.canvas-library,.canvas-bar")) {
+      createBranchPoint(worldPoint(event.clientX, event.clientY));
+      return;
+    }
+    if (curveMode && pendingCurveEndpoint && !(event.target as Element).closest(".canvas-node,.canvas-library,.canvas-bar")) {
+      createCurveEndpointAt(worldPoint(event.clientX, event.clientY));
+      return;
+    }
     if (event.target === viewport || event.target === stage) { selected.clear(); library.hidden = true; renderNodes(); }
   };
+  viewport.addEventListener("pointerdown", event => {
+    if (event.button !== 0 || (!branchCurveNode?.curve && !(curveMode && pendingCurveEndpoint))) return;
+    const target = event.target as Element;
+    if (target.closest(".canvas-node,.canvas-library,.canvas-bar")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    consumeCanvasClick = true;
+    const point = worldPoint(event.clientX, event.clientY);
+    if (branchCurveNode?.curve) createBranchPoint(point);
+    else createCurveEndpointAt(point);
+  }, true);
   viewport.addEventListener("contextmenu", showCanvasContextMenu);
   viewport.ondblclick = event => {
     if ((event.target as Element).closest(".canvas-node,.canvas-library,.canvas-bar")) return;
@@ -2253,6 +2119,12 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     viewport.classList.add("is-panning");
   });
   viewport.addEventListener("pointermove", event => {
+    if (branchPointPreview && !branchPointPreview.hidden && (branchCurveNode || (curveMode && pendingCurveEndpoint))) {
+      const point = worldPoint(event.clientX, event.clientY);
+      branchPointPreview.style.left = `${point.x - 7}px`;
+      branchPointPreview.style.top = `${point.y - 7}px`;
+      branchPointPreview.style.transform = `translate(${current?.viewport.x ?? 0}px, ${current?.viewport.y ?? 0}px) scale(${current?.viewport.zoom ?? 1})`;
+    }
     if (drawing && drawing.pointerId === event.pointerId && current) {
       const point = worldPoint(event.clientX, event.clientY);
       const previous = drawing.points[drawing.points.length - 1];
@@ -2329,7 +2201,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     catalog = null;
     let migratedHeadings = false;
     for (const node of [...current.nodes]) {
-      if (node.block?.type !== "heading" || node.block.parentId) continue;
+      if (!node.block || !blockModules.require(node.block.type).canvasHeadingCard || node.block.parentId) continue;
       const lines = markdownFromContent(node.block.content).split(/\r?\n/);
       if (lines.length < 2) continue;
       const titleLine = lines.shift()!;
@@ -2373,7 +2245,7 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     drawMode = false; curveMode = false; pendingCurveEndpoint = null; drawing = null; viewport.classList.remove("draw-mode", "curve-mode");
     current = null;
     selected.clear();
-    inspector.replaceChildren(); callbacks.onObjectSelection?.(false);
+    callbacks.onConfigSelection?.(null); callbacks.onObjectSelection?.(false);
     lastTextSelection = null;
     library.hidden = true;
     view.hidden = true;
@@ -2381,5 +2253,11 @@ export function mountCanvasManager(workspace: WorkspaceApi, callbacks: CanvasCal
     document.body.dataset.workspaceMode = "document";
   }
 
-  return { open, close, flush: async () => { await flush(); await referenceTail; await flush(); }, refreshReferences, undo: () => moveHistory("undo"), redo: () => moveHistory("redo"), restoreHistory, applyEditorState, insertCalendarLink, insertLocationBlock, isOpen: () => !view.hidden, activeId: () => current?.id ?? null };
+  const focusBlock = (blockId: string) => {
+    const node = current?.nodes.find(item => item.block?.id === blockId);
+    if (!node) return;
+    selectNode(node.id, false);
+    stage.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(node.id)}"]`)?.scrollIntoView({ block: "center", inline: "center" });
+  };
+  return { open, close, focusBlock, flush: async () => { await flush(); await referenceTail; await flush(); }, refreshReferences, undo: () => moveHistory("undo"), redo: () => moveHistory("redo"), restoreHistory, applyEditorState, insertCalendarLink, insertLocationBlock, isOpen: () => !view.hidden, activeId: () => current?.id ?? null };
 }

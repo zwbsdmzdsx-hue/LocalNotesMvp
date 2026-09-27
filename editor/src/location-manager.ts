@@ -88,9 +88,16 @@ export class LocationManager {
 
   constructor(private readonly options: LocationManagerOptions) {}
 
+  dispose() {
+    this.disposeMap();
+    this.disposeOverviewMap();
+    this.draft = null;
+    this.options.panel.replaceChildren();
+  }
+
   render() {
     const state = this.options.getState();
-    if (!state) { this.options.panel.replaceChildren(); return; }
+    if (!state) { this.dispose(); return; }
     if (this.draft) { this.renderEditor(state); return; }
     this.renderList(state);
   }
@@ -228,7 +235,7 @@ export class LocationManager {
   private updateMapPoint(draft: LocationDraft) { this.marker?.setLatLng([draft.latitude, draft.longitude]); this.map?.setView([draft.latitude, draft.longitude]); }
   private scheduleReverse(draft: LocationDraft, state: LocationManagerState) { clearTimeout(this.reverseTimer); this.reverseTimer = setTimeout(() => void this.reverseGeocode(draft, state), 600); }
   private async reverseGeocode(draft: LocationDraft, _state: LocationManagerState) {
-    try { const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&accept-language=zh-CN&lat=${encodeURIComponent(draft.latitude)}&lon=${encodeURIComponent(draft.longitude)}`); if (!response.ok) throw new Error("地址反查服务不可用"); const data = await response.json() as { display_name?: string; type?: string }; if (data.display_name) { draft.address = data.display_name; draft.precision = data.type === "road" ? "street" : "district"; this.renderEditor(this.options.getState()!); } } catch (error) { this.options.onError(error); }
+    try { const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&accept-language=zh-CN&lat=${encodeURIComponent(draft.latitude)}&lon=${encodeURIComponent(draft.longitude)}`); if (!response.ok) throw new Error("地址反查服务不可用"); const data = await response.json() as { display_name?: string; type?: string }; const state = this.options.getState(); if (data.display_name && state && this.draft === draft) { draft.address = data.display_name; draft.precision = data.type === "road" ? "street" : "district"; this.renderEditor(state); } } catch (error) { this.options.onError(error); }
   }
   private async saveCommand(operation: string, payload: Record<string, unknown>) {
     try { await this.options.execute({ operation, ...payload }, operation); this.draft = null; this.render(); } catch (error) { this.options.onError(error); }

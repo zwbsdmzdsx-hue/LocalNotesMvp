@@ -1,0 +1,113 @@
+import { test, expect } from "@playwright/test";
+
+async function createDatabaseDocument(page, title) {
+  await page.goto("/");
+  page.once("dialog", dialog => dialog.accept(title));
+  await page.locator(".bk-strip.active .bookmark-add-document").click();
+  await page.getByRole("button", { name: "新建数据表" }).click();
+  return page.locator('[data-own-block][data-type="database_table"]');
+}
+
+test("sheets have independent records and H1 titles", async ({ page }) => {
+  const table = await createDatabaseDocument(page, "项目台账");
+  await expect(page.locator('[data-own-block][data-type="heading"]')).toContainText("Sheet 1");
+  await table.locator(".database-add-row").click();
+  await table.locator('.database-cell[data-field-key="name"]').fill("第一表记录");
+  await table.locator('.database-cell[data-field-key="name"]').press("Tab");
+
+  page.once("dialog", dialog => dialog.accept("第二表"));
+  await table.locator(".database-sheet-add").click();
+  await expect(page.locator('[data-own-block][data-type="heading"]')).toContainText("第二表");
+  await expect(table.locator("tbody tr[data-record-id]")).toHaveCount(0);
+  await table.locator(".database-add-row").click();
+  await table.locator('.database-cell[data-field-key="name"]').fill("第二表记录");
+  await table.locator('.database-cell[data-field-key="name"]').press("Tab");
+  await table.locator(".database-sheet-tab").first().click();
+  await expect(table.locator('.database-cell[data-field-key="name"]')).toHaveValue("第一表记录");
+  await table.locator(".database-sheet-tab").nth(1).click();
+  await expect(table.locator('.database-cell[data-field-key="name"]')).toHaveValue("第二表记录");
+  await table.locator(".database-sheet-tab").nth(1).dragTo(table.locator(".database-sheet-tab").first(), { targetPosition: { x: 3, y: 10 } });
+  await expect(table.locator(".database-sheet-tab").first()).toContainText("第二表");
+  await page.screenshot({ path: "test-results/database-sheets.png" });
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  const source = page.locator('[data-id="a1"] > .block-row > .block-text');
+  await source.fill("[[默认笔记本/项目台账/");
+  const suggestion = page.locator(".link-suggestion").filter({ hasText: "整行" }).filter({ hasText: "第二表记录" });
+  await expect(suggestion).toBeVisible();
+  await suggestion.click();
+  await expect(source.locator(".wiki-link")).toHaveAttribute("data-target-scope", "record");
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  await page.locator('.doc-item', { hasText: "项目台账" }).click();
+  await expect(table.locator(".database-sheet-tab")).toHaveCount(2);
+  await expect(table.locator(".database-sheet-tab").first()).toContainText("第二表");
+  await table.locator(".database-sheet-tab").first().click();
+  await expect(table.locator('.database-cell[data-field-key="name"]')).toHaveValue("第二表记录");
+  page.once("dialog", dialog => dialog.accept());
+  await table.locator(".database-sheet-remove").click();
+  await expect(table.locator(".database-sheet-tab")).toHaveCount(1);
+  await expect(table.locator('.database-cell[data-field-key="name"]')).toHaveValue("第一表记录");
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  await source.locator(".wiki-link").hover();
+  await expect(page.locator(".link-preview")).toContainText("第二表记录", { timeout: 1500 });
+  await page.locator('.doc-item', { hasText: "项目台账" }).click();
+  await page.locator("#history").click();
+  const history = page.locator('[data-slot="history"]');
+  await history.locator(".history-entry").nth(1).click();
+  await expect(history.locator("pre")).toContainText("第二表");
+  await history.getByRole("button", { name: "恢复此版本" }).click();
+  await expect(table.locator(".database-sheet-tab")).toHaveCount(2);
+});
+
+test("saved views share records and restore sort, filter and search", async ({ page }) => {
+  const table = await createDatabaseDocument(page, "视图测试");
+  for (const [name, status] of [["A任务", "待办"], ["B任务", "完成"], ["C任务", "待办"]]) {
+    await table.locator(".database-add-row").click();
+    const row = table.locator("tbody tr[data-record-id]").last();
+    await row.locator('.database-cell[data-field-key="name"]').fill(name);
+    await row.locator('.database-cell[data-field-key="name"]').press("Tab");
+    await row.locator('.database-cell[data-field-key="status"]').fill(status);
+    await row.locator('.database-cell[data-field-key="status"]').press("Tab");
+  }
+  await table.locator(".database-view-add").selectOption("table");
+  await expect(table.locator(".database-view-picker option")).toHaveCount(2);
+  await table.locator(".database-view-sort-key").selectOption("name");
+  await table.locator(".database-view-sort-direction").selectOption("desc");
+  await expect(table.locator('tbody tr .database-cell[data-field-key="name"]').first()).toHaveValue("C任务");
+  await table.locator(".database-view-add-filter").click();
+  await table.locator('.database-view-filter select[aria-label="筛选字段 1"]').selectOption("status");
+  await table.locator('.database-view-filter input').fill("待办");
+  await table.locator('.database-view-filter input').press("Tab");
+  await expect(table.locator("tbody tr[data-record-id]")).toHaveCount(2);
+  await table.locator(".database-view-search").fill("C");
+  await expect(table.locator("tbody tr[data-record-id]:visible")).toHaveCount(1);
+  await table.locator(".database-view-search").press("Tab");
+  await expect(table.locator("tbody tr[data-record-id]")).toHaveCount(1);
+  await table.locator(".database-view-picker").selectOption({ index: 0 });
+  await expect(table.locator("tbody tr[data-record-id]")).toHaveCount(3);
+  await table.locator(".database-view-add").selectOption("board");
+  await expect(table.locator(".database-board-lane")).toHaveCount(2);
+  await table.locator(".database-view-add").selectOption("gallery");
+  await expect(table.locator(".database-record-card")).toHaveCount(3);
+  await page.screenshot({ path: "test-results/database-gallery.png" });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: "test-results/database-gallery-mobile.png" });
+  const card = await table.locator(".database-record-card").first().boundingBox();
+  expect(card.x + card.width).toBeLessThanOrEqual(390);
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await page.locator('[data-document-id="alpha"] > .doc-item').click();
+  await page.locator('.doc-item', { hasText: "视图测试" }).click();
+  await expect(table.locator(".database-view-picker option")).toHaveCount(4);
+  await expect(table.locator(".database-gallery-grid .database-record-card")).toHaveCount(3);
+  await table.locator(".database-view-picker").selectOption({ index: 1 });
+  await expect(table.locator("tbody tr[data-record-id]")).toHaveCount(1);
+  page.once("dialog", dialog => dialog.accept("待办视图"));
+  await table.getByRole("button", { name: "重命名" }).click();
+  await expect(table.locator(".database-view-picker option").nth(1)).toContainText("待办视图");
+  await table.locator(".database-view-columns summary").click();
+  await table.locator('.database-view-columns input[value="status"]').uncheck();
+  await expect(table.locator('th[data-field-key="status"]')).toHaveCount(0);
+  page.once("dialog", dialog => dialog.accept());
+  await table.getByRole("button", { name: "删除视图" }).click();
+  await expect(table.locator(".database-view-picker option")).toHaveCount(3);
+  await expect(table.locator("tbody tr[data-record-id]")).toHaveCount(3);
+});

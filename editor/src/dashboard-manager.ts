@@ -1,84 +1,56 @@
 import type { EditorState, Block, BlockProperties } from "../../protocol/types";
-import type { WorkspaceApi } from "./workspace-api";
+import type { WorkspaceApi, WorkspaceDocument } from "./workspace-api";
+import type { DocumentModule, ModuleRegistry } from "./module-registry";
 import type { EditorHostApi } from "./editor-host-api";
-import { createBlock } from "./document-model";
+import type { HistoryModel } from "./history";
+import { createRegisteredBlock as createBlock, isDashboardWidgetBlock } from "./block-modules";
 import { DocumentSaveSession } from "./document-session";
-import { dashboardRows, normalizeDashboardQuery, runDashboardQuery, type DashboardOperator, type DashboardQuery } from "./dashboard-query";
+import { dashboardMetricPresets, normalizeDashboardQuery, runDashboardQuery } from "./dashboard-query";
+import { dataViews, renderDataView, sourceNames, type DataViewKind } from "./dashboard-views";
+import type { DashboardExternalWidget } from "./dashboard-extension";
+import type { DashboardConfigPanelModel } from "./dashboard-config-panel";
+import { defaultDashboardRenderers, dashboardWidgetConfig, widgetIcons, type DashboardWidgetRenderer } from "./dashboard-renderers";
+import { renderDashboardDocumentFilter } from "./dashboard-filter-widget";
+import { renderDashboardWidgetBody } from "./dashboard-widget-body";
 
 export type DashboardWidgetKind =
   | "references" | "backlinks" | "overrides" | "comments" | "history"
   | "calendar" | "locations" | "styles" | "databases" | (string & {});
 
-export type DashboardWidgetRenderer = {
-  kind: DashboardWidgetKind;
-  icon?: string;
-  render(state: EditorState, widget: Block): HTMLElement;
-};
-
 type DashboardCallbacks = {
   onOpenDocument(documentId: string, blockId?: string): void;
   onError(error: unknown): void;
   onStateChanged?(state: EditorState): void;
+  onHistoryChanged?(model: HistoryModel): void;
   onWidgetSelection?(selected: boolean, activate?: boolean): void;
+  onShowBacklinks?(blockId: string, state: EditorState): void;
+  onWidgetConfig?(model: DashboardConfigPanelModel | null): void;
 };
 
 type DashboardConfig = NonNullable<BlockProperties["dashboardWidget"]>;
 type DashboardSaveSnapshot = { documentId: string; title: string; blocks: Block[] };
 
 const uid = () => `dashboard-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
-const widgetIcons: Record<string, string> = {
-  metric: "∑", references: "↗", backlinks: "↙", overrides: "!", comments: "◌",
-  history: "↶", calendar: "▦", locations: "⌖", styles: "◧", databases: "▤"
-};
-
 function widgetConfig(block: Block): DashboardConfig | undefined {
-  return block.properties.dashboardWidget as DashboardConfig | undefined;
-}
-
-function list(values: string[], empty = "暂无内容") {
-  const section = document.createElement("div");
-  section.className = "dashboard-widget-list";
-  if (!values.length) {
-    const p = document.createElement("p"); p.className = "dashboard-empty"; p.textContent = empty; section.append(p); return section;
-  }
-  values.slice(0, 12).forEach(value => { const row = document.createElement("div"); row.className = "dashboard-list-row"; row.textContent = value; section.append(row); });
-  if (values.length > 12) { const more = document.createElement("small"); more.textContent = `还有 ${values.length - 12} 项`; section.append(more); }
-  return section;
-}
-
-function countCard(label: string, count: number) {
-  const body = document.createElement("div"); body.className = "dashboard-count-card";
-  const value = document.createElement("strong"); value.textContent = String(count);
-  const caption = document.createElement("span"); caption.textContent = label;
-  body.append(value, caption); return body;
-}
-
-function defaultRenderers(): DashboardWidgetRenderer[] {
-  return [
-    { kind: "references", render: state => list(state.references.map(ref => `${ref.targetTitle} · ${ref.mode}`)) },
-    { kind: "backlinks", render: state => list(state.backlinks.map(link => `${link.sourceTitle} · ${link.excerpt}`)) },
-    { kind: "overrides", render: state => countCard("条外部覆写通知", state.overrideNotices.length) },
-    { kind: "comments", render: state => countCard("条正文注释", state.blocks.reduce((total, block) => total + (block.properties.comments?.length ?? 0), 0)) },
-    { kind: "history", render: state => list((state.history?.entries ?? []).map(entry => `${entry.label} · ${entry.preview}`)) },
-    { kind: "calendar", render: state => list(state.blocks.filter(block => block.type === "todo").map(block => block.content.text || "未命名待办"), "当前文档没有待办") },
-    { kind: "locations", render: state => list((state.locations ?? []).filter(location => !location.deletedAt).map(location => `${location.name} · ${location.address}`)) },
-    { kind: "styles", render: state => list([...(state.systemStyles ?? []), ...(state.notebookStyles ?? []), ...(state.documentStyles ?? [])].map(style => `${style.title}${style.enabled ? "" : " · 已停用"}`)) },
-    { kind: "databases", render: state => list((state.databases ?? []).map(database => `${database.title} · ${database.recordCount} 条记录`)) }
-  ];
+  return dashboardWidgetConfig(block) as DashboardConfig | undefined;
 }
 
 export type DashboardManager = {
   open(state: EditorState, sourceState?: EditorState | null): void;
   close(): void;
   flush(): Promise<void>;
+  restoreHistory(entryId: string): Promise<void>;
   isOpen(): boolean;
+  currentState(): EditorState | null;
+  focusBlock(blockId: string): void;
   applyState(state: EditorState): void;
   setSourceState(state: EditorState | null): void;
   refreshSources(documentId?: string): void;
   register(renderer: DashboardWidgetRenderer): void;
+  registerExternal(definition: DashboardExternalWidget): () => void;
 };
 
-export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceApi, callbacks: DashboardCallbacks): DashboardManager {
+export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceApi, callbacks: DashboardCallbacks, documentModules: ModuleRegistry<DocumentModule>): DashboardManager {
   const container = document.querySelector<HTMLElement>(".workspace")!;
   const view = document.createElement("section");
   view.className = "dashboard-view";
@@ -88,7 +60,6 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
   const title = view.querySelector<HTMLInputElement>(".dashboard-title")!;
   const saveState = view.querySelector<HTMLElement>(".dashboard-save-state")!;
   const stage = view.querySelector<HTMLElement>(".dashboard-stage")!;
-  const settings = document.querySelector<HTMLElement>('[data-slot="dashboard-config"]')!;
   const editor = container.querySelector<HTMLElement>(".editor")!;
   let current: EditorState | null = null;
   let sourceState: EditorState | null = null;
@@ -101,6 +72,7 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     versions.set(snapshot.documentId, result.clientVersion);
     if (current?.note.id === snapshot.documentId) {
       current.note.clientVersion = result.clientVersion;
+      if (result.history) { current.history = result.history; callbacks.onHistoryChanged?.(result.history); }
       callbacks.onStateChanged?.(structuredClone(current));
     }
   }, (phase, error) => {
@@ -108,10 +80,17 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     if (phase === "failed") callbacks.onError(error);
   });
   let selectedWidgetId: string | null = null;
-  const renderers = new Map<string, DashboardWidgetRenderer>(defaultRenderers().map(renderer => [renderer.kind, renderer]));
+  let viewDisposers: Array<() => void> = [];
+  const renderers = new Map<string, DashboardWidgetRenderer>(defaultDashboardRenderers().map(renderer => [renderer.kind, renderer]));
+  const externalWidgets = new Map<string, DashboardExternalWidget>();
+  const externalRuntimes = new Map<string, { kind: string; settings: string; element: HTMLElement; dispose(): void }>();
 
   function setSaveState(text: string, error = false) { saveState.textContent = text; saveState.classList.toggle("is-error", error); }
-  function widgets() { return current?.blocks.filter(block => block.type === "dashboard_widget" && widgetConfig(block)) ?? []; }
+  function widgets() { return current?.blocks.filter(block => isDashboardWidgetBlock(block) && widgetConfig(block)) ?? []; }
+  function dashboardSources(documents: WorkspaceDocument[]) {
+    return documents.filter(item => Boolean(documentModules.require(item.kind).dashboardSource));
+  }
+  function documentFilterIds() { return widgets().find(block => widgetConfig(block)?.kind === "documentFilter")?.properties.dashboardWidget?.documentIds ?? []; }
   function rendererFor(kind: string) { return renderers.get(kind); }
   function aggregate(states: EditorState[]): EditorState | null {
     const first = states[0];
@@ -129,37 +108,84 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     return result;
   }
   function dataStateFor(config: NonNullable<BlockProperties["dashboardWidget"]>) {
-    if (config.scope === "activeDocument") return sourceState ?? current!;
-    if (config.scope === "document") return sourceStates.get(config.sourceId ?? sourceState?.note.id ?? "") ?? sourceState ?? current!;
-    if (config.scope === "notebook") {
-      const notebookId = sourceState?.note.workspaceId;
-      const states = [...sourceStates.values()].filter(state => !notebookId || state.note.workspaceId === notebookId);
-      return aggregate(states) ?? sourceState ?? current!;
-    }
-    if (config.scope === "workspace") return aggregate([...sourceStates.values()]) ?? sourceState ?? current!;
-    return current!;
+    const states = dataStatesFor(config);
+    if (states.length) return aggregate(states)!;
+    const empty = structuredClone(current!);
+    empty.blocks = []; empty.references = []; empty.backlinks = []; empty.overrideNotices = [];
+    empty.locations = []; empty.databases = []; empty.systemStyles = []; empty.notebookStyles = []; empty.documentStyles = [];
+    return empty;
   }
   function dataStatesFor(config: DashboardConfig): EditorState[] {
-    const documents = workspace.snapshot().documents.filter(item => item.kind !== "dashboard");
-    const allowed = new Set(documents.filter(item => normalizeDashboardQuery(config.query).source !== "documents" || item.kind === "document").map(item => item.id));
+    const documents = dashboardSources(workspace.snapshot().documents);
+    const selected = documentFilterIds();
+    const allowed = new Set(documents.filter(item => (!selected.length || selected.includes(item.id)) &&
+      (config.kind !== "metric" && !(config.kind in dataViews) || normalizeDashboardQuery(config.query).source !== "documents" || documentModules.require(item.kind).dashboardSource?.countsAsDocument)).map(item => item.id));
     if (config.scope === "activeDocument") return sourceState && allowed.has(sourceState.note.id) ? [sourceState] : [];
-    if (config.scope === "document") return [sourceStates.get(config.sourceId ?? "")].filter((state): state is EditorState => !!state && allowed.has(state.note.id));
+    if (config.scope === "document") return [sourceStates.get(config.sourceId ?? sourceState?.note.id ?? "")].filter((state): state is EditorState => !!state && allowed.has(state.note.id));
     const states = [...sourceStates.values()].filter(state => allowed.has(state.note.id));
     if (config.scope === "notebook") return states.filter(state => state.note.workspaceId === current?.note.workspaceId);
     return states;
   }
   function renderQueryWidget(config: DashboardConfig) {
     const query = normalizeDashboardQuery(config.query);
+    const kind = config.kind as DataViewKind;
+    const definition = dataViews[kind];
+    if (definition && !definition.sources.includes(query.source)) {
+      const body = document.createElement("div"); body.className = "dashboard-query-result";
+      const error = document.createElement("p"); error.className = "dashboard-query-error";
+      error.textContent = "此视图不支持当前数据类型，请在右栏重新选择。";
+      body.append(error);
+      return { element: body, dispose() {} };
+    }
     const result = runDashboardQuery(dataStatesFor(config), query);
     const body = document.createElement("div"); body.className = "dashboard-query-result";
-    if (result.error) { const error = document.createElement("p"); error.className = "dashboard-query-error"; error.textContent = result.error; body.append(error); return body; }
-    const total = document.createElement("strong"); total.className = "dashboard-query-total"; total.textContent = String(result.value); body.append(total);
-    if (query.groupBy) {
-      const groups = document.createElement("div"); groups.className = "dashboard-query-groups";
-      result.groups.forEach(group => { const row = document.createElement("div"); const label = document.createElement("span"); label.textContent = group.key; const value = document.createElement("strong"); value.textContent = String(group.value); row.append(label, value); groups.append(row); });
-      body.append(groups);
-    }
-    return body;
+    const view = renderDataView(kind, config, query, result); body.append(view.element);
+    return { element: body, dispose: view.dispose };
+  }
+  function renderDocumentFilter(block: Block, config: DashboardConfig) {
+    const options = dashboardSources(workspace.snapshot().documents).map(item => ({ id: item.id, title: item.title }));
+    return renderDashboardDocumentFilter({ documents: options, selectedIds: config.documentIds ?? [], onChange: ids => {
+      config.documentIds = ids;
+      block.revision += 1;
+      render(); renderSettings(); scheduleSave();
+    } });
+  }
+  function renderExternalWidget(block: Block, definition: DashboardExternalWidget) {
+    const config = widgetConfig(block)!;
+    const settings = JSON.stringify(config.externalSettings ?? {});
+    const previous = externalRuntimes.get(block.id);
+    if (previous?.kind === config.kind && previous.settings === settings) return previous.element;
+    previous?.dispose();
+    const element = document.createElement("div"); element.className = "dashboard-external-widget";
+    const status = document.createElement("p"); status.className = "dashboard-empty"; status.textContent = "加载中"; element.append(status);
+    const controller = new AbortController();
+    let cleanup: void | (() => void);
+    let stopped = false;
+    const runtime = {
+      kind: config.kind, settings, element,
+      dispose() { if (stopped) return; stopped = true; controller.abort(); externalRuntimes.delete(block.id); try { cleanup?.(); } catch (error) { callbacks.onError(error); } }
+    };
+    externalRuntimes.set(block.id, runtime);
+    const context = {
+      widgetId: block.id,
+      settings: structuredClone(config.externalSettings ?? {}),
+      signal: controller.signal,
+      refresh: () => { if (stopped || !current?.blocks.some(item => item.id === block.id)) return; runtime.dispose(); element.replaceWith(renderExternalWidget(block, definition)); }
+    };
+    void Promise.resolve().then(() => definition.mount(element, context)).then(result => {
+      if (stopped) { if (typeof result === "function") result(); return; }
+      cleanup = result;
+      if (status.isConnected) {
+        if (element.childNodes.length > 1) status.remove();
+        else status.textContent = "组件没有内容";
+      }
+    }).catch(error => {
+      if (stopped) return;
+      const message = document.createElement("p"); message.className = "dashboard-query-error";
+      message.textContent = `组件加载失败：${error instanceof Error ? error.message : String(error)}`;
+      element.replaceChildren(message);
+    });
+    return element;
   }
   function renderWidget(block: Block) {
     const config = widgetConfig(block)!;
@@ -177,20 +203,25 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     if (config.style?.fontSize) card.style.setProperty("--dashboard-widget-font-size", `${config.style.fontSize}px`);
     const head = document.createElement("header"); head.className = "dashboard-widget-head";
     const icon = document.createElement("span"); icon.className = "dashboard-widget-icon";
-    icon.textContent = rendererFor(config.kind)?.icon || widgetIcons[config.kind] || "◇";
+    icon.textContent = externalWidgets.get(config.kind)?.icon || rendererFor(config.kind)?.icon || dataViews[config.kind as DataViewKind]?.icon || widgetIcons[config.kind] || "◇";
     icon.title = config.kind;
     const label = document.createElement("strong"); label.textContent = config.title || config.kind;
-    const kind = document.createElement("small"); kind.textContent = config.kind;
+    const kind = document.createElement("small"); kind.textContent = externalWidgets.has(config.kind) ? "外部组件" : config.kind in dataViews ? sourceNames[normalizeDashboardQuery(config.query).source] : config.kind === "documentFilter" ? "范围控件" : config.kind;
     const controls = document.createElement("span"); controls.className = "dashboard-widget-controls";
     const smaller = document.createElement("button"); smaller.type = "button"; smaller.textContent = "−"; smaller.title = "缩小组件"; smaller.onclick = () => resize(block, -24, -16);
     const larger = document.createElement("button"); larger.type = "button"; larger.textContent = "+"; larger.title = "放大组件"; larger.onclick = () => resize(block, 24, 16);
     const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "×"; remove.title = "移除组件"; remove.onclick = () => { current!.blocks = current!.blocks.filter(item => item.id !== block.id); if (selectedWidgetId === block.id) selectWidget(null); render(); scheduleSave(); };
     controls.append(smaller, larger, remove); head.append(icon, label, kind, controls); card.append(head);
     const body = document.createElement("div"); body.className = "dashboard-widget-body";
-    const custom = rendererFor(config.kind);
-    if (config.kind === "metric") body.append(renderQueryWidget(config));
-    else if (custom) body.append(custom.render(dataStateFor(config), block));
-    else { body.append(countCard("自定义组件占位", 0)); const hint = document.createElement("p"); hint.className = "dashboard-empty"; hint.textContent = "此组件类型已预留，可通过 DashboardWidgetRenderer 注册。"; body.append(hint); }
+    body.append(renderDashboardWidgetBody({
+      block, config, state: dataStateFor(config), renderers,
+      dataViews: Object.fromEntries(Object.entries(dataViews).map(([kind, definition]) => [kind, { label: definition.label, icon: definition.icon }])),
+      externalWidgets,
+      renderDocumentFilter,
+      renderQuery: renderQueryWidget,
+      renderExternal: renderExternalWidget,
+      registerDispose: dispose => viewDisposers.push(dispose)
+    }));
     if (config.description) { const description = document.createElement("p"); description.className = "dashboard-widget-description"; description.textContent = config.description; body.append(description); }
     card.append(body);
     enableDrag(card, block);
@@ -203,64 +234,31 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     callbacks.onWidgetSelection?.(!!id, activate);
   }
   function renderSettings() {
-    settings.replaceChildren();
     const block = widgets().find(item => item.id === selectedWidgetId);
-    if (!block) return;
+    if (!block || !current) { callbacks.onWidgetConfig?.(null); return; }
+    const owner = current;
     const config = widgetConfig(block)!;
-    const query = normalizeDashboardQuery(config.query);
-    const form = document.createElement("div"); form.className = "dashboard-settings";
-    const update = (rerenderSettings = false) => { block.revision += 1; render(); scheduleSave(); if (rerenderSettings) renderSettings(); };
-    const field = (labelText: string, value: string, onChange: (value: string) => void, type = "text") => {
-      const label = document.createElement("label"); label.textContent = labelText;
-      const input = document.createElement("input"); input.type = type; input.value = value; input.setAttribute("aria-label", labelText);
-      input.onchange = () => onChange(input.value); label.append(input); form.append(label); return input;
-    };
-    const choice = (labelText: string, value: string, options: Array<[string, string]>, onChange: (value: string) => void) => {
-      const label = document.createElement("label"); label.textContent = labelText;
-      const select = document.createElement("select"); select.setAttribute("aria-label", labelText);
-      options.forEach(([key, name]) => { const option = document.createElement("option"); option.value = key; option.textContent = name; select.append(option); });
-      select.value = value; select.onchange = () => onChange(select.value); label.append(select); form.append(label); return select;
-    };
-    field("标题", config.title ?? "", value => { config.title = value.trim(); update(); });
-    field("文字描述", config.description ?? "", value => { config.description = value.trim(); update(); });
-    choice("数据范围", config.scope, [["activeDocument", "当前文档"], ["document", "指定文档"], ["notebook", "当前笔记本"], ["workspace", "整个工作区"]], value => { config.scope = value as DashboardConfig["scope"]; update(true); void hydrateSources(); });
-    if (config.scope === "document") choice("来源文档", config.sourceId ?? "", workspace.snapshot().documents.filter(item => item.kind !== "dashboard").map(item => [item.id, item.title]), value => { config.sourceId = value; update(); void hydrateSources(); });
-    if (config.kind === "metric") {
-      choice("数据类型", query.source, [["documents", "文档"], ["blocks", "正文块"], ["keywords", "关键字"], ["todos", "待办"], ["locations", "位置"], ["databaseRecords", "表格记录"]], value => { query.source = value as DashboardQuery["source"]; config.query = { ...query }; update(true); void hydrateSources(); });
-      if (query.source === "keywords") field("关键字", query.keyword ?? "", value => { query.keyword = value; config.query = { ...query }; update(); });
-      if (query.source === "databaseRecords") choice("数据表", query.databaseId ?? "", [["", "全部数据表"], ...[...new Map(dataStatesFor(config).flatMap(state => state.databases ?? []).map(database => [database.id, database.title] as [string, string])).entries()]], value => { query.databaseId = value; config.query = { ...query }; update(true); });
-      const sample = dashboardRows(dataStatesFor(config), query)[0] ?? {};
-      const keys = Object.keys(sample);
-      const hints = document.createElement("small"); hints.className = "dashboard-settings-hint"; hints.textContent = keys.length ? `可用字段：${keys.join("、")}` : "当前范围无数据"; form.append(hints);
-      const filterHeading = document.createElement("strong"); filterHeading.textContent = "筛选条件"; form.append(filterHeading);
-      (query.filters ?? []).forEach((filter, index) => {
-        const row = document.createElement("div"); row.className = "dashboard-filter-row";
-        const key = document.createElement("input"); key.placeholder = "字段"; key.value = filter.field; key.setAttribute("aria-label", `筛选字段 ${index + 1}`);
-        const operator = document.createElement("select"); operator.setAttribute("aria-label", `筛选运算符 ${index + 1}`);
-        (["=", "!=", ">", ">=", "<", "<=", "contains"] as const).forEach(value => { const option = document.createElement("option"); option.value = value; option.textContent = value; operator.append(option); }); operator.value = filter.operator;
-        const value = document.createElement("input"); value.placeholder = "值"; value.value = filter.value; value.setAttribute("aria-label", `筛选值 ${index + 1}`);
-        const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "×"; remove.title = "删除筛选条件"; remove.onclick = () => { query.filters?.splice(index, 1); config.query = { ...query }; update(true); };
-        [key, operator, value].forEach(input => { input.onchange = () => { filter.field = key.value.trim(); filter.operator = operator.value as DashboardOperator; filter.value = value.value; config.query = { ...query }; update(); }; });
-        row.append(key, operator, value, remove); form.append(row);
-      });
-      const addFilter = document.createElement("button"); addFilter.type = "button"; addFilter.textContent = "+ 筛选条件"; addFilter.onclick = () => { query.filters = [...(query.filters ?? []), { field: keys[0] ?? "type", operator: "=", value: "" }]; config.query = { ...query }; update(true); }; form.append(addFilter);
-      field("条件表达式", query.condition ?? "", value => { query.condition = value; config.query = { ...query }; update(); });
-      field("分类字段", query.groupBy ?? "", value => { query.groupBy = value.trim(); config.query = { ...query }; update(); });
-      choice("汇总方式", query.measure ?? "count", [["count", "计数"], ["sum", "求和"], ["avg", "平均"], ["min", "最小"], ["max", "最大"], ["unique", "去重计数"]], value => { query.measure = value as DashboardQuery["measure"]; config.query = { ...query }; update(); });
-      field("数值字段", query.valueField ?? "", value => { query.valueField = value.trim(); config.query = { ...query }; update(); });
-      field("计算公式", query.formula ?? "", value => { query.formula = value.trim(); config.query = { ...query }; update(); });
-    }
-    const layoutHeading = document.createElement("strong"); layoutHeading.textContent = "尺寸与布局"; form.append(layoutHeading);
-    (["x", "y", "width", "height", "zIndex"] as const).forEach(key => field(key === "width" ? "宽度" : key === "height" ? "高度" : key === "zIndex" ? "层级" : key.toUpperCase(), String(config.layout[key] ?? (key === "zIndex" ? 1 : 0)), value => { const number = Number(value); if (!Number.isFinite(number)) return; config.layout[key] = key === "width" ? Math.max(220, number) : key === "height" ? Math.max(140, number) : Math.max(0, number); update(); }, "number"));
-    const styleHeading = document.createElement("strong"); styleHeading.textContent = "样式"; form.append(styleHeading);
-    config.style ??= {};
-    ([ ["background", "背景色", "#ffffff"], ["color", "文字色", "#344054"], ["accent", "边框色", "#0f766e"] ] as const).forEach(([key, label, fallback]) => field(label, config.style![key] ?? fallback, value => { config.style![key] = value; update(); }, "color"));
-    field("字号", String(config.style.fontSize ?? 12), value => { config.style!.fontSize = Math.max(10, Math.min(32, Number(value) || 12)); update(); }, "number");
-    settings.append(form);
+    callbacks.onWidgetConfig?.({
+      block, current: owner, external: externalWidgets.get(config.kind),
+      documents: dashboardSources(workspace.snapshot().documents), dataStatesFor,
+      onChange(rerenderSettings) {
+        if (current !== owner) return;
+        block.revision += 1;
+        render();
+        scheduleSave();
+        if (rerenderSettings) renderSettings();
+      },
+      hydrateSources,
+      openDocument: callbacks.onOpenDocument,
+      showBacklinks: () => callbacks.onShowBacklinks?.(block.id, owner)
+    });
   }
   function render() {
     if (!current) return;
     title.value = current.note.title;
+    viewDisposers.forEach(dispose => dispose()); viewDisposers = [];
+    const active = new Set(widgets().map(block => block.id));
+    for (const [id, runtime] of externalRuntimes) if (!active.has(id) || !externalWidgets.has(runtime.kind)) runtime.dispose();
     stage.replaceChildren(...widgets().sort((a, b) => (widgetConfig(a)!.layout.zIndex ?? 0) - (widgetConfig(b)!.layout.zIndex ?? 0)).map(renderWidget));
     const maxX = Math.max(900, ...widgets().map(block => (widgetConfig(block)!.layout.x + widgetConfig(block)!.layout.width + 40)));
     const maxY = Math.max(620, ...widgets().map(block => (widgetConfig(block)!.layout.y + widgetConfig(block)!.layout.height + 40)));
@@ -271,9 +269,10 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     const configs = widgets().map(widgetConfig).filter((config): config is DashboardConfig => Boolean(config));
     const ids = new Set<string>();
     const snapshot = workspace.snapshot();
-    configs.forEach(config => {
+    configs.filter(config => !externalWidgets.has(config.kind)).forEach(config => {
       if (config.scope === "document" && config.sourceId) ids.add(config.sourceId);
-      if (config.scope === "notebook" || config.scope === "workspace") snapshot.documents.filter(item => item.kind !== "dashboard" && (config.scope === "workspace" || snapshot.bookmarks.find(bookmark => bookmark.id === item.bookmarkId)?.notebookId === current?.note.workspaceId)).forEach(item => ids.add(item.id));
+      if (config.scope === "notebook" || config.scope === "workspace") dashboardSources(snapshot.documents).filter(item =>
+        (config.scope === "workspace" || snapshot.bookmarks.find(bookmark => bookmark.id === item.bookmarkId)?.notebookId === current?.note.workspaceId)).forEach(item => ids.add(item.id));
     });
     if (sourceState) sourceStates.set(sourceState.note.id, structuredClone(sourceState));
     await Promise.all([...ids].filter(id => !sourceStates.has(id)).map(async id => {
@@ -283,7 +282,7 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
   }
   function resize(block: Block, dx: number, dy: number) {
     const layout = widgetConfig(block)!.layout;
-    layout.width = Math.max(220, layout.width + dx); layout.height = Math.max(140, layout.height + dy); render(); scheduleSave();
+    layout.width = Math.max(220, layout.width + dx); layout.height = Math.max(140, layout.height + dy); block.revision += 1; render(); scheduleSave();
   }
   function enableDrag(card: HTMLElement, block: Block) {
     const head = card.querySelector<HTMLElement>(".dashboard-widget-head")!;
@@ -293,21 +292,28 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
       const layout = widgetConfig(block)!.layout; drag = { x: event.clientX, y: event.clientY, left: layout.x, top: layout.y }; head.setPointerCapture(event.pointerId);
     });
     head.addEventListener("pointermove", event => { if (!drag) return; const layout = widgetConfig(block)!.layout; layout.x = Math.max(0, drag.left + event.clientX - drag.x); layout.y = Math.max(0, drag.top + event.clientY - drag.y); card.style.left = `${layout.x}px`; card.style.top = `${layout.y}px`; });
-    head.addEventListener("pointerup", () => { if (drag) scheduleSave(); drag = null; });
+    head.addEventListener("pointerup", () => { if (drag) { block.revision += 1; scheduleSave(); } drag = null; });
     head.addEventListener("pointercancel", () => { drag = null; });
   }
   function addWidget(kind: string) {
     if (!current) return;
-    const index = widgets().length;
-    const presets: Record<string, DashboardQuery> = {
-      "文档数量": { source: "documents", measure: "count" }, "关键字数量": { source: "keywords", measure: "count" },
-      "未完成待办": { source: "todos", measure: "count", filters: [{ field: "checked", operator: "=", value: "false" }] },
-      "已完成待办": { source: "todos", measure: "count", filters: [{ field: "checked", operator: "=", value: "true" }] },
-      "位置汇总": { source: "locations", measure: "count" }, "表格汇总": { source: "databaseRecords", measure: "count" }
-    };
-    const metric = !!presets[kind];
-    const block = createBlock({ id: uid(), type: "dashboard_widget", position: String((current.blocks.length + 1) * 1000).padStart(8, "0"), properties: { dashboardWidget: { kind: metric ? "metric" : kind, title: kind, scope: metric ? "workspace" : "activeDocument", query: metric ? { ...presets[kind] } : undefined, layout: { x: 32 + (index % 3) * 344, y: 32 + Math.floor(index / 3) * 244, width: 320, height: 220 } } } });
-    current.blocks.push(block); render(); selectWidget(block.id, true); scheduleSave(); void hydrateSources();
+    if (kind === "documentFilter" && widgets().some(block => widgetConfig(block)?.kind === kind)) { selectWidget(widgets().find(block => widgetConfig(block)?.kind === kind)!.id, true); return; }
+    const metric = !!dashboardMetricPresets[kind];
+    const definition = dataViews[kind as DataViewKind];
+    const external = externalWidgets.get(kind);
+    const query = metric ? { ...dashboardMetricPresets[kind] } : definition ? { source: definition.defaultSource, measure: "count" as const } : undefined;
+    const width = definition || external ? 400 : 320;
+    const height = definition || external ? 260 : 220;
+    let placement = { x: 32, y: 32 };
+    const rows = [32, ...widgets().map(item => { const layout = widgetConfig(item)!.layout; return layout.y + layout.height + 16; })].sort((a, b) => a - b);
+    for (const y of rows) {
+      const candidate = [32, 376].map(x => ({ x, y })).find(({ x, y }) =>
+        widgets().every(item => { const other = widgetConfig(item)!.layout; return x >= other.x + other.width + 16 || other.x >= x + width + 16 || y >= other.y + other.height + 16 || other.y >= y + height + 16; }));
+      if (candidate) { placement = candidate; break; }
+    }
+    const externalSettings = external ? Object.fromEntries((external.settings ?? []).map(setting => [setting.key, setting.defaultValue ?? null])) : undefined;
+    const block = createBlock({ id: uid(), type: "dashboard_widget", position: String((current.blocks.length + 1) * 1000).padStart(8, "0"), properties: { dashboardWidget: { kind: metric ? "metric" : kind, title: kind === "documentFilter" ? "文档范围" : definition?.label ?? external?.title ?? kind, scope: metric || definition || external ? "workspace" : "activeDocument", query, externalSettings, layout: { ...placement, width, height } } } });
+    current.blocks.push(block); render(); selectWidget(block.id, true); scheduleSave(); if (!external) void hydrateSources();
   }
   function scheduleSave() {
     if (!current) return;
@@ -317,7 +323,7 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     view.querySelector<HTMLButtonElement>("[data-dashboard-action=add]")!.onclick = event => {
       event.stopPropagation(); document.querySelector(".dashboard-add-menu")?.remove();
       const menu = document.createElement("div"); menu.className = "dashboard-add-menu";
-      ["文档数量", "关键字数量", "未完成待办", "已完成待办", "位置汇总", "表格汇总", "references", "backlinks", "overrides", "comments", "history", "calendar", "locations", "styles", "databases"].forEach(kind => { const button = document.createElement("button"); button.type = "button"; button.textContent = kind; button.onclick = () => { menu.remove(); addWidget(kind); }; menu.append(button); });
+      ["documentFilter", "文档数量", "关键字数量", "未完成待办", "已完成待办", "位置汇总", "表格汇总", "detailTable", "pivotTable", "barChart", "pieChart", "trendChart", "todoCalendar", "locationMap", "relationGraph", "references", "backlinks", "overrides", "comments", "history", "calendar", "locations", "styles", "databases", ...externalWidgets.keys()].forEach(kind => { const button = document.createElement("button"); button.type = "button"; button.textContent = kind === "documentFilter" ? "文档范围筛选" : dataViews[kind as DataViewKind]?.label ?? externalWidgets.get(kind)?.title ?? kind; button.onclick = () => { menu.remove(); addWidget(kind); }; menu.append(button); });
       document.body.append(menu); const rect = (event.currentTarget as HTMLElement).getBoundingClientRect(); menu.style.left = `${rect.left}px`; menu.style.top = `${rect.bottom + 4}px`;
       setTimeout(() => document.addEventListener("pointerdown", event => {
         if (!menu.contains(event.target as Node) && !view.querySelector("[data-dashboard-action=add]")?.contains(event.target as Node)) menu.remove();
@@ -327,15 +333,16 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
   }
   setupAddMenu();
   function open(state: EditorState, nextSourceState?: EditorState | null) {
+    externalRuntimes.forEach(runtime => runtime.dispose());
     current = structuredClone(state);
     versions.set(state.note.id, state.note.clientVersion);
     selectedWidgetId = null;
     sourceStates.clear();
     sourceState = nextSourceState ? structuredClone(nextSourceState) : sourceState;
     if (sourceState) sourceStates.set(sourceState.note.id, structuredClone(sourceState));
-    editor.hidden = true; view.hidden = false; render(); renderSettings(); callbacks.onWidgetSelection?.(false); void hydrateSources();
+    editor.hidden = true; view.hidden = false; render(); renderSettings(); callbacks.onHistoryChanged?.(state.history ?? { documentId: state.note.id, entries: [], currentId: "", canUndo: false, canRedo: false }); callbacks.onWidgetSelection?.(false); void hydrateSources();
   }
-  function close() { view.hidden = true; current = null; sourceState = null; selectedWidgetId = null; sourceStates.clear(); editor.hidden = false; stage.replaceChildren(); settings.replaceChildren(); callbacks.onWidgetSelection?.(false); }
+  function close() { viewDisposers.forEach(dispose => dispose()); viewDisposers = []; externalRuntimes.forEach(runtime => runtime.dispose()); view.hidden = true; current = null; sourceState = null; selectedWidgetId = null; sourceStates.clear(); editor.hidden = false; stage.replaceChildren(); callbacks.onWidgetConfig?.(null); callbacks.onWidgetSelection?.(false); }
   function setSourceState(state: EditorState | null) {
     sourceState = state ? structuredClone(state) : null;
     if (sourceState) sourceStates.set(sourceState.note.id, structuredClone(sourceState));
@@ -346,5 +353,31 @@ export function mountDashboardManager(host: EditorHostApi, workspace: WorkspaceA
     if (sourceState && (!documentId || sourceState.note.id === documentId)) sourceStates.delete(sourceState.note.id);
     if (current) void hydrateSources();
   }
-  return { open, close, isOpen: () => !view.hidden, applyState: state => { if (!current || current.note.id !== state.note.id) return; current = structuredClone(state); versions.set(state.note.id, state.note.clientVersion); render(); renderSettings(); }, setSourceState, refreshSources, register: renderer => { renderers.set(renderer.kind, renderer); if (current) render(); }, flush: () => saveSession.flush() };
+  const focusBlock = (blockId: string) => {
+    if (!widgets().some(block => block.id === blockId)) return;
+    selectWidget(blockId, true);
+    stage.querySelector<HTMLElement>(`[data-widget-id="${CSS.escape(blockId)}"]`)?.scrollIntoView({ block: "center", inline: "center" });
+  };
+  async function restoreHistory(entryId: string) {
+    await saveSession.flush();
+    if (!current) return;
+    const result = await host.executeCommand({ operation: "history-restore", entryId, expectedVersion: current.note.clientVersion }, current.note.id);
+    if (current?.note.id === result.state.note.id) applyState(result.state);
+  }
+  function applyState(state: EditorState) {
+    if (!current || current.note.id !== state.note.id) return;
+    current = structuredClone(state);
+    versions.set(state.note.id, state.note.clientVersion);
+    callbacks.onHistoryChanged?.(state.history ?? { documentId: state.note.id, entries: [], currentId: "", canUndo: false, canRedo: false });
+    render(); renderSettings();
+    callbacks.onStateChanged?.(structuredClone(current));
+  }
+  return { open, close, focusBlock, restoreHistory, isOpen: () => !view.hidden, currentState: () => current ? structuredClone(current) : null, applyState, setSourceState, refreshSources,
+    register: renderer => { renderers.set(renderer.kind, renderer); if (current) render(); },
+    registerExternal: definition => {
+      if (!/^[a-z][\w-]*(?:\.[a-z][\w-]*)+$/i.test(definition.kind) || definition.kind in dataViews || renderers.has(definition.kind) || externalWidgets.has(definition.kind)) throw new Error("外部组件需要唯一的命名空间类型 ID");
+      externalWidgets.set(definition.kind, definition);
+      if (current) { render(); renderSettings(); }
+      return () => { if (externalWidgets.get(definition.kind) !== definition) return; externalWidgets.delete(definition.kind); for (const runtime of externalRuntimes.values()) if (runtime.kind === definition.kind) runtime.dispose(); if (current) { render(); renderSettings(); } };
+    }, flush: () => saveSession.flush() };
 }

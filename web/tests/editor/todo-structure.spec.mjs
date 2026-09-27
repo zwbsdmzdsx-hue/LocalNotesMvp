@@ -37,6 +37,28 @@ test('todo blocks use GFM task markers in source and checked data in the model',
   await expect(todo.locator('.block-text')).toHaveText('- [ ] 已完成');
 });
 
+test('Enter inside todo source keeps the marker on the original block', async ({ page }) => {
+  await page.locator('#add-todo').click();
+  await switchMode(page, 'source');
+  const todo = page.locator('#blocks > [data-own-block][data-type="todo"]').last();
+  const body = todo.locator('.block-text');
+  await body.fill('- [x] 前半后半');
+  await body.evaluate(element => {
+    const range = document.createRange();
+    range.setStart(element.firstChild, '- [x] 前半'.length);
+    range.collapse(true);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+  await body.press('Enter');
+  await expect(body).toHaveText('- [x] 前半');
+  await expect(todo.locator('+ [data-own-block][data-type="paragraph"] .block-text')).toHaveText('后半');
+  await expect.poll(() => page.evaluate(() => window.mockHost.state('alpha').blocks.find(block => block.type === 'todo')?.content.checked)).toBe(true);
+  await switchMode(page, 'rich');
+  await expect(todo.locator('.todo-check')).toBeChecked();
+});
+
 test('todo dates persist as block metadata and appear as colored calendar dots', async ({ page }) => {
   const now = new Date();
   const month = String(now.getMonth() + 1).padStart(2, '0');
@@ -105,6 +127,7 @@ test('todo status shows a red warning when overdue and a late red check when com
   await due.fill(iso);
   await expect(todo.locator('.todo-status-overdue')).toBeVisible();
   await todo.locator('.todo-check').check();
-  await completed.fill(new Date().toISOString().slice(0, 10));
+  const today = new Date();
+  await completed.fill(`${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`);
   await expect(todo.locator('.todo-status-complete-late')).toBeVisible();
 });

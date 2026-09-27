@@ -10,7 +10,7 @@ type BlockOptions = {
   revision?: number;
 };
 
-function todayIsoDate() {
+export function todayIsoDate() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 }
@@ -22,8 +22,8 @@ export function createBlock(options: BlockOptions): Block {
     parentId: options.parentId ?? null,
     position: options.position ?? "",
     type,
-    content: { text: "", html: "", markdown: "", ...(type === "todo" ? { checked: false } : {}), ...options.content },
-    properties: { ...(type === "todo" ? { todoCreatedAt: todayIsoDate() } : {}), ...options.properties },
+    content: { text: "", html: "", markdown: "", ...options.content },
+    properties: { ...options.properties },
     revision: options.revision ?? 1
   };
 }

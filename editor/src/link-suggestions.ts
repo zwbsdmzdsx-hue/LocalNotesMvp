@@ -1,11 +1,27 @@
-import type { Block, EditorState, ReferenceTargetScope } from "../../protocol/types";
+import type { Block, DatabaseRecord, EditorState, ReferenceTargetScope } from "../../protocol/types";
 import { markdownFromContent, plainTextFromContent } from "./markdown";
 import { orderBlockTree } from "./block-tree";
+import { blockReferenceLabel } from "./block-references";
+import { blockModules } from "./block-modules";
 
 export type LinkSuggestion =
   | { kind: "notebook"; notebookId: string; title: string; meta: string; preview?: string }
   | { kind: "document"; id: string; notebookId: string; notebookName: string; title: string; meta: string; preview?: string }
-  | { kind: "target" | "heading"; id: string; blockId?: string; scope?: ReferenceTargetScope; title: string; meta: string; label: string; notebookName?: string; documentTitle?: string; preview?: string };
+  | { kind: "target" | "heading"; id: string; blockId?: string; scope?: ReferenceTargetScope; title: string; meta: string; label: string; notebookName?: string; documentTitle?: string; preview?: string }
+  | { kind: "record" | "cell"; id: string; recordId: string; fieldKey?: string; scope: "record" | "cell"; title: string; meta: string; label: string; notebookName?: string; documentTitle?: string; preview?: string };
+
+export function suggestionWikiTarget(item: LinkSuggestion, options: { alias?: boolean; headingByTitle?: boolean } = {}) {
+  if (item.kind === "notebook") return { text: `${item.title}/`, complete: false };
+  if (item.kind === "document") return { text: `${item.notebookName}/${item.title}/`, complete: false };
+  const documentTitle = item.documentTitle ?? item.label;
+  const prefix = item.notebookName ? `${item.notebookName}/` : "";
+  const suffix = item.kind === "record" || item.kind === "cell"
+    ? `#@${item.recordId}${item.fieldKey ? `.${item.fieldKey}` : ""}`
+    : item.kind === "heading" && options.headingByTitle ? `#${item.label}`
+    : (item.kind === "target" || item.kind === "heading") && item.blockId ? `#^${item.blockId}` : "";
+  const label = options.alias && suffix ? item.label.replace(/[\]\|\r\n]/g, " ").trim().slice(0, 80) : "";
+  return { text: `${prefix}${documentTitle}${suffix}${label ? `|${label}` : ""}]]`, complete: true };
+}
 
 export function blockWikiLink(notebook: string, title: string, blockId: string) {
   return `[[${notebook}/${title}#^${blockId}]]`;
@@ -16,11 +32,12 @@ export function headingInfo(block: Block) {
   const line = source.split(/\r?\n/).find(value => value.trim()) ?? "";
   const match = line.match(/^\s*(#{1,6})[ \u3000]+(.+?)\s*$/);
   const title = plainTextFromContent(block.content).trim();
-  if (block.type === "heading" && block.properties.headingLevel && title) {
+  const headingRole = blockModules.require(block.type).headingRole;
+  if (headingRole && block.properties.headingLevel && title) {
     return { level: block.properties.headingLevel, title };
   }
   if (match) return { level: match[1].length as 1 | 2 | 3 | 4 | 5 | 6, title: match[2].trim() };
-  return block.type === "heading" && title ? { level: 1, title } : null;
+  return headingRole && title ? { level: 1, title } : null;
 }
 
 
@@ -72,7 +89,7 @@ function headingFilter(value: string) {
   return { hash, level, needle };
 }
 
-export function queryLinkSuggestions(query: string, state: Pick<EditorState, "documents" | "note">, suggestionPreview: (blocks: Block[]) => string) {
+export function queryLinkSuggestions(query: string, state: Pick<EditorState, "documents" | "note" | "databases" | "databaseRecords">, suggestionPreview: (blocks: Block[]) => string) {
   let linkMenuStage: "notebook" | "document" | "block" = "notebook";
   let linkMenuTrail: string[] = [];
   function collect(): LinkSuggestion[] {
@@ -123,6 +140,40 @@ export function queryLinkSuggestions(query: string, state: Pick<EditorState, "do
     if (!document) return [];
     linkMenuTrail = [notebook.name, document.title];
     const blockQuery = parts.slice(2).join("/");
+    const databases = document.databases?.length ? document.databases : document.database ? [document.database] : [];
+    if (databases.length) {
+      const normalized = normalizedSearch(blockQuery.replace(/^#@?/, ""));
+      const databaseFor = (record: DatabaseRecord) => databases.find(item => item.databaseId === record.databaseId)!;
+      const makeRecord = (record: DatabaseRecord): LinkSuggestion => {
+        const database = databaseFor(record);
+        const labelField = database.fields.find(field => field.type === "text") ?? database.fields[0];
+        const title = String(record.values[labelField?.key ?? ""] ?? record.id);
+        const label = database.fields.map(field => `${field.title}: ${safeLinkLabel(formulaValue(record.values[field.key]))}`).join(" · ");
+        return { kind: "record", id: document.id, recordId: record.id, scope: "record", title, label, notebookName: notebook.name, documentTitle: document.title, meta: `${document.title} · 整行`, preview: label };
+      };
+      const makeCell = (record: DatabaseRecord, fieldKey: string): LinkSuggestion => {
+        const database = databaseFor(record);
+        const field = database.fields.find(item => item.key === fieldKey)!;
+        const label = safeLinkLabel(formulaValue(record.values[fieldKey]));
+        return { kind: "cell", id: document.id, recordId: record.id, fieldKey, scope: "cell", title: `${label || "空值"}`, label: `${label || "空值"}`, notebookName: notebook.name, documentTitle: document.title, meta: `${field.title} · 单元格`, preview: `${field.title}: ${label || "空值"}` };
+      };
+      const explicit = blockQuery.match(/^#?@([^\.\s/]+)(?:\.([^\s/]+))?/);
+      if (explicit) {
+        const record = databases.flatMap(item => item.records).find(item => item.id === explicit[1]);
+        if (!record) return [];
+        const database = databaseFor(record);
+        if (explicit[2]) {
+          const field = database.fields.find(item => item.key === explicit[2]);
+          return field ? [makeCell(record, field.key)] : [];
+        }
+        return [makeRecord(record), ...database.fields.map(field => makeCell(record, field.key))];
+      }
+      const records = databases.flatMap(item => item.records).filter(record => !normalized || normalizedSearch(makeRecord(record).title).includes(normalized));
+      if (records.length || !blockQuery) {
+        const items = records.flatMap(record => [makeRecord(record), ...databaseFor(record).fields.map(field => makeCell(record, field.key))]);
+        if (items.length) return items.slice(0, 24);
+      }
+    }
     const blockHeading = headingFilter(blockQuery);
     const blockNeedle = normalizedSearch(blockHeading ? blockQuery.slice(blockHeading.hash + 1 + (blockQuery.slice(blockHeading.hash + 1).match(/^#{0,5}/)?.[0].length ?? 0)) : blockQuery);
     const items: LinkSuggestion[] = [];
@@ -141,8 +192,7 @@ export function queryLinkSuggestions(query: string, state: Pick<EditorState, "do
         }
         return;
       }
-      const text = plainTextFromContent(block.content) || (block.type === "database_table" ? "数据库表" :
-        block.type === "data_view" ? "查询视图" : block.type === "media" ? block.content.media?.name ?? "媒体" : block.type === "location" ? "位置" : "");
+      const text = blockReferenceLabel(block);
       if (!text || (blockNeedle && !normalizedSearch(text).includes(blockNeedle))) return;
       const label = text.slice(0, 56);
       items.push({ kind: "target", id: document.id, blockId: block.id, title: label, meta: `${document.title} · 正文块`, label,
@@ -154,4 +204,15 @@ export function queryLinkSuggestions(query: string, state: Pick<EditorState, "do
 
   const items = collect();
   return { items, stage: linkMenuStage as "notebook" | "document" | "block", trail: linkMenuTrail };
+}
+
+function formulaValue(value: unknown) {
+  if (Array.isArray(value)) return value.join(", ");
+  if (value && typeof value === "object" && "message" in value) return String((value as { message?: unknown }).message ?? "计算失败");
+  return String(value ?? "");
+}
+
+function safeLinkLabel(value: string) {
+  return value.replace(/\[\[([^\]]+)\]\]/g, (_match, link: string) => link.split("|").pop() ?? link)
+    .replace(/[\[\]|\r\n]/g, " ");
 }
